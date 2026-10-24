@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ictc-o3-hp-ascend"
+version = "0.1.0"
+description = "High-performance ICTC-O3 operators and MACE-ICTC models for Ascend NPUs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "PolyForm-Noncommercial-1.0.0 AND MIT" }
+dependencies = ["torch>=2.7", "numpy>=1.24,<2", "e3nn>=0.4.4,<0.6", "ase>=3.22", "opt-einsum-fx>=0.1.4"]
+
+[project.optional-dependencies]
+hp = ["triton-ascend==3.2.1; platform_system=='Linux'", "pybind11", "ninja"]
+train = ["h5py", "pandas", "scipy", "matscipy==1.1.1", "tqdm"]
+preprocess = ["h5py", "pandas", "tables", "matscipy==1.1.1", "tqdm"]
+conversion = ["mace-torch>=0.3.16"]
+
+[project.scripts]
+ictc-ascend-train = "mace_ictc.cli.train:main"
+ictc-ascend-convert-mace = "mace_ictc.cli.convert_mace:main"
+ictc-ascend-preprocess = "mace_ictc.cli.preprocess:main"
+
+[tool.setuptools]
+license-files = ["LICENSE", "LICENSES/*.txt", "NOTICE", "LICENSE_SCOPE.md", "COMMERCIAL_LICENSE.md", "UPSTREAM.md"]
+
+[tool.setuptools.packages.find]
+include = ["ictc_o3", "ictc_o3.*", "mace_ictc", "mace_ictc.*"]
+exclude = ["mace_ictc.bench", "mace_ictc.bench.*", "mace_ictc.test", "mace_ictc.test.*"]
+
+[tool.setuptools.package-data]
+mace_ictc = ["models/_ictd_basis/v1/*.pt", "csrc/*.cpp", "csrc/*.cu"]
