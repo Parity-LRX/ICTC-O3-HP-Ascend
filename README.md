@@ -191,6 +191,11 @@ Across seven channel/degree configurations spanning 16–128 channels, the
 depend on the workload: C96/lmax-2 training is 19.3% faster, but its allocation
 peak increases by 7.6%.
 
+A separate continuous-training check uses 64 timed steps per route, six warmups,
+alternating 16-step blocks, per-step synchronization and Python garbage collection
+enabled. C64 mean step time decreases from 400.2 to 306.5 ms, increasing sustained
+throughput by 30.6%; the largest observed step on the new route is 306.9 ms.
+
 Performance figures use the latest paired run. Capacity and native figures come
 from their earlier qualification with the same protocol and unchanged kernels.
 Throughput counts processed atoms per energy-and-force call or full training step.
