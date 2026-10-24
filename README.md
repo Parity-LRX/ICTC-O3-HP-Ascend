@@ -105,11 +105,14 @@ species banks and symmetric contractions, and [the upstream provenance](UPSTREAM
   automatic reserve is one sixth of reported UB, rounded up to 4 KiB. These are
   scheduling choices, with no fixed model hyperparameters.
 - Learned weight names and shapes are retained; configuration does not freeze or cast parameters.
-- Performance mode uses analytic tensor-product adjoints that preserve contiguous
-  channel blocks. Training retains ordinary per-path GEMM autograd, which is faster
-  for the measured force-loss workload. Standalone tensor products and symmetric
-  contractions have analytic first and mixed second adjoints; higher derivatives
-  retain differentiable PyTorch formulas.
+- Performance graph messages keep channels contiguous, group paths by their
+  actual input angular degree and apply one GEMM per group. Constant geometry
+  columns are reordered without padding; live path gates and output order are
+  retained. Node-sized transforms and grouped path splits reduce edge-sized copies
+  and slice-adjoint zero fills. Small workloads retain the established path.
+  Recursive matrix adjoints retain live first, mixed second and higher derivatives. Standalone edge products
+  retain their analytic path adjoints; symmetric contractions use analytic first
+  and mixed second adjoints with differentiable higher-order formulas.
 - Capacity mode fuses source gathering, tensor products and FP32 atomic
   destination accumulation, with analytic first and mixed second adjoints.
   Native mode additionally selects custom strict-FP32 Cube matrix kernels.
@@ -146,8 +149,11 @@ masked graph messages, empty graphs, mutable species metadata, rectangular
 channel transforms for multiple atomic species and an energy-and-force trainer
 step with AdamW. Native Cube checks include every transpose/bias combination,
 frozen operands and mixed derivatives, including a reduction width of 65,537.
-Nonlinearity and direction-polynomial checks include third derivatives. These checks
-use synthetic inputs and do not establish the accuracy of a fitted potential.
+Nonlinearity, direction-polynomial and recursive batched-matrix checks include
+third derivatives. Grouped graph messages also pass third-order checks with live
+path coefficients, trainable masks, unequal input/edge/output degrees and both
+packed layouts. These checks use synthetic inputs and do not establish the
+accuracy of a fitted potential.
 
 ## Training and inference performance
 
@@ -158,23 +164,26 @@ for every route. All latencies include both energy and forces.
 
 | Model | Operation | Performance ms / atom-steps/s | Capacity ms / atom-steps/s | Allocated peak, performance / capacity (MiB) |
 | --- | --- | ---: | ---: | ---: |
-| C32, lmax 1 | Inference | 69.6 / 58,878 | 92.9 / 44,113 | 1,771 / 776 |
-| C32, lmax 1 | Training + AdamW | 160.8 / 25,473 | 292.1 / 14,025 | 3,621 / 2,007 |
-| C64, lmax 2 | Inference | 206.3 / 19,850 | 313.9 / 13,047 | 9,496 / 2,330 |
-| C64, lmax 2 | Training + AdamW | 634.0 / 6,460 | 921.7 / 4,444 | 21,901 / 4,613 |
+| C32, lmax 1 | Inference | 62.1 / 65,961 | 92.9 / 44,113 | 1,706 / 776 |
+| C32, lmax 1 | Training + AdamW | 143.6 / 28,525 | 292.1 / 14,025 | 3,595 / 2,007 |
+| C64, lmax 2 | Inference | 139.5 / 29,365 | 313.9 / 13,047 | 8,865 / 2,330 |
+| C64, lmax 2 | Training + AdamW | 398.8 / 10,270 | 921.7 / 4,444 | 19,279 / 4,613 |
 
-The comparison baseline is the previous optimized Ascend HP implementation,
-using automatic edge chunks, structured inference adjoints and GEMM training.
-Performance mode reduces C64 inference latency from 230.1 to 206.3 ms and
-training from 740.0 to 634.0 ms, increasing training throughput by 16.7%.
-Its C64 training allocation peak increases from 16,032 to 21,901 MiB.
-Capacity mode reduces C64 allocation peaks by 76.3% for inference and 71.2%
-for training versus the previous HP route, with higher latency.
+The paired baseline is the preceding performance mode, with per-path GEMMs.
+Grouped messages reduce C64 inference latency from 207.4 to 139.5 ms and training
+from 635.2 to 398.8 ms, increasing throughput by 48.7% and 59.3%, respectively.
+C64 allocation peaks decrease from 9,499 to 8,865 MiB for inference and from
+21,912 to 19,279 MiB for training. The 512-atom C32/C64 checks retain the existing
+small-chunk route; their largest measured regression is below 1%.
+
+Performance figures use the latest paired run. Capacity and native figures come
+from their earlier qualification with the same protocol and unchanged kernels.
+Throughput counts processed atoms per energy-and-force call or full training step.
 
 Full native mode measures 337.2/1,053.5 ms for C64 inference/training, with
 2,330/4,611 MiB peaks. It is an explicit alternative, not the performance default.
 Memory values are PyTorch allocation peaks above the warmed baseline; they exclude
-driver memory and external runtime allocations and is not an OOM-capacity test.
+driver memory and external runtime allocations and are not an OOM-capacity test.
 
 Measurements are medians of three alternating paired rounds, three calls per
 round, after three warmup calls. Inference freezes model weights and computes

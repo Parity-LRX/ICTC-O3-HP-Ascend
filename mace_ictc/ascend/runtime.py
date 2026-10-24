@@ -104,8 +104,8 @@ def configure_model(model, *, training=False, policy="auto", capture=False,
         core._fused_direction_harmonics = True
         for layer in core.interactions:
             layer._ascend_edge_chunk_size = edge_chunk_size
-            # First-adjoint packing helps force inference. Ordinary path GEMMs
-            # remain faster when the force graph must be differentiated again.
+            # Standalone edge products retain their established schedules;
+            # performance graph messages use channel-contiguous recursive GEMMs.
             layer.tp._ascend_tp_schedule = "gemm" if training else "structured"
     return {"requested": policy, "selected": "generated" if selected else "reference",
             "backend": "ascend", "reasons": coverage["reasons"] if policy != "reference" else [],
@@ -113,5 +113,6 @@ def configure_model(model, *, training=False, policy="auto", capture=False,
             "edge_chunk_size": ("auto" if edge_chunk_size is None else edge_chunk_size) if selected else None,
             "kernel_backend": ("ascendc" if is_enabled() else "triton_gemm") if selected else "reference",
             "ascendc_mode": mode() if selected and is_enabled() else None,
-            "tensor_product_adjoint": ("analytic" if native_graph_enabled() or not training else "autograd") if selected else None,
+            "tensor_product_adjoint": ("automatic" if is_enabled() and mode()=="performance" else
+                                       "analytic" if native_graph_enabled() or not training else "autograd") if selected else None,
             "counts": {"interactions": len(getattr(core, "interactions", ()))}}

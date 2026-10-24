@@ -139,7 +139,17 @@ def _automatic_edge_chunk(owner, sample, features, harmonics):
 def graph_message(owner, features, harmonics, gates, src, dst, mask=None,
                   *, edge_chunk_size=16384):
     """Bound edge intermediates while retaining ordinary differentiable gathers."""
-    from mace_ictc.ascendc.runtime import native_graph_enabled
+    from mace_ictc.ascendc.runtime import native_graph_enabled,is_enabled,mode
+    schedule=getattr(owner,'_ascend_message_schedule','auto')
+    if (is_enabled() and mode()=='performance' and schedule!='legacy'
+            and getattr(owner,'_ascend_tp_preproject',True)):
+        chosen=(_automatic_edge_chunk(owner,next(iter(features.values())),features,harmonics)
+                if edge_chunk_size is None else edge_chunk_size)
+        # Grouped layout work needs enough edges to amortize its extra launches.
+        # Retain the established small-chunk route for arbitrary model widths.
+        if schedule=='grouped' or (src.numel()>=65536 and chosen>=32768):
+            from .channel_message import graph_message as channel_message
+            return channel_message(owner,features,harmonics,gates,src,dst,mask,edge_chunk_size=chosen)
     if (native_graph_enabled() and getattr(owner,'_ascend_tp_preproject',True)
             and (mask is None or not mask.requires_grad)):
         from mace_ictc.ascendc.graph import graph_message as native_graph

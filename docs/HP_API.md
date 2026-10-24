@@ -33,7 +33,7 @@ This process-wide opt-in selects an execution mode:
 
 | Mode | Tensor products and graph messages | Symmetric contractions | Dense transforms |
 | --- | --- | --- | --- |
-| `performance` (default) | Shared-geometry GEMMs and chunked PyTorch accumulation | Ascend C vector kernels | CANN GEMMs with analytic adjoints |
+| `performance` (default) | Channel-contiguous shared-geometry GEMMs and chunked PyTorch accumulation | Ascend C vector kernels | CANN GEMMs with analytic adjoints |
 | `capacity` | Fused Ascend C gather, tensor product and atomic accumulation | Ascend C vector kernels | CANN GEMMs with analytic adjoints |
 | `native` | Fused Ascend C graph kernels | Ascend C vector kernels | Ascend C FP32 Cube kernels |
 
@@ -189,12 +189,22 @@ and a maximum of 131,072 edges. This estimate excludes saved activations and oth
 model storage; it does not guarantee a total memory limit. Set a positive integer,
 for example `message_chunk_edges=16384`, to limit edge intermediates more tightly.
 Standalone graph-message factories retain their explicit 16,384-edge default.
+On large graphs, `message_chunk_edges=32768` keeps the grouped performance route
+available with smaller intermediates; `16384` selects the established small-chunk route.
 
-In the GEMM/performance route, configuration selects analytic tensor-product adjoints for force inference and
-ordinary per-path GEMM autograd for energy-and-force training. Switch configurations
-when switching workloads: call `configure_model(..., training=True)` for training
-and `configure_model(..., training=False)` for inference. The selected adjoint and
+For graphs with at least 65,536 edges and chunks of at least 32,768 edges,
+performance graph messages keep channels contiguous and group paths by their
+actual input degree. Each group uses one GEMM without zero padding. Recursive
+matrix adjoints support force inference and energy-and-force training. Smaller
+workloads retain the established path schedule to avoid extra launch overhead.
+Grouped path splits assemble bond and gate gradients without one full slice-adjoint buffer
+per path. Standalone edge products retain their established analytic adjoints.
+Switch configurations when switching workloads: call
+`configure_model(..., training=True)` for training and
+`configure_model(..., training=False)` for inference. The adjoint policy and
 chunk policy are reported as `tensor_product_adjoint` and `edge_chunk_size`.
+The performance adjoint policy is `automatic`; the effective chunk determines
+which graph layout is used at execution.
 Capacity and native modes use analytic tensor-product adjoints for both workloads.
 The return value also reports `kernel_backend` and `ascendc_mode`.
 Standalone tensor products use the analytic route, including mixed second adjoints
