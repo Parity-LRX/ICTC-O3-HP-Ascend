@@ -33,7 +33,7 @@ This process-wide opt-in selects an execution mode:
 
 | Mode | Tensor products and graph messages | Symmetric contractions | Dense transforms |
 | --- | --- | --- | --- |
-| `performance` (default) | Channel-contiguous shared-geometry GEMMs and chunked PyTorch accumulation | Ascend C vector kernels | CANN GEMMs with analytic adjoints |
+| `performance` (default) | Channel-contiguous grouped GEMMs; Vector gate/reduction epilogues for large working sets | Ascend C vector kernels | CANN GEMMs with analytic adjoints |
 | `capacity` | Fused Ascend C gather, tensor product and atomic accumulation | Ascend C vector kernels | CANN GEMMs with analytic adjoints |
 | `native` | Fused Ascend C graph kernels | Ascend C vector kernels | Ascend C FP32 Cube kernels |
 
@@ -199,12 +199,21 @@ matrix adjoints support force inference and energy-and-force training. Smaller
 workloads retain the established path schedule to avoid extra launch overhead.
 Grouped path splits assemble bond and gate gradients without one full slice-adjoint buffer
 per path. Standalone edge products retain their established analytic adjoints.
+Large working sets also fuse path gates and destination accumulation on Vector
+Cores. These messages keep `[edges, angular rows, channels]` contiguous through
+the first and mixed second adjoints. Constant geometry columns are arranged to
+merge adjacent output intervals into fewer DMA transfers; learned path weights
+and the public output order are preserved.
+The automatic policy uses the actual active angular width and channel/edge
+working set, then checks the complete UB and DMA limits. Small messages and
+trainable masks retain PyTorch postprocessing. Set `ICTC_ASCEND_EPILOGUE=0` before
+execution to retain grouped GEMMs with PyTorch gates and accumulation.
 Switch configurations when switching workloads: call
 `configure_model(..., training=True)` for training and
 `configure_model(..., training=False)` for inference. The adjoint policy and
 chunk policy are reported as `tensor_product_adjoint` and `edge_chunk_size`.
-The performance adjoint policy is `automatic`; the effective chunk determines
-which graph layout is used at execution.
+The performance adjoint policy is `automatic`; graph width, effective chunk size
+and UB feasibility determine the graph schedule at execution.
 Capacity and native modes use analytic tensor-product adjoints for both workloads.
 The return value also reports `kernel_backend` and `ascendc_mode`.
 Standalone tensor products use the analytic route, including mixed second adjoints

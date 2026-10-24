@@ -80,15 +80,45 @@ def graph_message(owner,features,harmonics,gates,src,dst,mask=None,*,edge_chunk_
     # Edge intermediates retain this layout through both matrix adjoints.
     angular={l:value.transpose(1,2).contiguous() for l,value in features.items()}
     sh=torch.cat([harmonics[l] for l in sorted(harmonics)],-1).squeeze(1)
+    from mace_ictc.ascendc.epilogue import enabled,supported,regroup,apply as epilogue
+    fused=(enabled(mask,group_plan[1],channels,min(edges,edge_chunk_size)) and bool(group_plan[1])
+           and supported(group_plan[1],mask is not None))
+    projection,groups=group_plan
+    weight_groups=groups
+    if fused:
+        widths=[owner.path_counts_by_l.get(l,0)*(2*l+1) for l in output]
+        offsets=[]
+        offset=0
+        for width in widths:
+            offsets.append(offset)
+            offset+=width
+        plan['_ascendc_output_widths']=tuple(widths)
+        plan['_ascendc_owner_path_offset']=tuple(owner.path_offset)
+        projection,groups=regroup(plan,projection,groups,owner.path_offset)
     for begin in range(0,edges,edge_chunk_size):
         end=min(begin+edge_chunk_size,edges)
         rows=end-begin
         edge={l:value.index_select(0,src[begin:end]) for l,value in angular.items()}
-        weights=(gates[begin:end].reshape(rows,owner.num_paths,channels)*owner.weight[None]).unbind(1)
+        weighted=gates[begin:end].reshape(rows,owner.num_paths,channels)*owner.weight[None]
+        weights=weighted.unbind(1)
         blocks={l:[None]*owner.path_counts_by_l.get(l,0) for l in output}
-        projection,groups=group_plan
         bond=_FixedLinear.apply(sh[begin:end],projection)
         matrices=bond.split([ni*width for i,ni,width,widths,items in groups],1)
+        if fused:
+            order=tuple(item[0] for group in weight_groups for item in group[4])
+            grouped_weights=(weighted.split([len(group[4]) for group in weight_groups],1)
+                             if order==tuple(range(owner.num_paths)) else
+                             tuple(torch.stack([weights[item[0]] for item in group[4]],1) for group in weight_groups))
+            accumulated=None
+            for group,old_group,matrix,weight in zip(groups,weight_groups,matrices,grouped_weights):
+                i,ni,width,_,_=group
+                base=_BatchedMatrix.apply(matrix.reshape(rows,width,ni),edge[i],False,False)
+                value=epilogue(base,weight,plan,group,tuple(item[0] for item in old_group[4]),offsets,dst[begin:end],nodes,
+                               None if mask is None else mask[begin:end].reshape(-1).contiguous())
+                accumulated=value if accumulated is None else accumulated+value
+            for (l,old),block in zip(output.items(),accumulated.split(plan['_ascendc_output_widths'],1)):
+                output[l]=old+block
+            continue
         for (i,ni,width,widths,items),matrix in zip(groups,matrices):
             value=_BatchedMatrix.apply(matrix.reshape(rows,width,ni),edge[i],False,False)
             for spec,part in zip(items,value.split(widths,1)):

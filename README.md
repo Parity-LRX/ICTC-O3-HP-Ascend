@@ -109,7 +109,11 @@ species banks and symmetric contractions, and [the upstream provenance](UPSTREAM
   actual input angular degree and apply one GEMM per group. Constant geometry
   columns are reordered without padding; live path gates and output order are
   retained. Node-sized transforms and grouped path splits reduce edge-sized copies
-  and slice-adjoint zero fills. Small workloads retain the established path.
+  and slice-adjoint zero fills. Large working sets use a Vector epilogue for
+  path gates and FP32 destination accumulation. Its first and mixed second
+  adjoints keep channels contiguous across the autograd boundary. Adjacent output
+  intervals share DMA transfers; only constant projection columns are reordered.
+  Small workloads retain the established path.
   Recursive matrix adjoints retain live first, mixed second and higher derivatives. Standalone edge products
   retain their analytic path adjoints; symmetric contractions use analytic first
   and mixed second adjoints with differentiable higher-order formulas.
@@ -122,8 +126,10 @@ species banks and symmetric contractions, and [the upstream provenance](UPSTREAM
 - Whole-model edge chunks are sized from the actual channel, angular and path widths.
   Set `message_chunk_edges=16384` for smaller forward intermediates; automatic sizing
   favors throughput and can increase the allocation peak. See the API guide for
-  the scratch estimate. Performance mode retains PyTorch graph accumulation;
-  capacity/native modes perform it inside Ascend C kernels.
+  the scratch estimate. Performance mode combines grouped GEMMs with a native
+  gate/reduction epilogue where its working set is large enough; smaller messages
+  retain PyTorch accumulation. Capacity/native modes also fuse the tensor product
+  itself inside Ascend C kernels.
 - FP32 execution disables HF32 and requires autocast to be off. No reduced-precision
   approximation is used.
 
@@ -152,7 +158,9 @@ frozen operands and mixed derivatives, including a reduction width of 65,537.
 Nonlinearity, direction-polynomial and recursive batched-matrix checks include
 third derivatives. Grouped graph messages also pass third-order checks with live
 path coefficients, trainable masks, unequal input/edge/output degrees and both
-packed layouts. These checks use synthetic inputs and do not establish the
+packed layouts. Native graph epilogues additionally cover 1, 7, 17, 64 and 129
+channels, fixed masks, frozen operands and strided graph indices through third
+derivatives. These checks use synthetic inputs and do not establish the
 accuracy of a fitted potential.
 
 ## Training and inference performance
@@ -164,17 +172,24 @@ for every route. All latencies include both energy and forces.
 
 | Model | Operation | Performance ms / atom-steps/s | Capacity ms / atom-steps/s | Allocated peak, performance / capacity (MiB) |
 | --- | --- | ---: | ---: | ---: |
-| C32, lmax 1 | Inference | 62.1 / 65,961 | 92.9 / 44,113 | 1,706 / 776 |
-| C32, lmax 1 | Training + AdamW | 143.6 / 28,525 | 292.1 / 14,025 | 3,595 / 2,007 |
-| C64, lmax 2 | Inference | 139.5 / 29,365 | 313.9 / 13,047 | 8,865 / 2,330 |
-| C64, lmax 2 | Training + AdamW | 398.8 / 10,270 | 921.7 / 4,444 | 19,279 / 4,613 |
+| C32, lmax 1 | Inference | 60.4 / 67,854 | 92.9 / 44,113 | 1,704 / 776 |
+| C32, lmax 1 | Training + AdamW | 138.8 / 29,501 | 292.1 / 14,025 | 3,597 / 2,007 |
+| C64, lmax 2 | Inference | 112.2 / 36,521 | 313.9 / 13,047 | 5,299 / 2,330 |
+| C64, lmax 2 | Training + AdamW | 304.1 / 13,470 | 921.7 / 4,444 | 12,607 / 4,613 |
 
-The paired baseline is the preceding performance mode, with per-path GEMMs.
-Grouped messages reduce C64 inference latency from 207.4 to 139.5 ms and training
-from 635.2 to 398.8 ms, increasing throughput by 48.7% and 59.3%, respectively.
-C64 allocation peaks decrease from 9,499 to 8,865 MiB for inference and from
-21,912 to 19,279 MiB for training. The 512-atom C32/C64 checks retain the existing
-small-chunk route; their largest measured regression is below 1%.
+The paired baseline is the preceding grouped-GEMM performance mode. Native
+gate/reduction epilogues reduce C64 inference latency from 138.5 to 112.2 ms
+and full training from 397.1 to 304.1 ms. C64 allocation peaks decrease from
+8,864 to 5,299 MiB for inference and from 19,580 to 12,607 MiB for training.
+The corresponding throughput increases are 23.5% for inference and 30.6% for training.
+The 512-atom checks and the narrower C32/lmax-1 messages retain the preceding
+route. Dispatch depends on the actual working set rather than fixed model
+hyperparameters.
+
+Across seven channel/degree configurations spanning 16–128 channels, the
+18 paired measurements show no latency regression above 1%. Memory savings
+depend on the workload: C96/lmax-2 training is 19.3% faster, but its allocation
+peak increases by 7.6%.
 
 Performance figures use the latest paired run. Capacity and native figures come
 from their earlier qualification with the same protocol and unchanged kernels.
