@@ -153,7 +153,7 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
                 or high_l_policy != "auto" or reference_buffer_policy != "auto"):
             raise ValueError("CUDA scheduling overrides are not implemented by the Ascend backend")
         return configure_ascend(model, training=training, policy=policy, capture=capture,
-                                edge_chunk_size=16384 if message_chunk_edges is None else message_chunk_edges)
+                                edge_chunk_size=message_chunk_edges)
     from mace_ictc.models.fp32_policy import strict_fp32
     strict_fp32()
     _layout(layout)

@@ -1,10 +1,11 @@
 # ICTC-O3-HP-Ascend
 
 ICTC-O3 Cartesian tensor operators and the MACE-ICTC framework for Ascend NPUs.
-Tensor products use shared geometry projections and FP32 batched GEMMs.
-Symmetric contractions combine shared CG prefixes, bounded GEMM scratch storage
-and analytic adjoints. Triton-Ascend supplies sparse fallbacks and generated
-direction harmonics.
+Ascend C kernels cover tensor products, fused graph messages, symmetric
+contractions, direction harmonics, nonlinearities and FP32 channel transforms.
+Hardware-derived UB tiling supports odd channel counts, tails and streamed
+coupling tables. Performance and capacity modes combine these kernels with
+CANN GEMMs according to the measured workload.
 
 Version 0.1.0. Distribution: `ictc-o3-hp-ascend`. Python packages: `ictc_o3`
 for standalone operators and `mace_ictc` for models, training and checkpoints.
@@ -22,6 +23,9 @@ python -m pip install 'torch==2.7.1' 'torch_npu==2.7.1.post4'
 python -m pip install 'triton-ascend==3.2.1' pybind11 \
   --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
 python -m pip install -e '.[train]'
+python -m pip install 'cmake>=3.16' ninja
+python -m mace_ictc.ascendc.build --output /path/to/build/ictc_ascendc --jobs 4
+export ICTC_ASCENDC_LIBRARY=/path/to/build/ictc_ascendc/libictc_ascendc.so
 ```
 
 Triton-Ascend supplies the `triton` namespace. Install it after other packages
@@ -37,6 +41,9 @@ unlink semantics cause compiler cleanup errors.
 import torch
 import torch_npu
 from mace_ictc.hp import create_model, configure_model, energy_and_forces
+from mace_ictc.ascendc import enable
+
+enable(mode='performance')  # 'capacity' saves memory; 'native' uses custom Cube GEMMs
 
 model = create_model(
     channels=64, lmax=2, num_interactions=2, correlation=3, device='npu',
@@ -62,6 +69,8 @@ The factory creates initialized weights. It does not provide a trained potential
 `policy='reference'` selects the inherited differentiable PyTorch implementation;
 `policy='generated'` requires NPU coverage and reports unsupported configurations.
 Run [`examples/model.py`](examples/model.py) for a complete synthetic training step.
+Add `--ascendc --ascendc-mode performance` to use the built library. The default
+without `enable()` retains the Triton/GEMM implementation.
 
 ## Standalone O3 operators
 
@@ -69,6 +78,9 @@ Run [`examples/model.py`](examples/model.py) for a complete synthetic training s
 import torch
 import torch_npu
 from ictc_o3 import EdgeTensorProduct, direction_harmonics
+from mace_ictc.ascendc import enable
+
+enable(mode='capacity')
 
 op = EdgeTensorProduct.create(channels=64, input_lmax=2, edge_lmax=2)
 features = torch.randn(1024, 64*9, device='npu', requires_grad=True)
@@ -87,18 +99,35 @@ species banks and symmetric contractions, and [the upstream provenance](UPSTREAM
   ICTC coupling constants and preserve path order.
 - Symmetric contractions share CG prefixes and read species weights directly, without
   materializing a node-sized path-weight bank or sorting nodes by species.
-- Matrix contraction schedules bound scratch storage and retain a sparse fallback
-  when constant or species-bank matrices exceed the configured memory limits.
+- Native vector schedules account for double buffers, work vectors, gather and
+  graph indices, masks and coupling metadata before selecting row/channel tiles.
+  The tested 910B3 reports 196,352 available UB bytes and 40 Vector Cores. The
+  automatic reserve is one sixth of reported UB, rounded up to 4 KiB. These are
+  scheduling choices, with no fixed model hyperparameters.
 - Learned weight names and shapes are retained; configuration does not freeze or cast parameters.
-- Tensor-product derivatives use PyTorch NPU matrix operations. Symmetric contractions
-  have analytic first and mixed second adjoints; higher derivatives retain
-  differentiable PyTorch formulas.
+- Performance mode uses analytic tensor-product adjoints that preserve contiguous
+  channel blocks. Training retains ordinary per-path GEMM autograd, which is faster
+  for the measured force-loss workload. Standalone tensor products and symmetric
+  contractions have analytic first and mixed second adjoints; higher derivatives
+  retain differentiable PyTorch formulas.
+- Capacity mode fuses source gathering, tensor products and FP32 atomic
+  destination accumulation, with analytic first and mixed second adjoints.
+  Native mode additionally selects custom strict-FP32 Cube matrix kernels.
+  Both transpose flags and wide ND transfer strides are handled explicitly.
 - Channels, element count, interaction depth and graph size are runtime parameters.
   Native symmetric contractions currently cover correlation orders 1, 2 and 3.
-- Edge chunking bounds forward intermediates. PyTorch gathers and destination reductions
-  remain part of the current graph path.
+- Whole-model edge chunks are sized from the actual channel, angular and path widths.
+  Set `message_chunk_edges=16384` for smaller forward intermediates; automatic sizing
+  favors throughput and can increase the allocation peak. See the API guide for
+  the scratch estimate. Performance mode retains PyTorch graph accumulation;
+  capacity/native modes perform it inside Ascend C kernels.
 - FP32 execution disables HF32 and requires autocast to be off. No reduced-precision
   approximation is used.
+
+Ordinary framework layout operations, loss construction, small broadcast
+products and some reductions still use PyTorch NPU. A full native execution
+option is provided for tuning; it is slower than the selected vendor-GEMM
+combination at the measured points.
 
 The current execution route is eager on one NPU. Multi-NPU HCCL, compiled export,
 long-range electrostatics and Ascend LAMMPS deployment are not qualified in this
@@ -110,12 +139,14 @@ their presence does not establish NPU support.
 On an Ascend 910B3, four initialized model configurations cover angular degrees
 1–3, correlation orders 1–3 and one to three interactions. Energies, forces and
 the parameter and position gradients of the energy-and-force loss pass CPU FP64 comparisons;
-the maximum observed relative L2 error is `2.23e-6`.
+the maximum observed relative L2 error across all three modes is `2.31e-6`.
 
 Validation also covers 28 sparse-operator checks, both packed layouts, chunked
 masked graph messages, empty graphs, mutable species metadata, rectangular
 channel transforms for multiple atomic species and an energy-and-force trainer
-step with AdamW. These checks
+step with AdamW. Native Cube checks include every transpose/bias combination,
+frozen operands and mixed derivatives, including a reduction width of 65,537.
+Nonlinearity and direction-polynomial checks include third derivatives. These checks
 use synthetic inputs and do not establish the accuracy of a fitted potential.
 
 ## Training and inference performance
@@ -123,18 +154,26 @@ use synthetic inputs and do not establish the accuracy of a fitted potential.
 One active Ascend 910B3, FP32 with HF32 disabled, eager execution. Each model has
 two interactions and correlation order 3. The following points use 4,096 atoms
 and 56 directed neighbors per atom, with identical initialized weights and graphs
-for Ascend HP and the inherited PyTorch NPU reference.
+for every route. All latencies include both energy and forces.
 
-| Model | Operation | Reference → HP (ms/step) | Speedup | HP atom-steps/s |
+| Model | Operation | Performance ms / atom-steps/s | Capacity ms / atom-steps/s | Allocated peak, performance / capacity (MiB) |
 | --- | --- | ---: | ---: | ---: |
-| C32, lmax 1 | Energy + forces | 748.4 → 127.4 | 5.87× | 32,146 |
-| C32, lmax 1 | Energy + force loss + AdamW | 1,486.1 → 308.4 | 4.82× | 13,280 |
-| C64, lmax 2 | Energy + forces | 3,271.2 → 332.6 | 9.84× | 12,316 |
-| C64, lmax 2 | Energy + force loss + AdamW | 6,883.6 → 832.7 | 8.27× | 4,919 |
+| C32, lmax 1 | Inference | 69.6 / 58,878 | 92.9 / 44,113 | 1,771 / 776 |
+| C32, lmax 1 | Training + AdamW | 160.8 / 25,473 | 292.1 / 14,025 | 3,621 / 2,007 |
+| C64, lmax 2 | Inference | 206.3 / 19,850 | 313.9 / 13,047 | 9,496 / 2,330 |
+| C64, lmax 2 | Training + AdamW | 634.0 / 6,460 | 921.7 / 4,444 | 21,901 / 4,613 |
 
-For C64/lmax 2, the incremental allocated NPU memory peak changes from
-23,936 to 8,191 MiB for inference and from 43,577 to 16,059 MiB for training.
-This is the PyTorch allocation peak above the warmed baseline; it excludes
+The comparison baseline is the previous optimized Ascend HP implementation,
+using automatic edge chunks, structured inference adjoints and GEMM training.
+Performance mode reduces C64 inference latency from 230.1 to 206.3 ms and
+training from 740.0 to 634.0 ms, increasing training throughput by 16.7%.
+Its C64 training allocation peak increases from 16,032 to 21,901 MiB.
+Capacity mode reduces C64 allocation peaks by 76.3% for inference and 71.2%
+for training versus the previous HP route, with higher latency.
+
+Full native mode measures 337.2/1,053.5 ms for C64 inference/training, with
+2,330/4,611 MiB peaks. It is an explicit alternative, not the performance default.
+Memory values are PyTorch allocation peaks above the warmed baseline; they exclude
 driver memory and external runtime allocations and is not an OOM-capacity test.
 
 Measurements are medians of three alternating paired rounds, three calls per

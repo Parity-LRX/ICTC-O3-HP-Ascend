@@ -11,8 +11,13 @@ def main():
     parser.add_argument('--channels', type=int, default=64)
     parser.add_argument('--lmax', type=int, default=2)
     parser.add_argument('--edges', type=int, default=1024)
+    parser.add_argument('--ascendc', action='store_true', help='Load ICTC_ASCENDC_LIBRARY')
+    parser.add_argument('--ascendc-mode', choices=('performance','capacity','native'), default='performance')
     args = parser.parse_args()
     torch.npu.set_device(0)
+    if args.ascendc:
+        from mace_ictc.ascendc import enable
+        enable(mode=args.ascendc_mode)
     op = EdgeTensorProduct.create(channels=args.channels, input_lmax=args.lmax,
                                    edge_lmax=args.lmax)
     x = torch.randn(args.edges, args.channels*(args.lmax+1)**2,

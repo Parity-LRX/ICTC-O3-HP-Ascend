@@ -73,11 +73,13 @@ def check_model(model, *, training=False, capture=False):
 
 
 def configure_model(model, *, training=False, policy="auto", capture=False,
-                    edge_chunk_size=16384):
+                    edge_chunk_size=None):
+    from mace_ictc.ascendc.runtime import is_enabled,mode,native_graph_enabled
     if policy not in ("auto", "generated", "reference"):
         raise ValueError("policy must be auto, generated or reference")
-    if not isinstance(edge_chunk_size, int) or isinstance(edge_chunk_size, bool) or edge_chunk_size < 1:
-        raise ValueError("edge_chunk_size must be a positive integer")
+    if edge_chunk_size is not None and (not isinstance(edge_chunk_size, int)
+            or isinstance(edge_chunk_size, bool) or edge_chunk_size < 1):
+        raise ValueError("edge_chunk_size must be a positive integer or None for automatic sizing")
     from mace_ictc.models.operator_plans import mace_backbone_core, configure_mace_runtime_plan
     core = mace_backbone_core(model)
     coverage = check_model(model, training=training, capture=capture)
@@ -91,6 +93,10 @@ def configure_model(model, *, training=False, policy="auto", capture=False,
     # index_add accepts arbitrary edge order; integer sorting would introduce
     # an unnecessary AiCPU operation and host synchronization on every call.
     core.preserve_edge_order = True if selected else core._ascend_original_edge_order
+    if selected:
+        if is_enabled():
+            from mace_ictc.ascendc.linear import prepare_model
+            prepare_model(core)
     for module in core.modules():
         module._ascend_hp = selected
     if selected:
@@ -98,8 +104,14 @@ def configure_model(model, *, training=False, policy="auto", capture=False,
         core._fused_direction_harmonics = True
         for layer in core.interactions:
             layer._ascend_edge_chunk_size = edge_chunk_size
+            # First-adjoint packing helps force inference. Ordinary path GEMMs
+            # remain faster when the force graph must be differentiated again.
+            layer.tp._ascend_tp_schedule = "gemm" if training else "structured"
     return {"requested": policy, "selected": "generated" if selected else "reference",
             "backend": "ascend", "reasons": coverage["reasons"] if policy != "reference" else [],
             "arithmetic": "strict FP32; HF32 and autocast disabled",
-            "edge_chunk_size": edge_chunk_size if selected else None,
+            "edge_chunk_size": ("auto" if edge_chunk_size is None else edge_chunk_size) if selected else None,
+            "kernel_backend": ("ascendc" if is_enabled() else "triton_gemm") if selected else "reference",
+            "ascendc_mode": mode() if selected and is_enabled() else None,
+            "tensor_product_adjoint": ("analytic" if native_graph_enabled() or not training else "autograd") if selected else None,
             "counts": {"interactions": len(getattr(core, "interactions", ()))}}

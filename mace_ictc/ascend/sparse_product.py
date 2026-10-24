@@ -126,6 +126,9 @@ if triton is not None:
 
 
 def available():
+    from mace_ictc.ascendc.runtime import is_enabled
+    if is_enabled():
+        return True
     if triton is None:
         return False
     try:
@@ -136,6 +139,10 @@ def available():
 
 
 def _raw(left, right, weight, index, plan, bank, mode=0, grad=None):
+    from mace_ictc.ascendc.runtime import is_enabled
+    if is_enabled() or '_ascendc_graph' in plan:
+        from mace_ictc.ascendc.product import raw
+        return raw(left,right,weight,index,plan,bank,mode,grad)
     if plan.get("_ascend_gemm",False):
         from .dense_product import raw
         return raw(left,right,weight,index,plan,bank,mode,grad)
@@ -181,12 +188,27 @@ def _raw(left, right, weight, index, plan, bank, mode=0, grad=None):
 
 
 def _reference(left, right, weight, index, plan, bank):
+    graph=plan.get('_ascendc_graph')
+    nodes=left.shape[0] if graph is None else graph.get('destination_nodes',left.shape[0])
+    if graph is not None:
+        left=left.index_select(0,graph['src'])
     selected = weight if not bank else (weight[index] if index is not None else weight)
     result = left.new_zeros(left.shape[0], left.shape[1], plan["sizes"][3])
     for a, b, p, out, coefficient in plan["entries"]:
         term = left[:, :, a]*right[:, :, b]*(selected[:, :, p]*coefficient)
         result[:, :, out] = result[:, :, out]+term
+    if graph is not None:
+        if graph['mask'] is not None:
+            result=result*graph['mask'][:,None,None]
+        result=result.new_zeros(nodes,result.shape[1],result.shape[2]).index_add(0,graph['dst'],result)
     return result
+
+
+def _graph_tensors(plan):
+    graph=plan.get('_ascendc_graph')
+    if graph is None:
+        return ()
+    return (graph['src'],graph['dst'],*(() if graph['mask'] is None else (graph['mask'],)))
 
 
 class _Adjoint(torch.autograd.Function):
@@ -194,14 +216,15 @@ class _Adjoint(torch.autograd.Function):
     def forward(ctx, left, right, weight, grad, index, plan, bank, needed):
         ctx.set_materialize_grads(False)
         ctx.save_for_backward(left, right, weight, grad,
-                              left.new_empty(0, dtype=torch.int64) if index is None else index)
+                              left.new_empty(0, dtype=torch.int64) if index is None else index,
+                              *_graph_tensors(plan))
         ctx.spec = plan, bank, needed, index is not None
         return tuple(_raw(left, right, weight, index, plan, bank, mode+1, grad)
                      if need else None for mode, need in enumerate(needed))
 
     @staticmethod
     def backward(ctx, hleft, hright, hweight):
-        left, right, weight, grad, saved_index = ctx.saved_tensors
+        left, right, weight, grad, saved_index, *_ = ctx.saved_tensors
         plan, bank, first_needed, indexed = ctx.spec
         index = saved_index if indexed else None
         from mace_ictc.models.adjoint_requirements import required_gradients
@@ -245,13 +268,14 @@ class _Product(torch.autograd.Function):
     @staticmethod
     def forward(ctx, left, right, weight, index, plan, bank):
         ctx.save_for_backward(left, right, weight,
-                              left.new_empty(0, dtype=torch.int64) if index is None else index)
+                              left.new_empty(0, dtype=torch.int64) if index is None else index,
+                              *_graph_tensors(plan))
         ctx.spec = plan, bank, index is not None
         return _raw(left, right, weight, index, plan, bank)
 
     @staticmethod
     def backward(ctx, grad):
-        left, right, weight, saved_index = ctx.saved_tensors
+        left, right, weight, saved_index, *_ = ctx.saved_tensors
         plan, bank, indexed = ctx.spec
         index = saved_index if indexed else None
         from mace_ictc.models.adjoint_requirements import required_gradients

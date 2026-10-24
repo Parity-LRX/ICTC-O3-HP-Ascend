@@ -48,7 +48,7 @@ def _plan(owner, sample, input_degrees, edge_degrees):
     result = sparse_product_plan(entries, (a, bond_width if preproject else b, owner.num_paths, out),
                                  sample.device, sample.dtype)
     if preproject:
-        projection = torch.zeros(b, bond_width, dtype=sample.dtype)
+        projection = torch.zeros(b, bond_width, device="cpu", dtype=sample.dtype)
         for row, column, value in projection_entries:
             projection[row, column] = value
         result["bond_projection"] = projection.to(sample.device)
@@ -64,7 +64,8 @@ def _sparse_tensor_product(owner, features, harmonics, gates=None):
     rows, channels = left.shape[:2]
     if "bond_projection" in plan:
         projection = plan["bond_projection"]
-        right = ((right.squeeze(1) @ projection).unsqueeze(1) if rows
+        from .structured_product import _FixedLinear
+        right = (_FixedLinear.apply(right.squeeze(1), projection).unsqueeze(1) if rows
                  else right.reshape(0, 1, projection.shape[1]))
     weight = owner.weight.T.unsqueeze(0)
     if gates is None:
@@ -85,11 +86,14 @@ def _sparse_tensor_product(owner, features, harmonics, gates=None):
 
 
 def tensor_product(owner, features, harmonics, gates=None):
-    """Apply the original ICTC map with one FP32 batched GEMM per path."""
+    """Apply the original map with shared geometry and per-path FP32 GEMMs."""
+    from mace_ictc.ascendc.runtime import native_graph_enabled
+    if native_graph_enabled():
+        return _sparse_tensor_product(owner,features,harmonics,gates)
     sample=next(iter(features.values()))
     rows,channels=sample.shape[:2]
     if (not rows or not getattr(owner,"_ascend_tp_preproject",True)
-            or getattr(owner,"_ascend_tp_schedule","gemm")=="sparse"):
+            or getattr(owner,"_ascend_tp_schedule","structured")=="sparse"):
         return _sparse_tensor_product(owner,features,harmonics,gates)
     from .runtime import require_npu_fp32
     require_npu_fp32(owner.weight,*features.values(),*harmonics.values(),
@@ -98,6 +102,9 @@ def tensor_product(owner, features, harmonics, gates=None):
             (rows,owner.num_paths*channels),(rows,owner.num_paths,channels)):
         raise ValueError("External gates must have shape [E,P*C] or [E,P,C]")
     plan=_plan(owner,sample,sorted(features),sorted(harmonics))
+    if getattr(owner,"_ascend_tp_schedule","structured")=="structured":
+        from .structured_product import tensor_product as structured_product
+        return structured_product(owner,features,harmonics,gates,plan)
     sh=torch.cat([harmonics[l] for l in sorted(harmonics)],-1).squeeze(1)
     bond=sh@plan["bond_projection"]
     weights=(owner.weight[None] if gates is None else
@@ -117,10 +124,29 @@ def tensor_product(owner, features, harmonics, gates=None):
             for l,blocks in output.items()}
 
 
+def _automatic_edge_chunk(owner, sample, features, harmonics):
+    """Estimate forward scratch from the actual channel and angular widths."""
+    channels = sample.shape[1]
+    angular = sum(2*l+1 for l in features)
+    output = sum(count*(2*l+1) for l,count in owner.path_counts_by_l.items())
+    bond = sum((2*i+1)*(2*k+1) for i,j,k in owner.paths
+               if i in features and j in harmonics)
+    bytes_per_edge = sample.element_size()*(channels*(angular+output+2*owner.num_paths)+bond)
+    limit = max(1, min(131072, (3*1024**3)//max(1, bytes_per_edge)))
+    return (limit//128)*128 if limit >= 128 else limit
+
+
 def graph_message(owner, features, harmonics, gates, src, dst, mask=None,
                   *, edge_chunk_size=16384):
     """Bound edge intermediates while retaining ordinary differentiable gathers."""
+    from mace_ictc.ascendc.runtime import native_graph_enabled
+    if (native_graph_enabled() and getattr(owner,'_ascend_tp_preproject',True)
+            and (mask is None or not mask.requires_grad)):
+        from mace_ictc.ascendc.graph import graph_message as native_graph
+        return native_graph(owner,features,harmonics,gates,src,dst,mask,edge_chunk_size=edge_chunk_size)
     sample = next(iter(features.values()))
+    if edge_chunk_size is None:
+        edge_chunk_size = _automatic_edge_chunk(owner, sample, features, harmonics)
     nodes, channels = sample.shape[:2]
     output = {l: sample.new_zeros(nodes, owner.path_counts_by_l.get(l, 0)*channels, 2*l+1)
               for l in range(owner.lmax+1)}

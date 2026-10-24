@@ -12,6 +12,10 @@ def channel_linear(features, weight, bias=None):
         raise ValueError("Expected features [...,I,M] and weight [O,I]")
     if bias is not None and (features.shape[-1] != 1 or bias.shape != (weight.shape[0],)):
         raise ValueError("Bias is allowed only for scalar angular blocks with shape [O]")
+    from mace_ictc.ascendc.runtime import is_enabled
+    if is_enabled():
+        from mace_ictc.ascendc.linear import channel_linear as native_linear
+        return native_linear(features,weight,bias)
     angular = features.movedim(-2, -1).contiguous()
     result = F.linear(angular.reshape(-1, weight.shape[1]), weight, bias)
     return result.reshape(*angular.shape[:-1], weight.shape[0]).movedim(-1, -2)
@@ -33,6 +37,10 @@ def species_channel_linear(features, weight, species, bias=None):
     validate_species(species, weight.shape[0])
     if bias is not None and (features.shape[-1] != 1 or bias.shape != weight.shape[:2]):
         raise ValueError("Bias is allowed only for scalar angular blocks with shape [S,O]")
+    from mace_ictc.ascendc.runtime import is_enabled
+    if is_enabled():
+        from mace_ictc.ascendc.linear import species_channel_linear as native_species_linear
+        return native_species_linear(features,weight,species,bias)
     angular = features.transpose(1, 2).contiguous()
     flat = angular.reshape(-1, angular.shape[-1])
     result = None

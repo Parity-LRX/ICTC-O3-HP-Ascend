@@ -179,6 +179,12 @@ class _Harmonics(torch.autograd.Function):
 def generated_direction_harmonics(n,lmax):
     if (torch.compiler.is_compiling() or get_proxy_mode() is not None or is_fake(n)
             or torch._C._are_functorch_transforms_active()):return None
+    if (n.device.type=="npu" and n.dtype==torch.float32 and n.ndim==2 and n.shape[-1]==3
+            and isinstance(lmax,int) and not isinstance(lmax,bool) and lmax>=0):
+        from mace_ictc.ascendc.runtime import is_enabled
+        if is_enabled():
+            from mace_ictc.ascendc.direction import direction_harmonics
+            return direction_harmonics(n,lmax)
     if (triton is None or n.device.type not in ("cuda", "npu") or n.dtype!=torch.float32 or n.ndim!=2 or n.shape[-1]!=3
             or not isinstance(lmax,int) or isinstance(lmax,bool) or lmax<0 or torch.is_autocast_enabled(n.device.type)):
         return None

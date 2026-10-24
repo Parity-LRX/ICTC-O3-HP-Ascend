@@ -208,6 +208,10 @@ def normalized_silu(features, scale=1.):
     require_npu_fp32(features)
     if not isinstance(scale, (int, float)) or isinstance(scale, bool):
         raise TypeError("scale must be a fixed numeric scalar")
+    from mace_ictc.ascendc.runtime import is_enabled
+    if is_enabled():
+        from mace_ictc.ascendc.elementwise import normalized_silu as native_silu
+        return native_silu(features,scale)
     return F.silu(features)*float(scale)
 
 

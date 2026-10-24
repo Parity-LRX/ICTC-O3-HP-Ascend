@@ -13,8 +13,13 @@ def main():
     parser.add_argument('--lmax', type=int, default=2)
     parser.add_argument('--correlation', type=int, choices=(1, 2, 3), default=3)
     parser.add_argument('--layers', type=int, default=2)
+    parser.add_argument('--ascendc', action='store_true', help='Load ICTC_ASCENDC_LIBRARY')
+    parser.add_argument('--ascendc-mode', choices=('performance','capacity','native'), default='performance')
     args = parser.parse_args()
     torch.npu.set_device(0)
+    if args.ascendc:
+        from mace_ictc.ascendc import enable
+        enable(mode=args.ascendc_mode)
     torch.manual_seed(73)
     model = create_model(channels=args.channels, lmax=args.lmax,
                          correlation=args.correlation, num_interactions=args.layers, cutoff=4.5)

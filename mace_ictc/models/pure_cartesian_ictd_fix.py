@@ -667,6 +667,11 @@ class _Normalize2MomSiLU(nn.Module):
     _scale = 1.6791767923989418
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if getattr(self,"_ascend_hp",False) and x.device.type=="npu":
+            from mace_ictc.ascendc.runtime import is_enabled
+            if is_enabled():
+                from mace_ictc.ascendc.elementwise import normalized_silu
+                return normalized_silu(x,self._scale)
         if getattr(self,"_fuse_activation",False):
             from .fused_activation import normalized_silu
             return normalized_silu(x,self._scale)
