@@ -99,10 +99,12 @@ species banks and symmetric contractions, and [the upstream provenance](UPSTREAM
   ICTC coupling constants and preserve path order.
 - Symmetric contractions share CG prefixes and read species weights directly, without
   materializing a node-sized path-weight bank or sorting nodes by species.
-- Native vector schedules account for double buffers, work vectors, gather and
+- Native vector schedules account for input/output queue storage, work vectors, gather and
   graph indices, masks and coupling metadata before selecting row/channel tiles.
   The tested 910B3 reports 196,352 available UB bytes and 40 Vector Cores. The
-  automatic reserve is one sixth of reported UB, rounded up to 4 KiB. These are
+  generic multilinear maps reserve one sixth of reported UB, rounded up to
+  4 KiB. Graph epilogues and narrow matrix adjoints use a 4 KiB guard after
+  accounting for their explicit queues and workspaces. These are
   scheduling choices, with no fixed model hyperparameters.
 - Learned weight names and shapes are retained; configuration does not freeze or cast parameters.
 - Performance graph messages keep channels contiguous, group paths by their
@@ -117,9 +119,16 @@ species banks and symmetric contractions, and [the upstream provenance](UPSTREAM
   their requested edge gradients and combined node accumulation in one kernel.
   Tiling budgets all active operands and outputs; unsupported tiles retain
   separate adjoints. Small workloads retain the established path.
+  Each input-degree group can accumulate into a compact node buffer; node-sized
+  angular reordering restores the public path order. This keeps graph transfers
+  contiguous without changing coupling coefficients. Narrow batched adjoints
+  use bounded Vector schedules where applicable, with CANN fallback.
   Recursive matrix adjoints retain live first, mixed second and higher derivatives. Standalone edge products
   retain their analytic path adjoints; symmetric contractions use analytic first
   and mixed second adjoints with differentiable higher-order formulas.
+- The quadratic prefix of symmetric contraction shares one combined input
+  adjoint. Performance-mode geometry uses row gathers and a single-cell matrix
+  product while retaining derivatives of positions, cells and periodic shifts.
 - Capacity mode fuses source gathering, tensor products and FP32 atomic
   destination accumulation, with analytic first and mixed second adjoints.
   Native mode additionally selects custom strict-FP32 Cube matrix kernels.
@@ -150,8 +159,9 @@ their presence does not establish NPU support.
 
 On an Ascend 910B3, four initialized model configurations cover angular degrees
 1–3, correlation orders 1–3 and one to three interactions. Energies, forces and
-the parameter and position gradients of the energy-and-force loss pass CPU FP64 comparisons;
-the maximum observed relative L2 error across all three modes is `2.312e-6`.
+the parameter and position gradients of the energy-and-force loss pass CPU FP64
+comparisons. The latest performance-mode qualification requires relative L2 error
+at most `1e-4` and pointwise error at most `2e-5 + 1e-4 * abs(reference)`.
 
 Validation also covers 28 sparse-operator checks, both packed layouts, chunked
 masked graph messages, empty graphs, mutable species metadata, rectangular
@@ -166,45 +176,58 @@ channels, fixed masks, frozen operands and strided graph indices through third
 derivatives. Fused adjoints also cover every requested output subset, missing
 higher-adjoint inputs and strided input views against FP64. These checks use
 synthetic inputs and do not establish the accuracy of a fitted potential.
+The latest qualification also covers 204 batched-matrix cases, single-input
+quadratic derivatives and single/multiple-cell geometry through third derivatives,
+including live cell and periodic-shift inputs.
 
 ## Training and inference performance
 
 One active Ascend 910B3, FP32 with HF32 disabled, eager execution. Each model has
 two interactions and correlation order 3. The following points use 4,096 atoms
-and 56 directed neighbors per atom, with identical initialized weights and graphs
-for every route. All latencies include both energy and forces.
+and 56 directed neighbors per atom. Baseline and current performance mode use
+identical initialized weights and graphs. All latencies include energy and forces.
 
-| Model | Operation | Performance ms / atom-steps/s | Capacity ms / atom-steps/s | Allocated peak, performance / capacity (MiB) |
+| Model | Operation | Previous → current (ms) | Current atom-steps/s | Allocated peak (MiB) |
 | --- | --- | ---: | ---: | ---: |
-| C32, lmax 1 | Inference | 60.8 / 67,393 | 92.9 / 44,113 | 1,704 / 776 |
-| C32, lmax 1 | Training + AdamW | 141.6 / 28,918 | 292.1 / 14,025 | 3,597 / 2,007 |
-| C64, lmax 2 | Inference | 105.4 / 38,872 | 313.9 / 13,047 | 5,300 / 2,330 |
-| C64, lmax 2 | Training + AdamW | 273.2 / 14,995 | 921.7 / 4,444 | 10,956 / 4,613 |
+| C32, lmax 1 | Inference | 59.59 → 54.21 | 75,560 | 1,692 |
+| C32, lmax 1 | Training + AdamW | 138.38 → 134.73 | 30,401 | 3,595 |
+| C64, lmax 2 | Inference | 105.29 → 84.40 | 48,532 | 5,272 |
+| C64, lmax 2 | Training + AdamW | 273.41 → 236.13 | 17,346 | 10,797 |
 
-The paired baseline is the preceding performance mode with native epilogues and
-separate adjoints. Sharing first-adjoint transfers and fusing mixed second
-adjoints reduces C64 inference from 112.0 to 105.4 ms and full training from
-303.9 to 273.2 ms. Throughput increases by 6.3% and 11.3%, respectively.
-C64 allocation peaks are unchanged within this paired run; cross-run peaks
-also depend on allocation history.
+The paired baseline retains the preceding fused native epilogues. Compact node
+outputs, contiguous row gathers, narrow Vector adjoints and revised UB schedules
+increase C64 inference throughput by 24.8% and full training throughput by 15.8%.
+All optimizations are selected by actual shapes and hardware limits.
 
-Across seven channel/degree configurations spanning 16–128 channels, the
-18 paired measurements show no latency regression above 1%. The 512-atom
-checks and narrower working sets retain the preceding route. Dispatch uses the
-actual geometry and UB budget. C96/lmax-2 training improves from 476.8 to
-429.8 ms, with a 1.1% decrease in its allocation peak.
+Across seven channel/degree configurations spanning 16–128 channels, 18 paired
+measurements at 512 or 4,096 atoms show no observed latency regression.
+Memory savings are shape-dependent: C96/lmax-2 training improves from 431.07 to
+392.99 ms, while its allocation peak increases from 30,850 to 33,445 MiB.
+
+### Matched single-device K100 comparison
+
+The C64/lmax-2 case above also loads the same saved weights, exact graph and
+trainable parameter set on one K100. Loss, AdamW hyperparameters and timing
+protocol match. Both devices use eager FP32 with HF32/TF32 disabled.
+
+| Operation | K100 (ms) | Ascend 910B3 (ms) | Ascend / K100 latency |
+| --- | ---: | ---: | ---: |
+| Energy + force inference | 40.63 | 84.40 | 2.08× |
+| Energy + force training + AdamW | 112.68 | 236.13 | 2.10× |
+
+These ratios describe this initialized model and fixed graph, rather than a
+hardware-wide performance ratio.
+
+### Sustained training and measurement protocol
 
 A separate continuous-training check uses 64 timed steps per route, six warmups,
 alternating 16-step blocks, per-step synchronization and Python garbage collection
-enabled. C64 mean step time decreases from 304.2 to 273.5 ms, increasing sustained
-throughput by 11.2%; the largest observed step on the new route is 273.8 ms.
+enabled. C64 mean step time decreases from 272.65 to 243.44 ms, increasing
+sustained throughput by 12.0% to 16,826 atom-steps/s. The new median is 243.36 ms,
+95th percentile 244.25 ms and maximum 245.28 ms. Per-step synchronization makes
+this a different timing protocol from the three-call rounds above.
 
-Performance figures use the latest paired run. Capacity and native figures come
-from their earlier qualification with the same protocol and unchanged kernels.
 Throughput counts processed atoms per energy-and-force call or full training step.
-
-Full native mode measures 337.2/1,053.5 ms for C64 inference/training, with
-2,330/4,611 MiB peaks. It is an explicit alternative, not the performance default.
 Memory values are PyTorch allocation peaks above the warmed baseline; they exclude
 driver memory and external runtime allocations and are not an OOM-capacity test.
 

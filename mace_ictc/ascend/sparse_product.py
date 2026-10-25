@@ -289,6 +289,70 @@ class _Product(torch.autograd.Function):
         return *values, None, None, None
 
 
+class _QuadraticAdjoint(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, grad, ones, plan, adjoint_plan):
+        ctx.save_for_backward(x, grad)
+        ctx.spec = ones, plan, adjoint_plan
+        return _raw(x, x, ones, None, adjoint_plan, True, 1, grad)
+
+    @staticmethod
+    def backward(ctx, h):
+        x, grad = ctx.saved_tensors
+        ones, plan, adjoint_plan = ctx.spec
+        from mace_ictc.models.adjoint_requirements import required_gradients
+        needed = required_gradients((x, grad), ctx.needs_input_grad[:2])
+        if torch.is_grad_enabled():
+            # Partial derivatives use separate local graph nodes even when the
+            # incoming cotangent depends on the original quadratic input.
+            xx, gg = x.clone(), grad.clone()
+            first = torch.autograd.grad(_reference(xx, xx, ones, None, plan, True),
+                                        xx, gg, create_graph=True)[0]
+            active = [v for v, need in zip((xx, gg), needed) if need]
+            values = iter(torch.autograd.grad(first, active, h,
+                                              create_graph=True, allow_unused=True))
+            dx, dg = (next(values) if need else None for need in needed)
+        else:
+            h = h.contiguous()
+            dx = _raw(h, h, ones, None, adjoint_plan, True, 1, grad) if needed[0] else None
+            dg = _raw(h, x, ones, None, adjoint_plan, True) if needed[1] else None
+        return dx, dg, None, None, None
+
+
+class _Quadratic(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, ones, plan, adjoint_plan):
+        ctx.save_for_backward(x)
+        ctx.spec = ones, plan, adjoint_plan
+        return _raw(x, x, ones, None, plan, True)
+
+    @staticmethod
+    def backward(ctx, grad):
+        x, = ctx.saved_tensors
+        ones, plan, adjoint_plan = ctx.spec
+        grad = grad.contiguous()
+        value = (_QuadraticAdjoint.apply(x, grad, ones, plan, adjoint_plan)
+                 if torch.is_grad_enabled()
+                 else _raw(x, x, ones, None, adjoint_plan, True, 1, grad))
+        return value, None, None, None
+
+
+def sparse_quadratic(x, ones, plan, adjoint_plan):
+    """Contract two identical inputs with a single combined input adjoint.
+
+    The derivative plan contains both permutations of each original term.
+    The coefficient bank must be fixed; learnable banks use sparse_product.
+    """
+    from .runtime import require_npu_fp32
+    require_npu_fp32(x, ones)
+    a, b, p, _ = plan['sizes']
+    if (a != b or x.ndim != 3 or x.shape[-1] != a or
+            ones.shape != (1, x.shape[1], p) or ones.requires_grad or
+            tuple(adjoint_plan['sizes']) != tuple(plan['sizes'])):
+        raise ValueError('Invalid fixed-bank quadratic sparse map')
+    return _Quadratic.apply(x.contiguous(), ones.contiguous(), plan, adjoint_plan)
+
+
 def sparse_product(left, right, weight, plan, *, index=None, bank=True):
     """Evaluate a sparse map with a shared, species or per-row weight bank.
 

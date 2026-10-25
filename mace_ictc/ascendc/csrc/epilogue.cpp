@@ -7,9 +7,9 @@ public:
     __aicore__ inline void Init(GM_ADDR left,GM_ADDR right,GM_ADDR grad,GM_ADDR dst,
         GM_ADDR mask,GM_ADDR meta,GM_ADDR indices,GM_ADDR out,uint64_t edges,
         uint64_t ls,uint64_t rs,uint32_t c,uint32_t q,uint32_t p,uint32_t m,
-        uint32_t paths,uint32_t mode,uint32_t rows,uint32_t bc,uint32_t masked,uint32_t dense) {
+        uint32_t paths,uint32_t mode,uint32_t rows,uint32_t bc,uint32_t masked,uint32_t dense,uint32_t hoist) {
         n_=edges;ls_=ls;rs_=rs;c_=c;q_=q;p_=p;m_=m;paths_=paths;mode_=mode;
-        rows_=rows;bc_=bc;masked_=masked;dense_=dense;cb_=(c+bc-1)/bc;
+        transpose_=bool(hoist&8);hoist_=hoist&1;singleIn_=hoist&32;singleOut_=hoist&16;rows_=rows;bc_=bc;masked_=masked;dense_=dense;cb_=(c+bc-1)/bc;
         vec_=rows*q*bc;rc_=rows*bc;
         lsize_=mode==1 ? 0 : vec_;rsize_=mode==2 ? 0 : rows*p*bc;
         gsize_=mode==0 ? 0 : rows*(dense ? m : q)*bc;
@@ -23,11 +23,11 @@ public:
         meta_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(meta));
         ix_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(indices));
         out_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(out));
-        pipe_.InitBuffer(input_,2,inputSize_*4);pipe_.InitBuffer(output_,2,outputSize_*4);
-        pipe_.InitBuffer(work_,(vec_+rc_)*4);pipe_.InitBuffer(index_,((2+dense)*vec_+2*rc_)*4);
+        pipe_.InitBuffer(input_,singleIn_?1:2,inputSize_*4);pipe_.InitBuffer(output_,singleOut_?1:2,outputSize_*4);
+        pipe_.InitBuffer(work_,(vec_+rc_)*4);pipe_.InitBuffer(index_,((2+dense+transpose_)*vec_+2*rc_)*4);
         pipe_.InitBuffer(table_,A8(4*paths_)*4);
         Copy(table_.Get<uint32_t>(),meta_,0,4*paths_);
-        Copy(index_.Get<uint32_t>(),ix_,0,(2+dense)*vec_+2*rc_);
+        Copy(index_.Get<uint32_t>(),ix_,0,(2+dense+transpose_)*vec_+2*rc_);
         Sync<HardEvent::MTE2_S>();Sync<HardEvent::MTE2_V>();
     }
     __aicore__ inline void Process() {
@@ -35,8 +35,9 @@ public:
         uint64_t task=GetBlockIdx();if(task>=tasks)return;
         CopyIn(task);
         for(;task<tasks;task+=GetBlockNum()) {
-            if(task+GetBlockNum()<tasks)CopyIn(task+GetBlockNum());
+            if(!singleIn_ && task+GetBlockNum()<tasks)CopyIn(task+GetBlockNum());
             Compute(task);
+            if(singleIn_ && task+GetBlockNum()<tasks)CopyIn(task+GetBlockNum());
         }
     }
 private:
@@ -76,7 +77,7 @@ private:
             if(rsize_ && !linearR)ReadColumns(x[lsize_+row*p_*bc_],r_,(firstN_+row)*rs_+firstC_,p_,cn_);
             if(gsize_ && dense_)ReadColumns(x[lsize_+rsize_+row*m_*bc_],g_,
                 static_cast<uint64_t>(destinations.GetValue(row))*m_*c_+firstC_,m_,cn_);
-            if(gsize_ && !dense_)for(uint32_t path=0;path<paths_;) {
+            if(gsize_ && !dense_ && !hoist_)for(uint32_t path=0;path<paths_;) {
                 const uint32_t src=table.GetValue(path*4),out=table.GetValue(path*4+2);
                 uint32_t width=table.GetValue(path*4+3);path++;
                 while(path<paths_ && table.GetValue(path*4)==src+width && table.GetValue(path*4+2)==out+width) {
@@ -85,6 +86,16 @@ private:
                 ReadColumns(x[lsize_+rsize_+(row*q_+src)*bc_],g_,
                     (static_cast<uint64_t>(destinations.GetValue(row))*m_+out)*c_+firstC_,width,cn_);
             }
+        }
+        if(gsize_ && !dense_ && hoist_)for(uint32_t path=0;path<paths_;) {
+            const uint32_t src=table.GetValue(path*4),out=table.GetValue(path*4+2);
+            uint32_t width=table.GetValue(path*4+3);path++;
+            while(path<paths_ && table.GetValue(path*4)==src+width && table.GetValue(path*4+2)==out+width) {
+                width+=table.GetValue(path*4+3);path++;
+            }
+            for(uint32_t row=0;row<rn_;row++)
+                ReadColumns(x[lsize_+rsize_+(row*q_+src)*bc_],g_,
+                    (static_cast<uint64_t>(destinations.GetValue(row))*m_+out)*c_+firstC_,width,cn_);
         }
         if(masked_)Copy(x[lsize_+rsize_+gsize_+A8(2*rows_)],mask_,firstN_,rn_);
         input_.EnQue(x);
@@ -100,12 +111,13 @@ private:
         if(mode_==2) {
             if(dense_) {Gather(work,grad,ix[2*vec_+2*rc_],0,lanes);Mul(work,work,left,lanes);}
             else Mul(work,left,grad,lanes);
+            if(transpose_)Gather(left,work,ix[(2+dense_)*vec_+2*rc_],0,vec_);
             Duplicate(y,0.f,outputSize_);
             for(uint32_t path=0;path<paths_;path++) {
                 const uint32_t src=table.GetValue(path*4),p=table.GetValue(path*4+1),width=table.GetValue(path*4+3);
                 for(uint32_t q=0;q<width;q++) {
-                    Gather(tmp,work,ix[2*vec_],(src+q)*bc_*4,rc);
-                    Add(y[p*rc_],y[p*rc_],tmp,rc);
+                    if(transpose_)Add(y[p*rc_],y[p*rc_],left[(src+q)*rc_],rc);
+                    else {Gather(tmp,work,ix[2*vec_],(src+q)*bc_*4,rc);Add(y[p*rc_],y[p*rc_],tmp,rc);}
                 }
                 if(masked_) {
                     Gather(tmp,mask,ix[2*vec_+rc_],0,rc);
@@ -130,6 +142,19 @@ private:
                 DataCopyExtParams cp{static_cast<uint16_t>(q_),cn_*4,(bc_-A8(cn_))/8,(c_-cn_)*4,0};
                 DataCopyPad(out_[((firstN_+row)*q_)*c_+firstC_],ready[row*q_*bc_],cp);
             }
+        } else if(hoist_) {
+            SetAtomicAdd<float>();
+            for(uint32_t path=0;path<paths_;) {
+                const uint32_t src=table.GetValue(path*4),out=table.GetValue(path*4+2);
+                uint32_t width=table.GetValue(path*4+3);path++;
+                while(path<paths_ && table.GetValue(path*4)==src+width && table.GetValue(path*4+2)==out+width) {
+                    width+=table.GetValue(path*4+3);path++;
+                }
+                DataCopyExtParams cp{static_cast<uint16_t>(width),cn_*4,(bc_-A8(cn_))/8,(c_-cn_)*4,0};
+                for(uint32_t row=0;row<rn_;row++)DataCopyPad(out_[(static_cast<uint64_t>(destinations.GetValue(row))*m_+out)*c_+firstC_],
+                    ready[(row*q_+src)*bc_],cp);
+            }
+            SetAtomicNone();
         } else for(uint32_t row=0;row<rn_;row++) {
             const uint64_t node=destinations.GetValue(row);
             SetAtomicAdd<float>();
@@ -151,14 +176,14 @@ private:
     GlobalTensor<float> l_,r_,g_,mask_,out_;GlobalTensor<int64_t> dst_;
     GlobalTensor<uint32_t> meta_,ix_;
     uint64_t n_,ls_,rs_,firstN_;
-    uint32_t c_,q_,p_,m_,paths_,mode_,rows_,bc_,masked_,dense_,cb_,vec_,rc_;
+    uint32_t transpose_,singleIn_,singleOut_,hoist_,c_,q_,p_,m_,paths_,mode_,rows_,bc_,masked_,dense_,cb_,vec_,rc_;
     uint32_t lsize_,rsize_,gsize_,inputSize_,outputSize_,rn_,cn_,firstC_;
 };
 }
 extern "C" __global__ __aicore__ void ictc_epilogue(
     GM_ADDR l,GM_ADDR r,GM_ADDR g,GM_ADDR dst,GM_ADDR mask,GM_ADDR meta,GM_ADDR ix,GM_ADDR out,
     uint64_t n,uint64_t ls,uint64_t rs,uint32_t c,uint32_t q,uint32_t p,uint32_t m,
-    uint32_t paths,uint32_t mode,uint32_t rows,uint32_t bc,uint32_t masked,uint32_t dense) {
+    uint32_t paths,uint32_t mode,uint32_t rows,uint32_t bc,uint32_t masked,uint32_t dense,uint32_t hoist) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    Epilogue kernel;kernel.Init(l,r,g,dst,mask,meta,ix,out,n,ls,rs,c,q,p,m,paths,mode,rows,bc,masked,dense);kernel.Process();
+    Epilogue kernel;kernel.Init(l,r,g,dst,mask,meta,ix,out,n,ls,rs,c,q,p,m,paths,mode,rows,bc,masked,dense,hoist);kernel.Process();
 }

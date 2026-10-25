@@ -1,7 +1,7 @@
 """Channel-contiguous graph epilogues on the Ascend Vector cores."""
 import os
 import torch
-from .runtime import load_library
+from .runtime import load_library,hardware
 
 
 def enabled(mask,groups,channels,rows):
@@ -12,7 +12,26 @@ def enabled(mask,groups,channels,rows):
         raise ValueError('The epilogue policy must be auto, zero or one')
     # Amortize irregular transfers and launches using the actual message volume.
     width=sum(group[2] for group in groups)
-    return policy=='1' or (policy=='auto' and width>=8 and rows*width*channels>=64*1024**2)
+    minimum=int(os.environ.get('ICTC_ASCEND_EPILOGUE_MIN_ELEMENTS',str(64*1024**2)))
+    if minimum<1:raise ValueError('The epilogue minimum working set must be positive')
+    return policy=='1' or (policy=='auto' and width>=8 and rows*width*channels>=minimum)
+
+
+def _buffering():
+    inputs=int(os.environ.get('ICTC_ASCEND_EPILOGUE_INPUT_BUFFERS','1'))
+    outputs=int(os.environ.get('ICTC_ASCEND_EPILOGUE_OUTPUT_BUFFERS','1'))
+    if inputs not in (1,2) or outputs not in (1,2):
+        raise ValueError('Native epilogue buffer counts must be one or two')
+    return inputs,outputs
+
+
+def _transfer_options():
+    hoist=os.environ.get('ICTC_ASCEND_TRANSFER_HOIST','1')
+    transpose=os.environ.get('ICTC_ASCEND_TRANSPOSE_REDUCTION','1')
+    if hoist not in ('0','1') or transpose not in ('0','1'):
+        raise ValueError('Invalid native epilogue transfer policy')
+    inputs,outputs=_buffering()
+    return int(hoist) | (8 if transpose=='1' else 0) | (32 if inputs==1 else 0) | (16 if outputs==1 else 0)
 
 
 def _align(n):
@@ -20,18 +39,20 @@ def _align(n):
 
 
 def supported(groups, masked=False):
-    ub,_ = load_library().hardware()
-    reserve = max(4096,int(os.environ.get('ICTC_ASCEND_EPILOGUE_RESERVE', '32768')))
+    input_slots,output_slots=_buffering()
+    ub,_ = hardware()
+    reserve = max(4096,int(os.environ.get('ICTC_ASCEND_EPILOGUE_RESERVE', '4096')))
     for _,_,q,_,items in groups:
         p,bc = len(items),8
         if q > 1024 or p > 4095:
             return False
         for mode in range(3):
+            transpose=mode==2 and bool(_transfer_options()&8)
             vec,rc = q*bc,bc
             inp = (0 if mode == 1 else vec)+(0 if mode == 2 else p*bc)+(
                 0 if mode == 0 else vec)+8+(8 if masked else 0)
             out = p*bc if mode == 2 else vec
-            if 4*(2*inp+2*out+3*vec+3*rc+_align(4*p))+reserve > ub:
+            if 4*(input_slots*inp+output_slots*out+(3+transpose)*vec+3*rc+_align(4*p))+reserve > ub:
                 return False
     return True
 
@@ -39,15 +60,17 @@ def supported(groups, masked=False):
 def _schedule(plan, sample, mode, masked):
     q,p,_,m = plan['sizes']
     c = sample.shape[1]
-    ub,cores = load_library().hardware()
+    ub,cores = hardware(sample.device)
     cap = int(os.environ.get('ICTC_ASCEND_EPILOGUE_CHANNELS', '64'))
-    reserve = int(os.environ.get('ICTC_ASCEND_EPILOGUE_RESERVE', '32768'))
+    reserve = int(os.environ.get('ICTC_ASCEND_EPILOGUE_RESERVE', '4096'))
     if cap < 8 or cap % 8 or reserve < 4096 or reserve >= ub:
         raise ValueError('Invalid epilogue channel tile or UB reserve')
     requested_dense = int(os.environ.get('ICTC_ASCEND_EPILOGUE_DENSE_G', '0'))
     if requested_dense not in (0,1):
         raise ValueError('The epilogue node-gather override must be zero or one')
-    key = str(sample.device),c,mode,masked,cap,reserve,ub,requested_dense
+    transpose=mode==2 and bool(_transfer_options()&8)
+    input_slots,output_slots=_buffering()
+    key = str(sample.device),c,mode,masked,cap,reserve,ub,requested_dense,transpose,input_slots,output_slots
     cache = plan.setdefault('_ascendc_epilogue_schedule', {})
     if key in cache:
         return cache[key]
@@ -63,7 +86,7 @@ def _schedule(plan, sample, mode, masked):
                     0 if mode == 0 else rows*(m if dense else q)*bc)+_align(2*rows)+(_align(rows) if masked else 0)
                 out = rows*p*bc if mode == 2 else vec
                 # Two input/output slots, work vectors, byte indices and metadata.
-                used = 4*(2*inp+2*out+(3+dense)*vec+3*rc+_align(4*p))
+                used = 4*(input_slots*inp+output_slots*out+(3+dense+transpose)*vec+3*rc+_align(4*p))
                 if used+reserve <= ub:
                     break
                 rows -= 1
@@ -89,6 +112,8 @@ def _schedule(plan, sample, mode, masked):
     if dense:
         packet.extend((r*m*bc+output_for_q[a]*bc+ch)*4
                       for r in range(rows) for a in range(q) for ch in range(bc))
+    if transpose:
+        packet.extend((r*q*bc+a*bc+ch)*4 for a in range(q) for r in range(rows) for ch in range(bc))
     metadata = torch.tensor([v for spec in specs for v in spec],dtype=torch.int32,device=sample.device)
     indices = torch.tensor(packet,dtype=torch.int32,device=sample.device)
     result = rows,bc,metadata,indices,dense,used,ub,cores
@@ -110,6 +135,9 @@ def raw(left,right,plan,mode=0,grad=None):
     p,_,m = plan['sizes'][1:]
     dummy = left.new_empty(0)
     shape = [n,c,q,p,m,p,mode,rows,bc,int(mask is not None),graph['destination_nodes'],dense]
+    options=_transfer_options()
+    if mode!=2:options&=~8
+    if options:shape.append(options)
     out = load_library().epilogue(_physical(left),_physical(right),
         dummy if grad is None else grad.transpose(1,2).contiguous(),graph['dst'].contiguous(),
         dummy if mask is None else mask.contiguous(),metadata,indices,shape)
@@ -131,12 +159,14 @@ def _adjoint_schedule(plan,left,second,flags,masked):
     """Budget both queue slots using the actual requested derivative outputs."""
     q,p,_,m=plan['sizes']
     c=left.shape[2]
-    ub,cores=load_library().hardware()
+    ub,cores=hardware(left.device)
     cap=int(os.environ.get('ICTC_ASCEND_EPILOGUE_CHANNELS','64'))
-    reserve=int(os.environ.get('ICTC_ASCEND_EPILOGUE_RESERVE','32768'))
+    reserve=int(os.environ.get('ICTC_ASCEND_EPILOGUE_RESERVE','4096'))
     if cap<8 or cap%8 or reserve<4096 or reserve>=ub:
         raise ValueError('Invalid epilogue channel tile or UB reserve')
-    key='adjoint',str(left.device),c,second,flags,masked,cap,reserve,ub
+    transpose=bool(flags&2) and bool(_transfer_options()&8)
+    input_slots,output_slots=_buffering()
+    key='adjoint',str(left.device),c,second,flags,masked,cap,reserve,ub,transpose,input_slots,output_slots
     cache=plan.setdefault('_ascendc_epilogue_schedule',{})
     if key in cache:return cache[key]
     dl,dr,dg,hl,hr=(bool(flags&bit) for bit in (1,2,4,8,16))
@@ -155,7 +185,7 @@ def _adjoint_schedule(plan,left,second,flags,masked):
                 inp=(vec if use_l else 0)+(pv if use_r else 0)+(vec if dl or dr else 0)+(
                     vec if use_hl else 0)+(pv if use_hr else 0)+_align(2*rows)+(_align(rows) if masked else 0)
                 out=(vec if dl else 0)+(pv if dr else 0)+(vec if dg else 0)
-                used=4*(2*inp+2*out+3*vec+3*rc+_align(4*p))
+                used=4*(input_slots*inp+output_slots*out+(3+transpose)*vec+3*rc+_align(4*p))
                 if used+reserve<=ub:break
                 rows-=1
             if rows:break
@@ -172,6 +202,8 @@ def _adjoint_schedule(plan,left,second,flags,masked):
     packet.extend(r*4 for r in range(rows) for _ in range(q*bc))
     packet.extend((r*q*bc+ch)*4 for r in range(rows) for ch in range(bc))
     packet.extend(r*4 for r in range(rows) for _ in range(bc))
+    if transpose:
+        packet.extend((r*q*bc+a*bc+ch)*4 for a in range(q) for r in range(rows) for ch in range(bc))
     metadata=torch.tensor([v for spec in plan['_ascendc_epilogue'] for v in spec],
                           dtype=torch.int32,device=left.device)
     indices=torch.tensor(packet,dtype=torch.int32,device=left.device)
@@ -208,6 +240,9 @@ def _adjoints(left,right,grad,plan,needed,hleft=None,hright=None,*,second=False)
     n,q,c=left.shape;p,_,m=plan['sizes'][1:]
     dummy=left.new_empty(0)
     shape=[n,c,q,p,m,int(second),rows,bc,int(mask is not None),graph['destination_nodes'],flags]
+    options=_transfer_options()
+    if not flags&2:options&=~8
+    if options:shape.append(options)
     values=load_library().epilogue_adjoint(left,right,grad.contiguous() if flags&3 else dummy,
         dummy if hleft is None else _edge_layout(hleft),
         dummy if hright is None else _edge_layout(hright),graph['dst'].contiguous(),
@@ -311,22 +346,22 @@ def regroup(plan, projection, groups, path_offsets):
     return plan[key]
 
 
-def apply(base,weights,plan,group,weight_ids,offsets,destination,nodes,mask=None):
+def apply(base,weights,plan,group,weight_ids,offsets,destination,nodes,mask=None,*,compact=False):
     """Fuse path gates and destination accumulation without edge-sized copies."""
     _,_,q,_,items = group
     c = base.shape[2]
-    key = tuple(item[0] for item in items),c,str(base.device)
+    key = tuple(item[0] for item in items),c,str(base.device),compact
     cache = plan.setdefault('_ascendc_epilogue_plans', {})
     if key not in cache:
         specs,entries,start = [],[],0
         for item in items:
             p,_,_,l,_,width = item
             local=weight_ids.index(p)
-            output = offsets[l]+plan['_ascendc_owner_path_offset'][p]*width
+            output = start if compact else offsets[l]+plan['_ascendc_owner_path_offset'][p]*width
             specs.append((start,local,output,width))
             entries.extend((start+a,local,0,output+a,1.) for a in range(width))
             start += width
-        cache[key] = dict(sizes=(q,len(items),1,sum(plan['_ascendc_output_widths'])),
+        cache[key] = dict(sizes=(q,len(items),1,q if compact else sum(plan['_ascendc_output_widths'])),
                           entries=tuple(entries),_ascendc_epilogue=tuple(specs),
                           _ascendc_identity={},_ascendc_epilogue_schedule={},
                           _ascendc_ones=base.new_ones(1,c,1))

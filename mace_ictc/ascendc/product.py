@@ -1,7 +1,7 @@
 """Generic fixed multilinear maps with a complete hardware-derived UB budget."""
 import os
 import torch
-from .runtime import load_library
+from .runtime import load_library,hardware
 
 
 def _align(value):
@@ -57,8 +57,7 @@ def _layout(c,rc,a,b,p,m,mode,rows,block_c,masked=False,graph=False):
 
 
 def _tiling(plan, sample, c,rc,a,b,p,m,mode,width,terms,head,masked=False,graph=False):
-    ops = load_library()
-    ub,cores = ops.hardware()
+    ub,cores = hardware(sample.device)
     term_cap = min(_align(terms),1024)
     metadata_bytes = 4*(head+5*term_cap)
     cache = plan.setdefault('_ascendc_tiling', {})

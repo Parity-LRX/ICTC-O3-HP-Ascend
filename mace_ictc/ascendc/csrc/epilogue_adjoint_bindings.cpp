@@ -11,8 +11,9 @@ uint64_t align8(uint64_t n) { return (n+7)/8*8; }
 std::vector<at::Tensor> epilogue_adjoint(const at::Tensor& l,const at::Tensor& r,const at::Tensor& g,
     const at::Tensor& hl,const at::Tensor& hr,const at::Tensor& dst,const at::Tensor& mask,
     const at::Tensor& meta,const at::Tensor& ix,at::IntArrayRef s) {
-    TORCH_CHECK(s.size()==11,"Invalid fused epilogue adjoint descriptor");
+    TORCH_CHECK((s.size()==11 || s.size()==12),"Invalid fused epilogue adjoint descriptor");
     for(auto v:s)TORCH_CHECK(v>=0,"Negative fused adjoint dimension");
+    const uint32_t hoist=s.size()==12?s[11]:0;TORCH_CHECK((hoist&~57u)==0,"Invalid transfer policy");
     const uint64_t n=s[0],nodes=s[9];
     const uint32_t c=s[1],q=s[2],p=s[3],m=s[4],second=s[5],rows=s[6],bc=s[7],masked=s[8],flags=s[10];
     const bool dl=flags&1,dr=flags&2,dg=flags&4,hasHL=flags&8,hasHR=flags&16;
@@ -47,9 +48,9 @@ std::vector<at::Tensor> epilogue_adjoint(const at::Tensor& l,const at::Tensor& r
     const uint64_t input=(useL?vec:0)+(useR?pv:0)+((dl || dr)?vec:0)+(useHL?vec:0)+(useHR?pv:0)+
         align8(2*rows)+(masked?align8(rows):0);
     const uint64_t output=(dl?vec:0)+(dr?pv:0)+(dg?vec:0);
-    const uint64_t bytes=4*(2*input+2*output+3*vec+3*rc+align8(4*p));
+    const uint64_t bytes=4*((hoist&32?1:2)*input+(hoist&16?1:2)*output+(3+bool(hoist&8))*vec+3*rc+align8(4*p));
     TORCH_CHECK(bytes+4096<=ub,"Fused adjoint exceeds UB capacity");
-    TORCH_CHECK(meta.numel()>=4*p && ix.numel()>=2*vec+2*rc,"Incomplete fused adjoint schedules");
+    TORCH_CHECK(meta.numel()>=4*p && ix.numel()>=(2+bool(hoist&8))*vec+2*rc,"Incomplete fused adjoint schedules");
     auto dlT=dl?at::empty({static_cast<int64_t>(n),q,c},l.options()):at::empty({0},l.options());
     auto drT=dr?at::empty({static_cast<int64_t>(n),p,c},l.options()):at::empty({0},l.options());
     auto dgT=dg?at::zeros({static_cast<int64_t>(nodes),m,c},l.options()):at::empty({0},l.options());
@@ -57,13 +58,13 @@ std::vector<at::Tensor> epilogue_adjoint(const at::Tensor& l,const at::Tensor& r
     const uint32_t blocks=std::min<uint64_t>(platform->GetCoreNumAiv(),((n+rows-1)/rows)*((c+bc-1)/bc));
     const uint64_t ls=l.stride(0),rs=r.stride(0),hls=hasHL?hl.stride(0):0,hrs=hasHR?hr.stride(0):0;
     const auto stream=c10_npu::getCurrentNPUStream().stream(false);
-    auto launch=[l,r,g,hl,hr,dst,mask,meta,ix,dlT,drT,dgT,stream,n,ls,rs,hls,hrs,c,q,p,m,second,rows,bc,masked,flags,blocks]() -> int {
+    auto launch=[l,r,g,hl,hr,dst,mask,meta,ix,dlT,drT,dgT,stream,n,ls,rs,hls,hrs,c,q,p,m,second,rows,bc,masked,flags,hoist,blocks]() -> int {
         ACLRT_LAUNCH_KERNEL(ictc_epilogue_adjoint)(blocks,stream,
             reinterpret_cast<uint8_t*>(l.data_ptr()),reinterpret_cast<uint8_t*>(r.data_ptr()),reinterpret_cast<uint8_t*>(g.data_ptr()),
             reinterpret_cast<uint8_t*>(hl.data_ptr()),reinterpret_cast<uint8_t*>(hr.data_ptr()),reinterpret_cast<uint8_t*>(dst.data_ptr()),
             reinterpret_cast<uint8_t*>(mask.data_ptr()),reinterpret_cast<uint8_t*>(meta.data_ptr()),reinterpret_cast<uint8_t*>(ix.data_ptr()),
             reinterpret_cast<uint8_t*>(dlT.data_ptr()),reinterpret_cast<uint8_t*>(drT.data_ptr()),reinterpret_cast<uint8_t*>(dgT.data_ptr()),
-            n,ls,rs,hls,hrs,c,q,p,m,second,rows,bc,masked,flags);return 0;
+            n,ls,rs,hls,hrs,c,q,p,m,second,rows,bc,masked,flags,hoist);return 0;
     };
     at_npu::native::OpCommand::RunOpApi("ictc_ascendc_epilogue_adjoint",launch);
     return {dlT,drT,dgT};

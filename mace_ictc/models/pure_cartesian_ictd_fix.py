@@ -3906,22 +3906,26 @@ class PureCartesianICTDFix(nn.Module):
         cell = cell.to(dtype=dtype)
         edge_shifts = edge_shifts.to(dtype=dtype)
 
-        if not getattr(self, "preserve_edge_order", False):
+        sort_idx = None
+        if sort_idx is None and not getattr(self, "preserve_edge_order", False):
             sort_idx = torch.argsort(edge_dst)
             edge_src = edge_src[sort_idx]
             edge_dst = edge_dst[sort_idx]
             edge_shifts = edge_shifts[sort_idx]
-        else:
-            sort_idx = None
         edge_index = torch.stack([edge_src, edge_dst], dim=0)
 
         if precomputed_edge_vec is not None:
             edge_vec = precomputed_edge_vec if sort_idx is None else precomputed_edge_vec[sort_idx]
         else:
-            edge_batch_idx = batch[edge_src]
-            edge_cells = cell[edge_batch_idx]
-            shift_vecs = torch.einsum("ni,nij->nj", edge_shifts, edge_cells)
-            edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
+            edge_vec = None
+            if getattr(self,"_ascend_hp",False) and pos.device.type=="npu":
+                from mace_ictc.ascend.geometry import edge_vectors
+                edge_vec=edge_vectors(pos,cell,edge_shifts,batch,edge_src,edge_dst)
+            if edge_vec is None:
+                edge_batch_idx = batch[edge_src]
+                edge_cells = cell[edge_batch_idx]
+                shift_vecs = torch.einsum("ni,nij->nj", edge_shifts, edge_cells)
+                edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
 
         edge_length = edge_vec.norm(dim=1)
         n = edge_vec / edge_length.clamp(min=1e-8).unsqueeze(-1)

@@ -1,4 +1,5 @@
 """Channel-contiguous messages with one GEMM per input angular degree."""
+import os
 import torch
 from mace_ictc.models.adjoint_requirements import required_gradients
 from .structured_product import _FixedLinear
@@ -10,7 +11,9 @@ class _BatchedMatrix(torch.autograd.Function):
         ctx.save_for_backward(a if b.requires_grad else a.new_empty(0),
                               b if a.requires_grad else b.new_empty(0))
         ctx.spec=ta,tb
-        return torch.bmm(a.transpose(-2,-1) if ta else a,b.transpose(-2,-1) if tb else b)
+        from mace_ictc.ascendc.batched_vector import try_apply
+        value=try_apply(a,b,ta,tb)
+        return value if value is not None else torch.bmm(a.transpose(-2,-1) if ta else a,b.transpose(-2,-1) if tb else b)
 
     @staticmethod
     def backward(ctx,g):
@@ -85,6 +88,7 @@ def graph_message(owner,features,harmonics,gates,src,dst,mask=None,*,edge_chunk_
            and supported(group_plan[1],mask is not None))
     projection,groups=group_plan
     weight_groups=groups
+    compact=False
     if fused:
         widths=[owner.path_counts_by_l.get(l,0)*(2*l+1) for l in output]
         offsets=[]
@@ -95,30 +99,57 @@ def graph_message(owner,features,harmonics,gates,src,dst,mask=None,*,edge_chunk_
         plan['_ascendc_output_widths']=tuple(widths)
         plan['_ascendc_owner_path_offset']=tuple(owner.path_offset)
         projection,groups=regroup(plan,projection,groups,owner.path_offset)
+        policy=os.environ.get('ICTC_ASCEND_COMPACT_OUTPUT','1')
+        if policy not in ('0','1'):
+            raise ValueError('The compact graph-output policy must be zero or one')
+        compact=policy=='1'
+        if compact and '_ascendc_compact_order' not in plan:
+            width=sum(group[2] for group in groups)
+            restore=[width]*sum(widths)
+            start=0
+            for group in groups:
+                for p,_,_,degree,_,span in group[4]:
+                    target=offsets[degree]+owner.path_offset[p]*span
+                    restore[target:target+span]=range(start,start+span)
+                    start+=span
+            inverse=None if restore==list(range(len(restore))) else torch.tensor(restore,dtype=torch.int64,device=sample.device)
+            plan['_ascendc_compact_order']=(inverse,any(item==width for item in restore))
     for begin in range(0,edges,edge_chunk_size):
         end=min(begin+edge_chunk_size,edges)
         rows=end-begin
         edge={l:value.index_select(0,src[begin:end]) for l,value in angular.items()}
         weighted=gates[begin:end].reshape(rows,owner.num_paths,channels)*owner.weight[None]
-        weights=weighted.unbind(1)
         blocks={l:[None]*owner.path_counts_by_l.get(l,0) for l in output}
         bond=_FixedLinear.apply(sh[begin:end],projection)
         matrices=bond.split([ni*width for i,ni,width,widths,items in groups],1)
         if fused:
             order=tuple(item[0] for group in weight_groups for item in group[4])
-            grouped_weights=(weighted.split([len(group[4]) for group in weight_groups],1)
-                             if order==tuple(range(owner.num_paths)) else
-                             tuple(torch.stack([weights[item[0]] for item in group[4]],1) for group in weight_groups))
+            if order==tuple(range(owner.num_paths)):
+                grouped_weights=weighted.split([len(group[4]) for group in weight_groups],1)
+            else:
+                weights=weighted.unbind(1)
+                grouped_weights=tuple(torch.stack([weights[item[0]] for item in group[4]],1) for group in weight_groups)
             accumulated=None
+            node_parts=[]
             for group,old_group,matrix,weight in zip(groups,weight_groups,matrices,grouped_weights):
                 i,ni,width,_,_=group
                 base=_BatchedMatrix.apply(matrix.reshape(rows,width,ni),edge[i],False,False)
                 value=epilogue(base,weight,plan,group,tuple(item[0] for item in old_group[4]),offsets,dst[begin:end],nodes,
-                               None if mask is None else mask[begin:end].reshape(-1).contiguous())
-                accumulated=value if accumulated is None else accumulated+value
+                               None if mask is None else mask[begin:end].reshape(-1).contiguous(),compact=compact)
+                if compact:node_parts.append(value)
+                else:accumulated=value if accumulated is None else accumulated+value
+            if compact:
+                restore,missing=plan['_ascendc_compact_order']
+                if missing:node_parts.append(sample.new_zeros(nodes,1,channels))
+                packed=node_parts[0] if len(node_parts)==1 else torch.cat(node_parts,1)
+                if restore is None:accumulated=packed
+                else:
+                    from .node_layout import restore_output
+                    accumulated=restore_output(packed,restore,plan)
             for (l,old),block in zip(output.items(),accumulated.split(plan['_ascendc_output_widths'],1)):
                 output[l]=old+block
             continue
+        weights=weighted.unbind(1)
         for (i,ni,width,widths,items),matrix in zip(groups,matrices):
             value=_BatchedMatrix.apply(matrix.reshape(rows,width,ni),edge[i],False,False)
             for spec,part in zip(items,value.split(widths,1)):

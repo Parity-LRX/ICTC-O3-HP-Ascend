@@ -29,6 +29,9 @@ ub_bytes, vector_cores = ops.hardware()
 # Construct/configure the model or standalone operators after enable().
 ```
 
+Rebuild the Ascend C library after updating the source tree. The native matrix
+adjoints and queue descriptors require the library built from the matching sources.
+
 This process-wide opt-in selects an execution mode:
 
 | Mode | Tensor products and graph messages | Symmetric contractions | Dense transforms |
@@ -207,8 +210,19 @@ and the public output order are preserved.
 First adjoints share node cotangent reads. Mixed second adjoints combine the
 requested edge gradients and the two node-gradient terms in one Vector kernel,
 reducing repeated transfers and destination updates. Their UB schedule includes
-all active operands, all requested outputs and both queue slots. Tiles that
+all active operands, all requested outputs and the selected input/output queue slots. Tiles that
 exceed this budget retain separate native adjoints.
+Input-degree groups accumulate compact `[nodes, group angular rows, channels]`
+buffers and restore the public angular/path order at node count. Coupling
+coefficients and learned parameter tensors are unchanged. Native narrow-matrix
+adjoints keep their original matrix storage, including transposed operands;
+unsupported widths retain CANN execution.
+
+Periodic geometry uses single-axis row gathers. A single-cell batch computes
+periodic shifts as one matrix product; multiple cells use the corresponding
+batched matrices. Positions, cell tensors and shifts remain differentiable.
+Only fixed species, shape and mathematical permutation metadata may be cached.
+Learned weights and feature values are read on every call.
 Set `ICTC_ASCEND_FUSED_ADJOINTS=0` to retain the native gate/reduction epilogue
 with separate adjoints; the default is `auto`.
 The automatic policy uses the actual active angular width and channel/edge

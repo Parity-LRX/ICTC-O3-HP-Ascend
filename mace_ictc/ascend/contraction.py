@@ -1,4 +1,5 @@
 """Shared CG prefixes with directly indexed species banks on Ascend."""
+import os
 import torch
 
 from .sparse_product import sparse_product
@@ -10,7 +11,7 @@ def factorized_contractions(owner, x, index):
     if plan is None:
         raise ValueError("Symmetric-contraction constants do not reconstruct within the FP32 budget")
     n, channels, _ = x.shape
-    from mace_ictc.ascendc.runtime import is_enabled
+    from mace_ictc.ascendc.runtime import is_enabled,mode
     native_enabled=is_enabled()
     from .structured_product import _FixedLinear
     fixed=lambda value,matrix: _FixedLinear.apply(value,matrix) if native_enabled else value@matrix
@@ -28,7 +29,15 @@ def factorized_contractions(owner, x, index):
     if plan["pair"] is None:
         pairs = native[:, :, :0]
     else:
-        pairs = product(native, native, plan["ones"].unsqueeze(0), plan["pair"])
+        policy=os.environ.get('ICTC_ASCEND_SYMMETRIC_PAIR','1' if native_enabled and mode()=='performance' else '0')
+        if policy not in ('0','1'):
+            raise ValueError('The symmetric-pair policy must be zero or one')
+        if native_enabled and policy=='1':
+            from .sparse_product import sparse_quadratic
+            pairs=sparse_quadratic(native,plan['ones'].unsqueeze(0),
+                                   plan['pair'],plan['pair_adjoint'])
+        else:
+            pairs = product(native, native, plan["ones"].unsqueeze(0), plan["pair"])
     left = torch.cat((pairs, native), -1)
     right = torch.cat((native, native.new_ones(n, channels, 1)), -1)
     output = product(left, right, bank, plan["final"], index=index)
