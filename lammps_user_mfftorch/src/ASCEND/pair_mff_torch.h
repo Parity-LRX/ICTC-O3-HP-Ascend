@@ -32,6 +32,7 @@ class PairMFFTorch : public Pair {
   void update_positions();
   double cutoff_ = 0;
   int depth_ = 0;
+  int halo_depth_ = 0;
   int requested_depth_ = 0;
   int local_device_ = 0;
   bigint neighbor_generation_ = -1;

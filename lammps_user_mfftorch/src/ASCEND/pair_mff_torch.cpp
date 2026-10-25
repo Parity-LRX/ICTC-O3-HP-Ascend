@@ -166,18 +166,18 @@ void PairMFFTorch::load_engine() {
     engine_=PyObject_CallFunction(cls,"sdiiisi",checkpoint_.c_str(),cutoff_,local_device_,comm->me,comm->nprocs,host,port);
     if(!engine_)python_error("Cannot initialize Ascend model/HCCL");
     Ref depth(PyObject_GetAttrString(engine_,"depth"));depth_=static_cast<int>(PyLong_AsLong(depth));
+    Ref halo_depth(PyObject_GetAttrString(engine_,"halo_depth"));halo_depth_=static_cast<int>(PyLong_AsLong(halo_depth));
     if(depth_<1 || (requested_depth_ && requested_depth_!=depth_))throw std::runtime_error("Model message depth does not match pair_style depth");
+    if(halo_depth_<1 || halo_depth_>depth_)throw std::runtime_error("Invalid model halo depth");
   } catch(const std::exception& e){error->all(FLERR,e.what());}
 }
 void PairMFFTorch::init_style() {
   if(!engine_)error->all(FLERR,"mff/torch needs pair_coeff before run");
   if(domain->dimension!=3)error->all(FLERR,"Ascend mff/torch requires a three-dimensional box");
   if(std::string(update->unit_style)!="metal")error->all(FLERR,"Ascend mff/torch requires units metal");
-  if(comm->nprocs==1)neighbor->add_request(this,NeighConst::REQ_FULL);
-  else {
-    neighbor->add_request(this,NeighConst::REQ_FULL|NeighConst::REQ_GHOST);
-    comm->cutghostuser=std::max(comm->cutghostuser,depth_*cutoff_+neighbor->skin);
-  }
+  const bool ghost_centers=comm->nprocs>1 && halo_depth_>1;
+  neighbor->add_request(this,ghost_centers?NeighConst::REQ_FULL|NeighConst::REQ_GHOST:NeighConst::REQ_FULL);
+  if(comm->nprocs>1)comm->cutghostuser=std::max(comm->cutghostuser,halo_depth_*cutoff_+neighbor->skin);
   neighbor_generation_=-1;
 }
 double PairMFFTorch::init_one(int i,int j) {
@@ -198,7 +198,7 @@ void PairMFFTorch::update_topology() {
   std::vector<char> center(all,0),active(all,0);
   std::vector<int> frontier;
   for(int i=0;i<owned;i++){center[i]=active[i]=1;frontier.push_back(i);}
-  if(comm->nprocs>1)for(int hop=1;hop<depth_;hop++) {
+  if(comm->nprocs>1)for(int hop=1;hop<halo_depth_;hop++) {
     std::vector<int> next;
     for(int i:frontier)for(int k=0;k<list->numneigh[i];k++) {
       const int j=list->firstneigh[i][k]&NEIGHMASK;
@@ -207,7 +207,7 @@ void PairMFFTorch::update_topology() {
     frontier.swap(next);
   }
   source_.clear();destination_.clear();shifts_.clear();
-  const int centers=list->inum+(comm->nprocs>1?list->gnum:0);
+  const int centers=list->inum+(comm->nprocs>1 && halo_depth_>1?list->gnum:0);
   const double xx=domain->xprd,yy=domain->yprd,zz=domain->zprd;
   for(int row=0;row<centers;row++) {
     const int i=list->ilist[row];if(!center[i])continue;

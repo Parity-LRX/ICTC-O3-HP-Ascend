@@ -116,10 +116,34 @@ the trained model.
 ## Data path and communication
 
 Single-rank periodic ghosts are folded into their local owners with lattice
-shifts, so the model uses the owned nodes. Multiple ranks use a depth-dependent
-halo and compute the energy of owned atoms only. Nodes unused by the model graph
-are removed before device transfer. Skin edges remain in the cached graph and
-are masked at the model cutoff using current coordinates.
+shifts, so the model uses the owned nodes. Multiple ranks compute the energy of
+owned atoms and support two halo layouts, selected with `MFF_ASCEND_HALO`:
+
+| Setting | Neighbor halo | Intermediate features |
+| --- | --- | --- |
+| `wide` (current default) | Interaction depth times the cutoff, plus skin | Recomputed in the multi-hop halo |
+| `layerwise` | One cutoff, plus skin | Received from owners through HCCL after each non-final interaction |
+
+```bash
+export MFF_ASCEND_HALO=layerwise
+mpiexec -n 8 /path/to/build-ascend/lmp -in in.mfftorch_ascend
+```
+
+The layerwise layout uses edges whose destinations are owned atoms. Products,
+message projection, self-connection and energy readouts evaluate owned rows.
+Frozen initial embeddings are determined locally from species. Intermediate
+features are exchanged on every force evaluation, and feature width comes from
+the actual tensor. A custom autograd operation coalesces and returns feature
+adjoints to owners through HCCL, then local autograd differentiates their
+construction. This reverse exchange is required for forces and global virial.
+The deployment exchange implements their first derivative; force-loss training
+and Hessians require a separate higher-derivative implementation.
+
+Nodes unused by the model graph are removed before device transfer. Skin edges
+remain in the cached graph and are masked at the cutoff using current coordinates.
+Fixed routing coefficients and UB transfer metadata are reused; ownership
+indices and buffers refresh with the topology. Floating learned features are
+recomputed. Single-rank computation is the same for both halo settings.
 
 At a neighbor rebuild, LAMMPS forwards owner rank/index metadata, then exchanges
 the index schedules through MPI. The schedule coalesces repeated periodic copies
@@ -141,8 +165,6 @@ strain, including cell and periodic shifts. Per-atom stress is currently rejecte
 Both Newton settings are supported. `newton off` avoids LAMMPS' ordinary MPI
 reverse-force stage; with `newton on`, this pair style leaves its host ghost
 forces zero so that stage does not count the model force twice.
-The current multi-rank route retains a wide halo; HCCL does not remove duplicated
-model computation in that halo. Per-layer feature exchange is future work.
 
 ## Qualification
 
@@ -162,6 +184,13 @@ These initialized-model runs qualify the deployment and communication path;
 they do not establish the physical accuracy of a fitted potential. Multi-node
 execution and per-atom stress are outside this qualification.
 
+Layerwise checks cover two, four and eight ranks, including actual owner changes,
+sorting, repeated rebuilds, zero-edge graphs and mixed active/empty ranks. Real
+feature-forward and feature-adjoint HCCL operation counts are checked alongside
+the numerical results. Recorded one-, two-, four- and eight-rank checks use an
+exclusive eight-NPU allocation. Partial-NPU allocations have not been qualified
+with this software stack.
+
 ## Diagnostics
 
 Set `MFF_ASCEND_STATS=/absolute/output/directory` to save one JSON report per
@@ -174,6 +203,14 @@ well as HCCL transport. Set `MFF_ASCEND_PROFILE_SKIP=N` to exclude the first `N`
 force calls from stage totals; `timed_calls` records the included call count.
 Payload counters still cover all calls. CPU topology, position packing and output
 scatter timings cover the complete run.
+
+Reports include `halo_mode`, `halo_depth`, `interaction_depth`, separate feature
+and force payload bytes, and actual forward/adjoint/force P2P operation counts.
+In the layerwise layout, `model_seconds` includes feature exchange. Synchronized
+`feature_forward_seconds` and `feature_reverse_seconds` isolate those intervals;
+subtract them from the same rank's model total to estimate local model work.
+`hccl_seconds` measures the final coordinate-force exchange. Phase maxima may
+come from different ranks and must not be added to reconstruct wall time.
 
 Reports also record the largest owned-node, compacted-model-node, edge,
 ghost-row and coalesced-send-row counts. `peak_allocated_bytes` is the PyTorch NPU
@@ -188,6 +225,9 @@ and excludes Python/NPU allocations.
 
 Fixed-graph operator benchmarks are not LAMMPS step-time predictions. End-to-end
 MD timing includes neighbor work, CPU integration, communication and transfers.
+For comparison with a direct PyTorch call, use the same checkpoint, positions
+and skin graph. Report resident-device model time, engine input/output transfers
+and complete MD step time separately.
 
 References: [HCCL batched P2P API](https://www.hiascend.com/document/detail/en/Pytorch/2610/apiref/customapi/docs/en/custom_APIs/cpp/c10d_npu-ProcessGroupHCCL-batch_isend_irecv.md),
 [LAMMPS communication design](https://docs.lammps.org/Developer_par_comm.html).

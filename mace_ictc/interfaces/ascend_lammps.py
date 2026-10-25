@@ -101,14 +101,26 @@ def load_checkpoint(path, device):
     return model, e0, state_source
 
 
+def _routing_plan(source, destination, outputs, device, cache, vector):
+    """Share fixed coefficients/UB metadata while keeping live routing separate."""
+    key = str(device), vector
+    template = cache.get(key)
+    if template is None:
+        template = dict(sizes=(3, 1, 1, 3) if vector else (1, 1, 1, 1),
+                        entries=[(i, 0, 0, i, 1.) for i in range(3)] if vector else [(0, 0, 0, 0, 1.)],
+                        _ascendc_metadata={}, _ascendc_tiling={})
+        cache[key] = template
+    return dict(template, _ascendc_graph=dict(src=source, dst=destination, mask=None,
+                                            destination_nodes=outputs))
+
+
 class _VectorSum:
     """Gather and coalesce force rows with the existing Ascend C graph map."""
-    def __init__(self, source, destination, outputs, device):
+    def __init__(self, source, destination, outputs, device, cache=None):
         self.rows = source.numel()
         self.outputs = outputs
-        self.plan = dict(sizes=(3, 1, 1, 3), entries=[(i, 0, 0, i, 1.) for i in range(3)],
-                         _ascendc_graph=dict(src=source, dst=destination, mask=None,
-                                            destination_nodes=outputs))
+        self.plan = _routing_plan(source, destination, outputs, device,
+                                  {} if cache is None else cache, True)
         self.right = torch.ones(self.rows, 1, 1, device=device, dtype=torch.float32)
         self.weight = torch.ones(1, 1, 1, device=device, dtype=torch.float32)
 
@@ -118,6 +130,36 @@ class _VectorSum:
         from mace_ictc.ascendc.product import raw
         return raw(value.contiguous().reshape(-1, 1, 3), self.right, self.weight,
                    None, self.plan, True).reshape(self.outputs, 3)
+
+
+class _RowSum:
+    """Gather/sum arbitrary feature widths through native channel tiling."""
+    def __init__(self, source, destination, outputs, width, device, cache=None):
+        self.rows, self.outputs, self.width = source.numel(), outputs, width
+        self.plan = _routing_plan(source, destination, outputs, device,
+                                  {} if cache is None else cache, False)
+        self.right = torch.ones(self.rows, 1, 1, device=device, dtype=torch.float32)
+        self.weight = torch.ones(1, width, 1, device=device, dtype=torch.float32)
+
+    def __call__(self, value):
+        if not self.rows:return value.new_zeros(self.outputs, self.width)
+        from mace_ictc.ascendc.product import raw
+        return raw(value.contiguous().reshape(-1, self.width, 1), self.right,
+                   self.weight, None, self.plan, True).reshape(self.outputs, self.width)
+
+
+class _FeatureHalo(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value, anchor, engine):
+        ctx.engine, ctx.generation = engine, engine.generation
+        return engine._feature_forward(value)
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, gradient):
+        if ctx.generation != ctx.engine.generation:
+            raise RuntimeError('Feature-halo topology changed before its adjoint completed')
+        return ctx.engine._feature_reverse(gradient), gradient.new_zeros(()), None
 
 
 class AscendLAMMPSEngine:
@@ -133,6 +175,10 @@ class AscendLAMMPSEngine:
         self.model, self.e0, self.state_source = load_checkpoint(checkpoint, self.device)
         self.cutoff = float(self.model.max_radius)
         self.depth = int(self.model.num_interaction)
+        self.halo_mode = os.environ.get('MFF_ASCEND_HALO', 'wide')
+        if self.halo_mode not in ('wide', 'layerwise'):
+            raise ValueError('MFF_ASCEND_HALO must be wide or layerwise')
+        self.halo_depth = 1 if self.halo_mode == 'layerwise' else self.depth
         if abs(float(cutoff) - self.cutoff) > 1e-6:
             raise ValueError(f'Pair cutoff {cutoff} does not match checkpoint cutoff {self.cutoff}')
         self.configuration = configure_model(self.model, policy='generated', training=False)
@@ -150,13 +196,83 @@ class AscendLAMMPSEngine:
                                hccl_seconds=0., transfer_seconds=0., sent_bytes=0,
                                received_bytes=0, p2p_operations=0, max_owned_nodes=0,
                                max_model_nodes=0, max_edges=0, max_ghost_rows=0,
-                               max_packed_rows=0, timed_calls=0)
+                               max_packed_rows=0, timed_calls=0,
+                               force_p2p_operations=0, feature_forward_p2p_operations=0,
+                               force_sent_bytes=0, force_received_bytes=0,
+                               feature_reverse_p2p_operations=0, feature_sent_bytes=0,
+                               feature_received_bytes=0, feature_forward_seconds=0.,
+                               feature_reverse_seconds=0.)
         self.initial_allocated_bytes = torch.npu.memory_allocated(self.device)
         torch.npu.reset_peak_memory_stats(self.device)
         self.profile = os.environ.get('MFF_ASCEND_PROFILE', '0') == '1'
         self.timing_skip = int(os.environ.get('MFF_ASCEND_PROFILE_SKIP', '0'))
         if self.timing_skip < 0:raise ValueError('MFF_ASCEND_PROFILE_SKIP must be nonnegative')
         self.generation = None
+        self._routing_templates = {}
+        self._owned_hooks = []
+        self._owned_methods = []
+        self._owned_metadata_views = {}
+        if self.halo_mode == 'layerwise' and world_size > 1:
+            import weakref
+            reference = weakref.ref(self)
+            def owned_inputs(module, args, kwargs):
+                engine = reference()
+                return engine._owned_inputs(args, kwargs)
+            def owned_output(module, args, output):
+                engine = reference()
+                return engine._pad_owned(output)
+            # Products and energy readouts act independently on each node.
+            # Ghost products are replaced by owner features before the next
+            # interaction; ghost readouts never contribute to owned energy.
+            modules = list(self.model.products) + list(self.model.layer_energy_readouts)
+            modules.append(self.model.last_layer_energy_readout)
+            modules.extend(layer.message_linear for layer in self.model.interactions)
+            for module in modules:
+                self._owned_hooks.append(module.register_forward_pre_hook(owned_inputs, with_kwargs=True))
+                self._owned_hooks.append(module.register_forward_hook(owned_output))
+            for layer in self.model.interactions:
+                module = layer.self_connection
+                if module is None:continue
+                # The backbone calls forward_type_idx directly, bypassing
+                # Module hooks. Retain and restore any existing instance override.
+                local = 'forward_type_idx' in module.__dict__
+                previous = module.__dict__.get('forward_type_idx')
+                original = module.forward_type_idx
+                def owned_self_connection(*args, _original=original, **kwargs):
+                    engine = reference()
+                    args, kwargs = engine._owned_inputs(args, kwargs)
+                    return engine._pad_owned(_original(*args, **kwargs))
+                self._owned_methods.append((module, local, previous))
+                module.forward_type_idx = owned_self_connection
+
+    def _pad_owned(self, output):
+        if self.nodes == self.nlocal:return output
+        return torch.cat((output, output.new_zeros(
+            (self.nodes - self.nlocal,) + output.shape[1:])))
+
+    def _owned_inputs(self, args, kwargs):
+        if self.nodes == self.nlocal:return args, kwargs
+        def owned(value):
+            if torch.is_tensor(value) and value.ndim and value.shape[0] == self.nodes:
+                if value.dtype in (torch.int32, torch.int64):
+                    # Stable species views retain validation and native bank
+                    # selection caches. Never cache floating learned features.
+                    key = id(value), value._version, tuple(value.shape)
+                    cached = self._owned_metadata_views.get(key)
+                    if cached is not None and cached[0]() is value:return cached[1]
+                    import weakref
+                    view = value[:self.nlocal]
+                    validated = getattr(value, '_ictc_ascend_valid_species', None)
+                    if validated is not None and validated[1] == value._version:
+                        view._ictc_ascend_valid_species = validated[0], view._version
+                    self._owned_metadata_views[key] = weakref.ref(value), view
+                    return view
+                return value[:self.nlocal]
+            if isinstance(value, dict):return {key:owned(item) for key,item in value.items()}
+            if isinstance(value, tuple):return tuple(owned(item) for item in value)
+            if isinstance(value, list):return [owned(item) for item in value]
+            return value
+        return tuple(owned(item) for item in args), {key:owned(item) for key,item in kwargs.items()}
 
     @staticmethod
     def _host(buffer, dtype, shape):
@@ -182,9 +298,12 @@ class AscendLAMMPSEngine:
         self.send_offsets, self.receive_offsets = [0], [0]
         for n in self.send_counts:self.send_offsets.append(self.send_offsets[-1] + n)
         for n in self.receive_counts:self.receive_offsets.append(self.receive_offsets[-1] + n)
-        self.pack = _VectorSum(ghosts, slots, self.send_offsets[-1], device)
-        self.accumulate = _VectorSum(torch.arange(receivers.numel(), device=device), receivers, nlocal, device)
+        self.pack = _VectorSum(ghosts, slots, self.send_offsets[-1], device, self._routing_templates)
+        self.accumulate = _VectorSum(torch.arange(receivers.numel(), device=device), receivers, nlocal, device, self._routing_templates)
         self.receive_buffer = torch.empty(receivers.numel(), 3, device=device, dtype=torch.float32)
+        self.ghost_nodes, self.ghost_slots, self.receive_indices = ghosts, slots, receivers
+        self.feature_plans = {}
+        self._owned_metadata_views.clear()
         self.generation = generation
         self.statistics['topology_updates'] += 1
         for key, value in (('max_owned_nodes', nlocal), ('max_model_nodes', nodes),
@@ -215,9 +334,89 @@ class AscendLAMMPSEngine:
                 raise RuntimeError('Model ghost exchange requires an HCCL process group')
             for request in dist.batch_isend_irecv(operations):request.wait()
         self.statistics['p2p_operations'] += len(operations)
-        self.statistics['sent_bytes'] += 12 * sum(n for p, n in enumerate(self.send_counts) if p != self.rank)
-        self.statistics['received_bytes'] += 12 * sum(n for p, n in enumerate(self.receive_counts) if p != self.rank)
+        self.statistics['force_p2p_operations'] += len(operations)
+        for prefix, counts in (('sent', self.send_counts), ('received', self.receive_counts)):
+            count = 12 * sum(n for p, n in enumerate(counts) if p != self.rank)
+            self.statistics[f'{prefix}_bytes'] += count
+            self.statistics[f'force_{prefix}_bytes'] += count
         return forces[:self.nlocal] + self.accumulate(receive)
+
+    def _feature_plan(self, width):
+        if width not in self.feature_plans:
+            device = self.device
+            ghost_rows = self.ghost_nodes.numel()
+            received_rows = self.receive_indices.numel()
+            ghost_order = torch.arange(ghost_rows, device=device)
+            received_order = torch.arange(received_rows, device=device)
+            self.feature_plans[width] = dict(
+                owner_gather=_RowSum(self.receive_indices, received_order, received_rows, width, device, self._routing_templates),
+                ghost_gather=_RowSum(self.ghost_slots, ghost_order, ghost_rows, width, device, self._routing_templates),
+                ghost_pack=_RowSum(self.ghost_nodes, self.ghost_slots, self.send_offsets[-1], width, device, self._routing_templates),
+                owner_sum=_RowSum(received_order, self.receive_indices, self.nlocal, width, device, self._routing_templates),
+                forward_buffer=torch.empty(self.send_offsets[-1], width, device=device, dtype=torch.float32),
+                reverse_buffer=torch.empty(received_rows, width, device=device, dtype=torch.float32))
+        return self.feature_plans[width]
+
+    def _feature_exchange(self, send, receive, forward):
+        send_offsets = self.receive_offsets if forward else self.send_offsets
+        receive_offsets = self.send_offsets if forward else self.receive_offsets
+        operations = []
+        sent_rows = received_rows = 0
+        for peer in range(self.world_size):
+            a, b = send_offsets[peer:peer + 2]
+            c, d = receive_offsets[peer:peer + 2]
+            if peer == self.rank:
+                if b - a != d - c:raise RuntimeError('Inconsistent self feature-halo schedule')
+                if b > a:receive[c:d].copy_(send[a:b])
+                continue
+            if b > a:
+                operations.append(dist.P2POp(dist.isend, send[a:b], peer, self.group))
+                sent_rows += b - a
+            if d > c:
+                operations.append(dist.P2POp(dist.irecv, receive[c:d], peer, self.group))
+                received_rows += d - c
+        if operations:
+            if self.group is None:raise RuntimeError('Feature-halo exchange requires HCCL')
+            for request in dist.batch_isend_irecv(operations):request.wait()
+        sent_bytes, received_bytes = 4 * send.shape[1] * sent_rows, 4 * send.shape[1] * received_rows
+        self.statistics['p2p_operations'] += len(operations)
+        key = 'feature_forward_p2p_operations' if forward else 'feature_reverse_p2p_operations'
+        self.statistics[key] += len(operations)
+        for prefix, value in (('sent', sent_bytes), ('received', received_bytes)):
+            self.statistics[f'{prefix}_bytes'] += value
+            self.statistics[f'feature_{prefix}_bytes'] += value
+
+    def _feature_forward(self, value):
+        if self.profile:torch.npu.synchronize()
+        started = time.perf_counter()
+        plan = self._feature_plan(value.shape[1])
+        self._feature_exchange(plan['owner_gather'](value), plan['forward_buffer'], True)
+        result = torch.cat((value[:self.nlocal], plan['ghost_gather'](plan['forward_buffer'])))
+        if self.profile:torch.npu.synchronize()
+        if self.statistics['calls'] >= self.timing_skip:
+            self.statistics['feature_forward_seconds'] += time.perf_counter() - started
+        return result
+
+    def _feature_reverse(self, gradient):
+        if self.profile:torch.npu.synchronize()
+        started = time.perf_counter()
+        plan = self._feature_plan(gradient.shape[1])
+        self._feature_exchange(plan['ghost_pack'](gradient), plan['reverse_buffer'], False)
+        owned = gradient[:self.nlocal] + plan['owner_sum'](plan['reverse_buffer'])
+        result = torch.cat((owned, gradient.new_zeros(self.nodes - self.nlocal, gradient.shape[1])))
+        if self.profile:torch.npu.synchronize()
+        if self.statistics['calls'] >= self.timing_skip:
+            self.statistics['feature_reverse_seconds'] += time.perf_counter() - started
+        return result
+
+    def _layer_state(self, layer, value):
+        if layer == self.depth - 1:return value
+        if not self.ghost_nodes.numel() and not self.receive_indices.numel():return value
+        width = value.numel() // self.nodes
+        # Keep the exchange in the requested position/strain autograd graph even
+        # on ranks whose local feature happens to be coordinate-independent.
+        flat = value.reshape(self.nodes, width)
+        return _FeatureHalo.apply(flat, self._halo_anchor, self).reshape(value.shape)
 
     def compute(self, positions, cell, want_virial):
         if self.generation is None:raise RuntimeError('Model topology has not been supplied')
@@ -235,7 +434,12 @@ class AscendLAMMPSEngine:
                 x, h = pos @ transform, box @ transform
             else:x, h = pos, box
             if self.nodes:
-                prediction = self.model(x, self.atomic_numbers, self.batch, self.src, self.dst, self.shifts, h)
+                callback = None
+                if self.halo_mode == 'layerwise' and self.world_size > 1 and self.depth > 1:
+                    self._halo_anchor = pos.sum()*0 + strain.sum()*0
+                    callback = self._layer_state
+                prediction = self.model(x, self.atomic_numbers, self.batch, self.src, self.dst, self.shifts, h,
+                                        layer_state_callback=callback)
                 atomic = (prediction[0] if isinstance(prediction, tuple) else prediction).reshape(self.nodes)
                 atomic = atomic + self.e0[self.atomic_numbers]
                 energy = atomic[:self.nlocal].sum()
@@ -245,6 +449,7 @@ class AscendLAMMPSEngine:
             variables = (pos, strain) if want_virial else (pos,)
             gradients = torch.autograd.grad(energy + pos.sum()*0 + strain.sum()*0,
                                             variables, allow_unused=True)
+            self._halo_anchor = None
         forces = -gradients[0].detach()
         if want_virial:
             tensor = -gradients[1].detach()
@@ -276,6 +481,13 @@ class AscendLAMMPSEngine:
         return result
 
     def close(self):
+        for handle in self._owned_hooks:handle.remove()
+        self._owned_hooks.clear()
+        for module, local, previous in self._owned_methods:
+            if local:module.forward_type_idx = previous
+            else:del module.forward_type_idx
+        self._owned_methods.clear()
+        self._owned_metadata_views.clear()
         destination = os.environ.get('MFF_ASCEND_STATS')
         if destination:
             import json
@@ -284,6 +496,7 @@ class AscendLAMMPSEngine:
             path.mkdir(parents=True, exist_ok=True)
             (path/f'ascend_rank{self.rank}.json').write_text(json.dumps(
                 dict(rank=self.rank, world_size=self.world_size, state_source=self.state_source,
+                     halo_mode=self.halo_mode, halo_depth=self.halo_depth, interaction_depth=self.depth,
                      device_index=self.device.index, synchronized_timings=self.profile,
                      timing_skip=self.timing_skip,
                      initial_allocated_bytes=self.initial_allocated_bytes,
