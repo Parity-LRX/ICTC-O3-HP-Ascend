@@ -86,45 +86,25 @@ communicators contain only one rank. Make only the allocated devices visible thr
 `ASCEND_RT_VISIBLE_DEVICES`. For a single-node job, use at most as many ranks as
 visible NPUs. Multi-node deployment needs a working HCCL network configuration.
 
-### Captured execution
+### Dynamic execution and host dispatch
 
-`MFF_ASCEND_EXECUTION=graph` captures the device energy, force and global-virial
-calculation together with its HCCL exchanges. Subsequent calls replay the
-recorded tasks. This uses TorchNPU ACLGraph and the same FP32 operators and
-checkpoint. It does not require a TorchScript or `torch.compile` export.
-This deployment capture is qualified for `MFF_ASCEND_MODE=performance`.
-Use eager execution for capacity and native operator modes.
-
-Build the current Ascend pair style before selecting this mode. Its topology
-commit protocol uses host MPI to agree whether any rank needs to invalidate
-the capture. Every rank then recaptures together. Model features, adjoints and
-ghost forces continue to use HCCL.
+The backend uses dynamic eager execution. Atom counts, neighbor edges, species
+and owner schedules are refreshed after neighbor rebuilds and atom migration.
+It does not capture or replay a fixed-shape device program.
 
 The launcher configures task dispatch before PyTorch starts and divides the
 actual near-CPU groups reported by `npu-smi` between visible devices:
 
 ```bash
 python /path/to/ICTC-O3-HP-Ascend/lammps_user_mfftorch/launch_ascend.py \
-  --execution graph --queue 1 -- \
+  --queue 2 -- \
   /path/to/mpi/bin/mpiexec -n 8 /path/to/build-ascend/lmp -in in.mfftorch_ascend
 ```
 
 Use `--dry-run` to inspect the command and CPU bindings. Existing
-`CPU_AFFINITY_CONF` settings are retained; `--affinity none` disables automatic
-binding. For eager execution, select `--execution eager`; the launcher defaults
-to task-queue level 2 unless a queue setting is already present.
-
-Current positions and cell tensors are copied into the capture inputs on every
-force evaluation. Exact topology, species and owner-schedule metadata can be
-reused across neighbor rebuilds only when the MPI change flag is zero. A single
-energy, force and virial program serves every call, keeping the kernel sequence
-and memory pool fixed when virial requests alternate. Unrequested virial output
-is discarded. The capture retains device memory until invalidation or shutdown;
-capture and warmup costs are incurred again when metadata changes.
-
-The tested TorchNPU stack requires task-queue level 0 or 1 for capture. Set
-`MFF_ASCEND_EXECUTION=eager` for synchronized stage profiling; the graph runtime
-records combined replay and result-download time under `graph_seconds`.
+`CPU_AFFINITY_CONF` and `TASK_QUEUE_ENABLE` settings are retained unless explicitly
+overridden. `--affinity none` disables automatic binding. Queue level 2 is the
+launcher default; it controls host task dispatch, not graph capture.
 
 ### Input example
 
@@ -235,13 +215,9 @@ the numerical results. Recorded one-, two-, four- and eight-rank checks use an
 exclusive eight-NPU allocation. Partial-NPU allocations have not been qualified
 with this software stack.
 
-Captured execution additionally passes eight-rank checks for orthogonal and
-triclinic boxes, a three-interaction architecture, mixed active/empty ranks,
-zero-edge graphs and empty ranks. Each force evaluation is compared with a
-fresh eager evaluation, alongside the FP64 initial, translated and final
-configuration checks. Alternating force-only and global-virial requests,
-sorting and actual owner migration are exercised. All ranks agree on capture
-invalidation before any rank runs capture warmup communication.
+The independent CPU FP64 oracle explicitly enables FP64 internal arithmetic and
+checks floating output dtypes. Its virial comes from coordinate/cell strain,
+independently of the deployment's edge-displacement contraction.
 
 ## Measured MD performance
 

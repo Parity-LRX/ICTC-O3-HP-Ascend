@@ -157,8 +157,8 @@ with feature and adjoint exchange. LAMMPS retains host integration, neighbor
 lists, domain decomposition and atom migration. See the
 [Ascend LAMMPS guide](lammps_user_mfftorch/docs/ASCEND.md) for the build,
 checkpoint requirements, examples and qualification scope.
-The backend also provides optional ACLGraph replay of device computation and
-HCCL exchanges, with collective capture invalidation after topology changes.
+Execution is dynamic eager: atom counts, neighbor edges and owner schedules
+can change without capturing or replaying a fixed-shape program.
 The eager C64/lmax2/two-interaction/correlation3 model reaches 5.27x strong scaling
 on eight NPUs at 13,824 atoms (65.8% efficiency). The guide also records the
 lower efficiency of the 4,096-atom point and matched direct-PyTorch timings.

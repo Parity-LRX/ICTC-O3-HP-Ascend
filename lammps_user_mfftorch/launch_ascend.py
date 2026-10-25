@@ -67,8 +67,6 @@ def topology_affinity(text, visible, allowed):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--execution', choices=('eager', 'graph'),
-                        help='Select persistent eager execution or ACLGraph replay')
     parser.add_argument('--queue', choices=('0', '1', '2'),
                         help='Override TASK_QUEUE_ENABLE; default is 2 for eager execution')
     parser.add_argument('--affinity', choices=('auto', 'none'), default='auto',
@@ -80,10 +78,11 @@ def main():
     if command[:1] == ['--']:command = command[1:]
     if not command:parser.error('Supply a LAMMPS or MPI command after --')
     environment = dict(os.environ)
-    if args.execution is not None:environment['MFF_ASCEND_EXECUTION'] = args.execution
+    if environment.get('MFF_ASCEND_EXECUTION', 'eager') != 'eager':
+        parser.error('Only dynamic eager execution is supported')
+    environment['MFF_ASCEND_EXECUTION'] = 'eager'
     if args.queue is not None:environment['TASK_QUEUE_ENABLE'] = args.queue
-    else:environment.setdefault('TASK_QUEUE_ENABLE',
-                                '1' if environment.get('MFF_ASCEND_EXECUTION') == 'graph' else '2')
+    else:environment.setdefault('TASK_QUEUE_ENABLE', '2')
     if args.affinity == 'auto' and not environment.get('CPU_AFFINITY_CONF'):
         if not hasattr(os, 'sched_getaffinity'):
             parser.error('Automatic affinity requires Linux; use --affinity none')

@@ -163,16 +163,9 @@ class _FeatureHalo(torch.autograd.Function):
 
 
 class AscendLAMMPSEngine:
-    def __new__(cls, *args, **kwargs):
-        execution = os.environ.get('MFF_ASCEND_EXECUTION', 'eager')
-        if execution not in ('eager', 'graph'):
-            raise ValueError('MFF_ASCEND_EXECUTION must be eager or graph')
-        if cls is AscendLAMMPSEngine and execution == 'graph':
-            from .ascend_graph import CapturedLAMMPSEngine
-            return object.__new__(CapturedLAMMPSEngine)
-        return object.__new__(cls)
-
     def __init__(self, checkpoint, cutoff, device_index, rank, world_size, master, port):
+        if os.environ.get('MFF_ASCEND_EXECUTION', 'eager') != 'eager':
+            raise ValueError('The Ascend LAMMPS backend supports dynamic eager execution only')
         self.execution = 'eager'
         torch.set_num_threads(int(os.environ.get('MFF_TORCH_THREADS', '2')))
         if not 0 <= device_index < torch.npu.device_count():

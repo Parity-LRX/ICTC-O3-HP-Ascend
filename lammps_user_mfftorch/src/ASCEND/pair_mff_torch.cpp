@@ -244,16 +244,6 @@ void PairMFFTorch::update_topology() {
     PyTuple_SET_ITEM(args.value,8,view(receive_indices_));PyTuple_SET_ITEM(args.value,9,view(send_counts_));
     PyTuple_SET_ITEM(args.value,10,view(receive_counts_));PyTuple_SET_ITEM(args.value,11,PyLong_FromLongLong(neighbor_generation_));
     Ref method(PyObject_GetAttrString(engine_,"topology"));Ref result(PyObject_CallObject(method,args));
-    const int commits=PyObject_HasAttrString(engine_,"topology_commit");
-    if(commits<0)python_error("Cannot inspect Ascend topology protocol");
-    if(commits) {
-      // Re-capture may perform extra model/HCCL warmups. Every rank must
-      // agree on invalidation even when only one local graph has changed.
-      const int local_changed=PyObject_IsTrue(result);int changed=0;
-      if(local_changed<0)python_error("Invalid Ascend topology-change result");
-      MPI_Allreduce(&local_changed,&changed,1,MPI_INT,MPI_MAX,world);
-      Ref committed(PyObject_CallMethod(engine_,"topology_commit","i",changed));
-    }
   }catch(const std::exception& e){error->one(FLERR,e.what());}
 }
 void PairMFFTorch::exchange_plan() {
