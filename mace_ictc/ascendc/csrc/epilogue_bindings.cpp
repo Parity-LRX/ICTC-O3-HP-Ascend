@@ -8,10 +8,10 @@
 #include "aclrtlaunch_ictc_epilogue.h"
 namespace {
 uint64_t align8(uint64_t x) { return (x+7)/8*8; }
-at::Tensor epilogue(const at::Tensor& l,const at::Tensor& r,const at::Tensor& g,
-    const at::Tensor& dst,const at::Tensor& mask,const at::Tensor& meta,const at::Tensor& ix,at::IntArrayRef s) {
+at::Tensor epilogue_impl(const at::Tensor& l,const at::Tensor& r,const at::Tensor& g,
+    const at::Tensor& dst,const at::Tensor& mask,const at::Tensor& meta,const at::Tensor& ix,at::IntArrayRef s,const at::Tensor& target) {
     TORCH_CHECK((s.size()==12 || s.size()==13),"Invalid epilogue descriptor");
-    const uint32_t hoist=s.size()==13?s[12]:0;TORCH_CHECK((hoist&~57u)==0,"Invalid transfer policy");
+    const uint32_t hoist=s.size()==13?s[12]:0;TORCH_CHECK((hoist&~121u)==0,"Invalid transfer policy");
     const uint64_t n=s[0],nodes=s[10];
     const uint32_t c=s[1],q=s[2],p=s[3],m=s[4],paths=s[5],mode=s[6],rows=s[7],bc=s[8],masked=s[9];
     const uint32_t dense=s[11];
@@ -44,7 +44,15 @@ at::Tensor epilogue(const at::Tensor& l,const at::Tensor& r,const at::Tensor& g,
     const uint64_t bytes=4*((hoist&32?1:2)*input+(hoist&16?1:2)*output+(3+dense+bool(hoist&8))*vec+3*rc+align8(4*paths));
     TORCH_CHECK(bytes+4096<=ub,"Epilogue exceeds UB capacity");
     TORCH_CHECK(meta.numel()>=4*paths && ix.numel()>=(2+dense+bool(hoist&8))*vec+2*rc,"Incomplete epilogue metadata");
-    auto out=mode==0 ? at::zeros({static_cast<int64_t>(nodes),m,c},l.options()) :
+    at::Tensor out;
+    if(target.defined()) {
+        TORCH_CHECK(mode==0 && target.device()==l.device() && target.scalar_type()==at::kFloat &&
+            target.is_contiguous() && target.dim()==3 && target.size(0)==nodes &&
+            target.size(1)==m && target.size(2)==c,"Invalid epilogue accumulation buffer");
+        for(const auto& value:{l,r,g,dst,mask,meta,ix})
+            TORCH_CHECK(!target.is_alias_of(value),"Epilogue accumulation must not alias its operands");
+        out=target;
+    } else out=mode==0 ? at::zeros({static_cast<int64_t>(nodes),m,c},l.options()) :
         at::empty({static_cast<int64_t>(n),mode==1 ? q : p,c},l.options());
     if(!n)return out;
     const uint64_t tasks=((n+rows-1)/rows)*((c+bc-1)/bc);
@@ -62,8 +70,21 @@ at::Tensor epilogue(const at::Tensor& l,const at::Tensor& r,const at::Tensor& g,
     at_npu::native::OpCommand::RunOpApi("ictc_ascendc_epilogue",launch);
     return out;
 }
+at::Tensor epilogue(const at::Tensor& l,const at::Tensor& r,const at::Tensor& g,
+    const at::Tensor& dst,const at::Tensor& mask,const at::Tensor& meta,const at::Tensor& ix,at::IntArrayRef s) {
+    return epilogue_impl(l,r,g,dst,mask,meta,ix,s,at::Tensor());
+}
+at::Tensor epilogue_into(const at::Tensor& l,const at::Tensor& r,const at::Tensor& g,
+    const at::Tensor& dst,const at::Tensor& mask,const at::Tensor& meta,const at::Tensor& ix,
+    const at::Tensor& out,at::IntArrayRef s) {
+    return epilogue_impl(l,r,g,dst,mask,meta,ix,s,out);
+}
 }
 TORCH_LIBRARY_FRAGMENT(ictc_ascendc,m) {
     m.def("epilogue(Tensor left, Tensor right, Tensor grad, Tensor destination, Tensor mask, Tensor metadata, Tensor indices, int[] shape) -> Tensor");
+    m.def("epilogue_into(Tensor left, Tensor right, Tensor grad, Tensor destination, Tensor mask, Tensor metadata, Tensor indices, Tensor(a!) output, int[] shape) -> Tensor(a!)");
 }
-TORCH_LIBRARY_IMPL(ictc_ascendc,PrivateUse1,m) { m.impl("epilogue",TORCH_FN(epilogue)); }
+TORCH_LIBRARY_IMPL(ictc_ascendc,PrivateUse1,m) {
+    m.impl("epilogue",TORCH_FN(epilogue));
+    m.impl("epilogue_into",TORCH_FN(epilogue_into));
+}

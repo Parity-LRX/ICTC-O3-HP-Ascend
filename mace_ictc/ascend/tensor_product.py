@@ -1,5 +1,6 @@
 """Path-preserving ICTC tensor products using shared-geometry NPU GEMMs."""
 import torch
+import os
 
 from mace_ictc.models.sparse_weighted_product import sparse_product_plan
 from .sparse_product import sparse_product
@@ -124,14 +125,19 @@ def tensor_product(owner, features, harmonics, gates=None):
             for l,blocks in output.items()}
 
 
-def _automatic_edge_chunk(owner, sample, features, harmonics):
-    """Estimate forward scratch from the actual channel and angular widths."""
+def _edge_working_bytes(owner, sample, features, harmonics):
+    """Estimate message storage from the actual channel and angular widths."""
     channels = sample.shape[1]
     angular = sum(2*l+1 for l in features)
     output = sum(count*(2*l+1) for l,count in owner.path_counts_by_l.items())
     bond = sum((2*i+1)*(2*k+1) for i,j,k in owner.paths
                if i in features and j in harmonics)
-    bytes_per_edge = sample.element_size()*(channels*(angular+output+2*owner.num_paths)+bond)
+    return sample.element_size()*(channels*(angular+output+2*owner.num_paths)+bond)
+
+
+def _automatic_edge_chunk(owner, sample, features, harmonics):
+    """Estimate forward scratch from the actual channel and angular widths."""
+    bytes_per_edge = _edge_working_bytes(owner, sample, features, harmonics)
     cap = getattr(owner, '_ascend_edge_chunk_cap', 131072)
     if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
         raise ValueError('Automatic edge-chunk cap must be a positive integer')
@@ -157,12 +163,20 @@ def graph_message(owner, features, harmonics, gates, src, dst, mask=None,
     schedule=getattr(owner,'_ascend_message_schedule','auto')
     if (is_enabled() and mode()=='performance' and schedule!='legacy'
             and getattr(owner,'_ascend_tp_preproject',True)):
-        chosen=(_automatic_edge_chunk(owner,next(iter(features.values())),features,harmonics)
+        sample=next(iter(features.values()))
+        chosen=(_automatic_edge_chunk(owner,sample,features,harmonics)
                 if edge_chunk_size is None else edge_chunk_size)
-        # Grouped layout work needs enough edges to amortize its extra launches.
-        # Retain the established small-chunk route for arbitrary model widths.
-        minimum = getattr(owner, '_ascend_grouped_min_edges', 65536)
-        if schedule=='grouped' or (src.numel()>=minimum and chosen>=32768):
+        policy=os.environ.get('ICTC_ASCEND_VOLUME_DISPATCH','1')
+        if policy not in ('0','1'):
+            raise ValueError('The message-volume dispatch policy must be zero or one')
+        width=sum(2*k+1 for i,j,k in owner.paths if i in features and j in harmonics)
+        volume=min(src.numel(),chosen)*sample.shape[1]*width
+        minimum=int(os.environ.get('ICTC_ASCEND_EPILOGUE_MIN_ELEMENTS',str(64*1024**2)))
+        if minimum<1:
+            raise ValueError('The message minimum working set must be positive')
+        grouped_minimum=getattr(owner, '_ascend_grouped_min_edges', 65536)
+        if (schedule=='grouped' or (src.numel()>=grouped_minimum and chosen>=32768)
+                or (policy=='1' and volume>=minimum)):
             from .channel_message import graph_message as channel_message
             return channel_message(owner,features,harmonics,gates,src,dst,mask,edge_chunk_size=chosen)
     if (native_graph_enabled() and getattr(owner,'_ascend_tp_preproject',True)
@@ -180,11 +194,20 @@ def graph_message(owner, features, harmonics, gates, src, dst, mask=None,
         zero = owner.weight.sum()*0+gates.sum()*0
         zero = zero+sum(value.sum()*0 for value in (*features.values(), *harmonics.values()))
         return {l: value+zero for l, value in output.items()}
-    for begin in range(0, src.numel(), edge_chunk_size):
+    policy=os.environ.get('ICTC_ASCEND_CHUNK_SPLIT','1')
+    if policy not in ('0','1'):
+        raise ValueError('The shared chunk-adjoint policy must be zero or one')
+    split=policy=='1'
+    # One split joins chunk cotangents without a full-edge gradient per slice.
+    edges=src.numel()
+    harmonic_parts={l:((value,) if edges<=edge_chunk_size else value.split(edge_chunk_size,0))
+                    for l,value in harmonics.items()} if split else {}
+    gate_parts=((gates,) if edges<=edge_chunk_size else gates.split(edge_chunk_size,0)) if split else ()
+    for chunk,begin in enumerate(range(0, src.numel(), edge_chunk_size)):
         end = min(begin+edge_chunk_size, src.numel())
         edge_features = {l: value.index_select(0, src[begin:end]) for l, value in features.items()}
-        edge_harmonics = {l: value[begin:end] for l, value in harmonics.items()}
-        value = tensor_product(owner, edge_features, edge_harmonics, gates[begin:end])
+        edge_harmonics = {l: harmonic_parts[l][chunk] if split else value[begin:end] for l, value in harmonics.items()}
+        value = tensor_product(owner, edge_features, edge_harmonics, gate_parts[chunk] if split else gates[begin:end])
         for l, block in value.items():
             if mask is not None:
                 block = block*mask[begin:end].reshape(-1, 1, 1)

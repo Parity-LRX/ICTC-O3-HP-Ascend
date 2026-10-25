@@ -10,7 +10,7 @@ public:
         uint32_t q,uint32_t p,uint32_t m,uint32_t second,uint32_t rows,uint32_t bc,
         uint32_t masked,uint32_t flags,uint32_t hoist) {
         n_=edges;ls_=ls;rs_=rs;hls_=hls;hrs_=hrs;c_=c;q_=q;p_=p;m_=m;
-        transpose_=bool(hoist&8);hoist_=hoist&1;singleIn_=hoist&32;singleOut_=hoist&16;second_=second;rows_=rows;bc_=bc;masked_=masked;flags_=flags;cb_=(c+bc-1)/bc;
+        transpose_=bool(hoist&8);linear_=bool(hoist&64);hoist_=hoist&1;singleIn_=hoist&32;singleOut_=hoist&16;second_=second;rows_=rows;bc_=bc;masked_=masked;flags_=flags;cb_=(c+bc-1)/bc;
         vec_=rows*q*bc;rc_=rows*bc;pv_=rows*p*bc;
         dl_=flags&1;dr_=flags&2;dg_=flags&4;hl_=flags&8;hr_=flags&16;
         useL_=(!second_ && dr_) || (second_ && dg_ && hr_);
@@ -54,6 +54,7 @@ private:
         DataCopyPadExtParams<T> pad{false,0,0,0};DataCopyPad(d,s[begin],cp,pad);
     }
     __aicore__ inline void Columns(LocalTensor<float> d,GlobalTensor<float> s,uint64_t begin,uint32_t angular) {
+        if(linear_ && cn_==c_ && bc_==c_) {Copy(d,s,begin,angular*c_);return;}
         DataCopyExtParams cp{static_cast<uint16_t>(angular),cn_*4,(c_-cn_)*4,(bc_-A8(cn_))/8,0};
         DataCopyPadExtParams<float> pad{false,0,0,0};DataCopyPad(d,s[begin],cp,pad);
     }
@@ -95,7 +96,12 @@ private:
     }
     __aicore__ inline void EdgeOut(GlobalTensor<float> target,LocalTensor<float> value,uint32_t width) {
         DataCopyExtParams cp{static_cast<uint16_t>(rn_*width),cn_*4,(bc_-A8(cn_))/8,(c_-cn_)*4,0};
+        if(linear_ && cn_==c_ && bc_==c_)cp={1,rn_*width*c_*4,0,0,0};
         DataCopyPad(target[firstN_*width*c_+firstC_],value,cp);
+    }
+    __aicore__ inline DataCopyExtParams NodeCopy(uint32_t width) {
+        if(linear_ && cn_==c_ && bc_==c_)return {1,width*c_*4,0,0,0};
+        return {static_cast<uint16_t>(width),cn_*4,(bc_-A8(cn_))/8,(c_-cn_)*4,0};
     }
     __aicore__ inline void Compute(uint64_t task) {
         Describe(task);const uint32_t lanes=rn_*q_*bc_,rc=rn_*bc_;
@@ -146,7 +152,7 @@ private:
                     while(path<p_ && table.GetValue(path*4)==src+width && table.GetValue(path*4+2)==out+width) {
                         width+=table.GetValue(path*4+3);path++;
                     }
-                    DataCopyExtParams cp{static_cast<uint16_t>(width),cn_*4,(bc_-A8(cn_))/8,(c_-cn_)*4,0};
+                    auto cp=NodeCopy(width);
                     for(uint32_t row=0;row<rn_;row++)DataCopyPad(dgG_[(static_cast<uint64_t>(destinations.GetValue(row))*m_+out)*c_+firstC_],
                         ready[dgo_+(row*q_+src)*bc_],cp);
                 }
@@ -160,7 +166,7 @@ private:
                     while(path<p_ && table.GetValue(path*4)==src+width && table.GetValue(path*4+2)==out+width) {
                         width+=table.GetValue(path*4+3);path++;
                     }
-                    DataCopyExtParams cp{static_cast<uint16_t>(width),cn_*4,(bc_-A8(cn_))/8,(c_-cn_)*4,0};
+                    auto cp=NodeCopy(width);
                     DataCopyPad(dgG_[(node*m_+out)*c_+firstC_],ready[dgo_+(row*q_+src)*bc_],cp);
                 }
                 SetAtomicNone();
@@ -173,7 +179,7 @@ private:
     GlobalTensor<float> lG_,rG_,gG_,hlG_,hrG_,maskG_,dlG_,drG_,dgG_;
     GlobalTensor<int64_t> dstG_;GlobalTensor<uint32_t> metaG_,ixG_;
     uint64_t n_,ls_,rs_,hls_,hrs_,firstN_;
-    uint32_t transpose_,singleIn_,singleOut_,hoist_,c_,q_,p_,m_,second_,rows_,bc_,masked_,flags_,cb_,vec_,rc_,pv_;
+    uint32_t transpose_,linear_,singleIn_,singleOut_,hoist_,c_,q_,p_,m_,second_,rows_,bc_,masked_,flags_,cb_,vec_,rc_,pv_;
     uint32_t lo_,ro_,go_,hlo_,hro_,dstoff_,maskoff_,dlo_,dro_,dgo_,inputSize_,outputSize_,rn_,cn_,firstC_;
     bool dl_,dr_,dg_,hl_,hr_,useL_,useR_,useG_,useHL_,useHR_;
 };

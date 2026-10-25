@@ -28,10 +28,12 @@ def _buffering():
 def _transfer_options():
     hoist=os.environ.get('ICTC_ASCEND_TRANSFER_HOIST','1')
     transpose=os.environ.get('ICTC_ASCEND_TRANSPOSE_REDUCTION','1')
-    if hoist not in ('0','1') or transpose not in ('0','1'):
+    linear=os.environ.get('ICTC_ASCEND_CONTIGUOUS_DMA','1')
+    if any(value not in ('0','1') for value in (hoist,transpose,linear)):
         raise ValueError('Invalid native epilogue transfer policy')
     inputs,outputs=_buffering()
-    return int(hoist) | (8 if transpose=='1' else 0) | (32 if inputs==1 else 0) | (16 if outputs==1 else 0)
+    return (int(hoist) | (8 if transpose=='1' else 0) | (32 if inputs==1 else 0) |
+            (16 if outputs==1 else 0) | (64 if linear=='1' else 0))
 
 
 def _align(n):
@@ -127,7 +129,7 @@ def _physical(value):
                      and value.stride(0) >= value.shape[1]*value.shape[2]) else value.contiguous()
 
 
-def raw(left,right,plan,mode=0,grad=None):
+def raw(left,right,plan,mode=0,grad=None,*,accumulator=None,physical_output=False):
     graph = plan['_ascendc_graph']
     mask = graph['mask']
     rows,bc,metadata,indices,dense,*_ = _schedule(plan,left,mode,mask is not None)
@@ -138,15 +140,19 @@ def raw(left,right,plan,mode=0,grad=None):
     options=_transfer_options()
     if mode!=2:options&=~8
     if options:shape.append(options)
-    out = load_library().epilogue(_physical(left),_physical(right),
-        dummy if grad is None else grad.transpose(1,2).contiguous(),graph['dst'].contiguous(),
-        dummy if mask is None else mask.contiguous(),metadata,indices,shape)
-    return out.transpose(1,2)
+    args=(_physical(left),_physical(right),
+          dummy if grad is None else grad.transpose(1,2).contiguous(),graph['dst'].contiguous(),
+          dummy if mask is None else mask.contiguous(),metadata,indices)
+    from mace_ictc.ascend.runtime import drain_graph_queue
+    drain_graph_queue(left.device)
+    out=(load_library().epilogue(*args,shape) if accumulator is None else
+         load_library().epilogue_into(*args,accumulator,shape))
+    return out if physical_output else out.transpose(1,2)
 
 
-def _native(left,right,plan,mode=0,grad=None):
+def _native(left,right,plan,mode=0,grad=None,*,accumulator=None):
     return raw(left.transpose(1,2),right.transpose(1,2),plan,mode,
-               None if grad is None else grad.transpose(1,2)).transpose(1,2)
+               None if grad is None else grad.transpose(1,2),accumulator=accumulator,physical_output=True)
 
 
 def _reference(left,right,plan):
@@ -243,6 +249,8 @@ def _adjoints(left,right,grad,plan,needed,hleft=None,hright=None,*,second=False)
     options=_transfer_options()
     if not flags&2:options&=~8
     if options:shape.append(options)
+    from mace_ictc.ascend.runtime import drain_graph_queue
+    drain_graph_queue(left.device)
     values=load_library().epilogue_adjoint(left,right,grad.contiguous() if flags&3 else dummy,
         dummy if hleft is None else _edge_layout(hleft),
         dummy if hright is None else _edge_layout(hright),graph['dst'].contiguous(),
@@ -324,6 +332,32 @@ class _PhysicalProduct(torch.autograd.Function):
         return *values,None
 
 
+class _AccumulatePhysicalProduct(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx,left,right,accumulator,plan):
+        from mace_ictc.ascend.sparse_product import _graph_tensors
+        ctx.set_materialize_grads(False)
+        ctx.save_for_backward(left,right,*_graph_tensors(plan))
+        ctx.plan=plan
+        ctx.mark_dirty(accumulator)
+        _native(left,right,plan,accumulator=accumulator)
+        return accumulator
+
+    @staticmethod
+    def backward(ctx,grad):
+        if grad is None:return None,None,None,None
+        from mace_ictc.models.adjoint_requirements import required_gradients
+        left,right,*_=ctx.saved_tensors
+        needed=required_gradients((left,right),ctx.needs_input_grad[:2])
+        if torch.is_grad_enabled():values=_PhysicalAdjoint.apply(left,right,grad,ctx.plan,needed)
+        else:
+            values=_adjoints(left,right,grad,ctx.plan,needed)
+            if values is None:
+                values=tuple(_native(left,right,ctx.plan,i+1,grad) if need else None
+                             for i,need in enumerate(needed))
+        return *values,grad if ctx.needs_input_grad[2] else None,None
+
+
 def regroup(plan, projection, groups, path_offsets):
     """Place adjacent destination paths next to each other in the Cube output."""
     key='_ascendc_epilogue_groups'
@@ -346,7 +380,7 @@ def regroup(plan, projection, groups, path_offsets):
     return plan[key]
 
 
-def apply(base,weights,plan,group,weight_ids,offsets,destination,nodes,mask=None,*,compact=False):
+def apply(base,weights,plan,group,weight_ids,offsets,destination,nodes,mask=None,*,compact=False,accumulator=None):
     """Fuse path gates and destination accumulation without edge-sized copies."""
     _,_,q,_,items = group
     c = base.shape[2]
@@ -375,4 +409,5 @@ def apply(base,weights,plan,group,weight_ids,offsets,destination,nodes,mask=None
     proxy = dict(core)
     proxy['_ascendc_graph'] = dict(src=identities[edges],dst=destination,
                                  mask=mask,destination_nodes=nodes)
-    return _PhysicalProduct.apply(base,weights,proxy)
+    return (_PhysicalProduct.apply(base,weights,proxy) if accumulator is None else
+            _AccumulatePhysicalProduct.apply(base,weights,accumulator,proxy))

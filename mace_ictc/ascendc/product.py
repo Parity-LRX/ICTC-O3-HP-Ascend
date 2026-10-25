@@ -138,6 +138,8 @@ def raw(left,right,weight,index,plan,bank,mode=0,grad=None):
     shape = [n,c,rc,a,b,p,m,width,mode,int(bank),index_kind,
              tile['rows'],tile['channels'],terms,head,stride,tile['term_capacity'],
              output_nodes,int(graph is not None),int(masked)]
+    from mace_ictc.ascend.runtime import drain_graph_queue
+    drain_graph_queue(left.device)
     return load_library().weighted_map(left,right,weight,left if grad is None else grad,
         metadata if index is None else index,metadata,*tile['indices'],
         metadata if graph is None else graph['src'],metadata if graph is None else graph['dst'],

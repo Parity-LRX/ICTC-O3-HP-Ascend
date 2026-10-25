@@ -1,5 +1,6 @@
 """Fused graph gather, multilinear map and FP32 destination accumulation."""
 import weakref
+import os
 import torch
 
 
@@ -47,10 +48,18 @@ def graph_message(owner,features,harmonics,gates,src,dst,mask=None,*,edge_chunk_
     if 'bond_projection' not in base:
         raise ValueError('Native fused graph messages require shared geometry projection')
     result=None
-    for begin in range(0,max(1,edges),edge_chunk_size):
+    policy=os.environ.get('ICTC_ASCEND_CHUNK_SPLIT','1')
+    if policy not in ('0','1'):
+        raise ValueError('The shared chunk-adjoint policy must be zero or one')
+    split=policy=='1'
+    # One split joins chunk cotangents without a full-edge gradient per slice.
+    sh_parts=((sh,) if edges<=edge_chunk_size else sh.split(edge_chunk_size,0)) if split else ()
+    gate_parts=((gates,) if edges<=edge_chunk_size else gates.split(edge_chunk_size,0)) if split else ()
+    for chunk,begin in enumerate(range(0,max(1,edges),edge_chunk_size)):
         end=min(begin+edge_chunk_size,edges)
-        right=_FixedLinear.apply(sh[begin:end],base['bond_projection']).unsqueeze(1)
-        weight=(gates[begin:end].reshape(end-begin,owner.num_paths,channels).transpose(1,2)*
+        right=_FixedLinear.apply(sh_parts[chunk] if split else sh[begin:end],base['bond_projection']).unsqueeze(1)
+        part=gate_parts[chunk] if split else gates[begin:end]
+        weight=(part.reshape(end-begin,owner.num_paths,channels).transpose(1,2)*
                 owner.weight.T.unsqueeze(0)).contiguous()
         graph=dict(src=src[begin:end].contiguous(),dst=dst[begin:end].contiguous(),destination_nodes=nodes,
                    mask=None if mask is None else mask[begin:end].reshape(-1).to(dtype=sample.dtype).contiguous())

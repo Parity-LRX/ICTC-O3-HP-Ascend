@@ -7,6 +7,8 @@
 #include <numeric>
 #include <tuple>
 #include "torch_npu/csrc/core/npu/NPUGuard.h"
+#include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
+#include "torch_npu/csrc/core/npu/NPUFunctions.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 #include "tiling/platform/platform_ascendc.h"
@@ -21,6 +23,12 @@ std::vector<int64_t> hardware() {
     uint64_t ub = 0;
     platform->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ub);
     return {static_cast<int64_t>(ub), platform->GetCoreNumAiv()};
+}
+
+int64_t allocated_bytes(int64_t device) {
+    TORCH_CHECK(device >= 0 && device < c10_npu::device_count(), "Invalid NPU device index");
+    const auto stats = c10_npu::NPUCachingAllocator::getDeviceStats(static_cast<int>(device));
+    return stats.allocated_bytes[static_cast<size_t>(c10_npu::NPUCachingAllocator::StatType::AGGREGATE)].current;
 }
 
 at::Tensor binary(const at::Tensor& x, const at::Tensor& y, int64_t mode, int64_t tile,
@@ -160,6 +168,7 @@ at::Tensor ictc_ascendc_add_bias(const at::Tensor& x,const at::Tensor& bias) {
 
 TORCH_LIBRARY(ictc_ascendc, m) {
     m.def("hardware() -> int[]", &hardware);
+    m.def("allocated_bytes(int device) -> int", &allocated_bytes);
     m.def("binary(Tensor x, Tensor y, int mode=0, int tile=0, float alpha=1., float beta=0.) -> Tensor");
     m.def("weighted_map(Tensor l, Tensor r, Tensor w, Tensor g, Tensor species, Tensor metadata, Tensor ix0, Tensor ix1, Tensor source, Tensor destination, Tensor mask, int[] shape) -> Tensor");
 }
