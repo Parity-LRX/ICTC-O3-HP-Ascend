@@ -29,8 +29,8 @@ ub_bytes, vector_cores = ops.hardware()
 # Construct/configure the model or standalone operators after enable().
 ```
 
-Rebuild the Ascend C library after updating the source tree. The native matrix
-adjoints and queue descriptors require the library built from the matching sources.
+Rebuild the Ascend C library after updating the source tree. Native transfer
+policies, matrix adjoints and queue descriptors require matching library sources.
 
 This process-wide opt-in selects an execution mode:
 
@@ -217,6 +217,12 @@ buffers and restore the public angular/path order at node count. Coupling
 coefficients and learned parameter tensors are unchanged. Native narrow-matrix
 adjoints keep their original matrix storage, including transposed operands;
 unsupported widths retain CANN execution.
+
+Tiles covering all channels combine consecutive angular rows into single DMA blocks
+when both source and destination intervals are contiguous. Channel tails and
+row gaps retain strided transfers. This changes transfer segmentation while
+preserving FP32 arithmetic and differentiation formulas. Set
+`ICTC_ASCEND_CONTIGUOUS_DMA=0` to retain the preceding transfer schedule.
 
 Periodic geometry uses single-axis row gathers. A single-cell batch computes
 periodic shifts as one matrix product; multiple cells use the corresponding

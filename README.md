@@ -123,6 +123,8 @@ species banks and symmetric contractions, and [the upstream provenance](UPSTREAM
   angular reordering restores the public path order. This keeps graph transfers
   contiguous without changing coupling coefficients. Narrow batched adjoints
   use bounded Vector schedules where applicable, with CANN fallback.
+  Tiles spanning the full channel axis coalesce contiguous angular rows into
+  single DMA blocks. Channel tails and separated rows retain strided transfers.
   Recursive matrix adjoints retain live first, mixed second and higher derivatives. Standalone edge products
   retain their analytic path adjoints; symmetric contractions use analytic first
   and mixed second adjoints with differentiable higher-order formulas.
@@ -189,20 +191,20 @@ identical initialized weights and graphs. All latencies include energy and force
 
 | Model | Operation | Previous → current (ms) | Current atom-steps/s | Allocated peak (MiB) |
 | --- | --- | ---: | ---: | ---: |
-| C32, lmax 1 | Inference | 59.59 → 54.21 | 75,560 | 1,692 |
-| C32, lmax 1 | Training + AdamW | 138.38 → 134.73 | 30,401 | 3,595 |
-| C64, lmax 2 | Inference | 105.29 → 84.40 | 48,532 | 5,272 |
-| C64, lmax 2 | Training + AdamW | 273.41 → 236.13 | 17,346 | 10,797 |
+| C32, lmax 1 | Inference | 55.32 → 55.68 | 73,565 | 1,212 |
+| C32, lmax 1 | Training + AdamW | 134.40 → 134.48 | 30,459 | 2,948 |
+| C64, lmax 2 | Inference | 84.79 → 83.74 | 48,912 | 5,273 |
+| C64, lmax 2 | Training + AdamW | 236.67 → 233.80 | 17,520 | 10,796 |
 
-The paired baseline retains the preceding fused native epilogues. Compact node
-outputs, contiguous row gathers, narrow Vector adjoints and revised UB schedules
-increase C64 inference throughput by 24.8% and full training throughput by 15.8%.
-All optimizations are selected by actual shapes and hardware limits.
+The paired baseline uses the preceding production schedules, including compact
+node outputs, contiguous row gathers and narrow Vector adjoints. Coalescing DMA
+transfers for full-channel tiles increases C64 inference throughput by 1.25% and
+full training throughput by 1.23%. Selection follows actual shapes and hardware
+limits; channel tails retain strided transfers.
 
 Across seven channel/degree configurations spanning 16–128 channels, 18 paired
-measurements at 512 or 4,096 atoms show no observed latency regression.
-Memory savings are shape-dependent: C96/lmax-2 training improves from 431.07 to
-392.99 ms, while its allocation peak increases from 30,850 to 33,445 MiB.
+measurements at 512 or 4,096 atoms show a maximum latency regression of 0.64%.
+The C64 allocation peaks are unchanged in this paired comparison.
 
 ### Matched single-device K100 comparison
 
@@ -212,8 +214,8 @@ protocol match. Both devices use eager FP32 with HF32/TF32 disabled.
 
 | Operation | K100 (ms) | Ascend 910B3 (ms) | Ascend / K100 latency |
 | --- | ---: | ---: | ---: |
-| Energy + force inference | 40.63 | 84.40 | 2.08× |
-| Energy + force training + AdamW | 112.68 | 236.13 | 2.10× |
+| Energy + force inference | 40.63 | 83.74 | 2.06× |
+| Energy + force training + AdamW | 112.68 | 233.80 | 2.07× |
 
 These ratios describe this initialized model and fixed graph, rather than a
 hardware-wide performance ratio.
@@ -222,9 +224,9 @@ hardware-wide performance ratio.
 
 A separate continuous-training check uses 64 timed steps per route, six warmups,
 alternating 16-step blocks, per-step synchronization and Python garbage collection
-enabled. C64 mean step time decreases from 272.65 to 243.44 ms, increasing
-sustained throughput by 12.0% to 16,826 atom-steps/s. The new median is 243.36 ms,
-95th percentile 244.25 ms and maximum 245.28 ms. Per-step synchronization makes
+enabled. C64 mean step time decreases from 245.54 to 242.45 ms, increasing
+sustained throughput by 1.28% to 16,895 atom-steps/s. The new median is 242.34 ms,
+95th percentile 243.13 ms and maximum 244.13 ms. Per-step synchronization makes
 this a different timing protocol from the three-call rounds above.
 
 Throughput counts processed atoms per energy-and-force call or full training step.

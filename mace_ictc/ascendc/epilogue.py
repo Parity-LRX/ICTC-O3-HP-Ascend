@@ -28,10 +28,12 @@ def _buffering():
 def _transfer_options():
     hoist=os.environ.get('ICTC_ASCEND_TRANSFER_HOIST','1')
     transpose=os.environ.get('ICTC_ASCEND_TRANSPOSE_REDUCTION','1')
-    if hoist not in ('0','1') or transpose not in ('0','1'):
+    linear=os.environ.get('ICTC_ASCEND_CONTIGUOUS_DMA','1')
+    if any(value not in ('0','1') for value in (hoist,transpose,linear)):
         raise ValueError('Invalid native epilogue transfer policy')
     inputs,outputs=_buffering()
-    return int(hoist) | (8 if transpose=='1' else 0) | (32 if inputs==1 else 0) | (16 if outputs==1 else 0)
+    return (int(hoist) | (8 if transpose=='1' else 0) | (32 if inputs==1 else 0) |
+            (16 if outputs==1 else 0) | (64 if linear=='1' else 0))
 
 
 def _align(n):

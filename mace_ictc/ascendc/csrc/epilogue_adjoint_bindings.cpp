@@ -13,7 +13,7 @@ std::vector<at::Tensor> epilogue_adjoint(const at::Tensor& l,const at::Tensor& r
     const at::Tensor& meta,const at::Tensor& ix,at::IntArrayRef s) {
     TORCH_CHECK((s.size()==11 || s.size()==12),"Invalid fused epilogue adjoint descriptor");
     for(auto v:s)TORCH_CHECK(v>=0,"Negative fused adjoint dimension");
-    const uint32_t hoist=s.size()==12?s[11]:0;TORCH_CHECK((hoist&~57u)==0,"Invalid transfer policy");
+    const uint32_t hoist=s.size()==12?s[11]:0;TORCH_CHECK((hoist&~121u)==0,"Invalid transfer policy");
     const uint64_t n=s[0],nodes=s[9];
     const uint32_t c=s[1],q=s[2],p=s[3],m=s[4],second=s[5],rows=s[6],bc=s[7],masked=s[8],flags=s[10];
     const bool dl=flags&1,dr=flags&2,dg=flags&4,hasHL=flags&8,hasHR=flags&16;

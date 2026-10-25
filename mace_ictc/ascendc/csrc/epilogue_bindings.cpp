@@ -11,7 +11,7 @@ uint64_t align8(uint64_t x) { return (x+7)/8*8; }
 at::Tensor epilogue(const at::Tensor& l,const at::Tensor& r,const at::Tensor& g,
     const at::Tensor& dst,const at::Tensor& mask,const at::Tensor& meta,const at::Tensor& ix,at::IntArrayRef s) {
     TORCH_CHECK((s.size()==12 || s.size()==13),"Invalid epilogue descriptor");
-    const uint32_t hoist=s.size()==13?s[12]:0;TORCH_CHECK((hoist&~57u)==0,"Invalid transfer policy");
+    const uint32_t hoist=s.size()==13?s[12]:0;TORCH_CHECK((hoist&~121u)==0,"Invalid transfer policy");
     const uint64_t n=s[0],nodes=s[10];
     const uint32_t c=s[1],q=s[2],p=s[3],m=s[4],paths=s[5],mode=s[6],rows=s[7],bc=s[8],masked=s[9];
     const uint32_t dense=s[11];
