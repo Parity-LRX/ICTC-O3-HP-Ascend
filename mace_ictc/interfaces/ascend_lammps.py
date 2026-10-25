@@ -196,7 +196,7 @@ class AscendLAMMPSEngine:
         self.prune_skin = prune == '1'
         if self.prune_skin and getattr(self.model, 'assume_edges_within_radius', False):
             raise ValueError('Skin pruning requires the model cutoff mask to remain enabled')
-        compact = os.environ.get('MFF_ASCEND_COMPACT_OUTPUTS', '0')
+        compact = os.environ.get('MFF_ASCEND_COMPACT_OUTPUTS', '1')
         if compact not in ('0', '1'):
             raise ValueError('MFF_ASCEND_COMPACT_OUTPUTS must be zero or one')
         self.compact_outputs = compact == '1' and self.halo_mode == 'layerwise' and world_size > 1

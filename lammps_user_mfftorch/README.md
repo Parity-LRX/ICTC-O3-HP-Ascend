@@ -6,9 +6,10 @@ installer and does not require Kokkos or ML-IAP. The CUDA deployment paths below
 retain their existing LibTorch/AOTInductor interface.
 
 Multi-rank Ascend runs default to a single-cutoff halo with HCCL feature and
-adjoint exchange. The measured C64/lmax2/two-interaction model reaches 5.27x
-strong scaling on eight NPUs at 13,824 atoms. See the guide for the full
-configuration, single-rank PT comparison and per-rank memory measurements.
+adjoint exchange. The measured C64/lmax2/two-interaction model reaches 6.64x
+strong scaling on eight NPUs at 32,768 atoms (83.0% efficiency). See the guide
+for the full configuration, single-rank PT comparison and per-rank memory
+measurements.
 
 `USER-MFFTORCH` is a LAMMPS package for running exported MACE-ICTC models through
 LibTorch/AOTInductor from C++. It is intended for production MD after a model has

@@ -106,6 +106,30 @@ Use `--dry-run` to inspect the command and CPU bindings. Existing
 overridden. `--affinity none` disables automatic binding. Queue level 2 is the
 launcher default; it controls host task dispatch, not graph capture.
 
+### Dynamic work reduction
+
+Compact owned outputs are enabled by default for multi-rank layerwise execution.
+Other work-reduction options below are disabled by default, and feature gathers
+use the native route. These controls apply to live atom and neighbor data; none
+requires a fixed atom count, padded neighbor capacity or captured device program.
+
+| Environment variable | Effect |
+| --- | --- |
+| `MFF_ASCEND_PRUNE_SKIN=1` | Filters inactive skin edges using current host coordinates before device evaluation. The original NPU cutoff mask remains enabled. |
+| `MFF_ASCEND_COMPACT_OUTPUTS=1` | Omits redundant zero-ghost rows from projections, self-connections and readouts in multi-rank layerwise execution. Default: `1`; set `0` to disable. |
+| `MFF_ASCEND_OWNER_LINEAR=1` | Evaluates the frozen input linear map on owned features before exchanging them. |
+| `MFF_ASCEND_OWNER_OUTPUT=1` | Aggregates messages directly into owned destinations while retaining halo source features. |
+| `MFF_ASCEND_FEATURE_GATHER=index_select` | Uses device `index_select` for feature gathers; adjoint accumulation still uses Ascend C. Default: `native`. |
+| `MFF_ASCEND_OVERLAP_FEATURES=1` | Overlaps feature communication with independent radial work on an eager device stream. Requires `MFF_ASCEND_OWNER_LINEAR=1`. |
+
+Skin filtering uses the coordinates already available to the CPU integrator.
+It recomputes a conservative distance bound on every force call, including a
+margin for FP32 device arithmetic. Device indices are reused only when the newly
+computed mask is identical. Atom migration, neighbor rebuilds and changing edge
+counts remain supported. Filtering costs CPU time and does not shrink the
+HCCL ownership schedule, so its benefit depends on the model and system size.
+It is incompatible with `assume_edges_within_radius=True`.
+
 ### Input example
 
 Minimal input, with a cutoff of 3.2 Angstrom matching the saved model:
@@ -161,8 +185,10 @@ construction. This reverse exchange is required for forces and global virial.
 The deployment exchange implements their first derivative; force-loss training
 and Hessians require a separate higher-derivative implementation.
 
-Nodes unused by the model graph are removed before device transfer. Skin edges
-remain in the cached graph and are masked at the cutoff using current coordinates.
+Nodes unused by the model graph are removed before device transfer. By default,
+skin edges remain in the cached graph and are masked at the cutoff using current
+coordinates. Optional dynamic skin filtering removes provably inactive edges
+before model evaluation while retaining the NPU cutoff mask.
 Fixed routing coefficients and UB transfer metadata are reused; ownership
 indices and buffers refresh with the topology. Floating learned features are
 recomputed. Single-rank computation is the same for both halo settings.
@@ -219,60 +245,82 @@ The independent CPU FP64 oracle explicitly enables FP64 internal arithmetic and
 checks floating output dtypes. Its virial comes from coordinate/cell strain,
 independently of the deployment's edge-displacement contraction.
 
+The dynamic work-reduction options are checked together with actual MPI owner
+changes, restricted triclinic boxes, a second architecture, mixed active/empty
+ranks and zero-edge cases. Compact outputs are also checked with the standard
+pre-linear feature exchange. Skin-filter checks include 54 cutoff-boundary,
+periodic-coordinate and moving-edge cases against NPU cutoff decisions.
+
 ## Measured MD performance
 
-The following initialized H/C/O model has 64 channels, angular degree 2, two
-interactions and correlation order 3. Runs use one Ascend 910B3 per MPI rank,
-strict FP32, eager execution, a 4.5 Angstrom cutoff, 0.5 Angstrom skin and a
-0.5 fs NVE timestep. The configurations have 56 physical neighbors and 80 cached
-skin edges per atom initially. Values are median LAMMPS loop times from three
-10-step runs after five warmup steps. Synchronized diagnostic runs are separate.
+The initialized H/C/O model has 64 channels, angular degree 2, two interactions
+and correlation order 3. Each MPI rank uses one Ascend 910B3. All rank counts
+and sizes use the same checkpoint, strict FP32 with HF32 disabled, dynamic eager
+execution, a 4.5 Angstrom cutoff, 0.5 Angstrom skin, density 0.125 atoms/Angstrom^3
+and a 0.5 fs NVE timestep. There are initially 56 physical neighbors and 80
+cached skin edges per atom. Skin pruning and feature overlap are disabled;
+gathering uses the native route and compact owned outputs are enabled.
 
-### Strong scaling with layerwise exchange
+Values are median complete LAMMPS loop times from three ten-step runs after
+five warmup steps. CPU integration, transfers and communication are included.
+Neighbor rebuilds use LAMMPS' displacement check; separate numerical checks
+force rebuilds and owner migration. Each run has an exclusive eight-NPU
+allocation, including runs with fewer active MPI ranks. No custom
+`CPU_AFFINITY_CONF` was set. To reproduce the dispatch configuration from a
+clean shell:
 
-| NPUs | 4,096 atoms: ms/step | Speedup | Efficiency | 13,824 atoms: ms/step | Speedup | Efficiency |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 134.90 | 1.00x | 100% | 504.08 | 1.00x | 100% |
-| 2 | 92.60 | 1.46x | 72.8% | 248.75 | 2.03x | 101.3% |
-| 4 | 71.52 | 1.89x | 47.2% | 135.22 | 3.73x | 93.2% |
-| 8 | 75.77 | 1.78x | 22.3% | 95.74 | 5.27x | 65.8% |
+```bash
+export MFF_ASCEND_COMPACT_OUTPUTS=1
+python /path/to/ICTC-O3-HP-Ascend/lammps_user_mfftorch/launch_ascend.py \
+  --affinity none --queue 2 -- \
+  /path/to/mpi/bin/mpiexec -n 8 /path/to/build-ascend/lmp -in in.mfftorch_ascend
+```
 
-Efficiency is `T1 / (ranks * Tranks)`. The larger eight-NPU point processes
-144,389 atom-steps/s. At 4,096 atoms, four NPUs are faster than eight; per-rank
-work is too small to sustain efficient scaling. The slightly superlinear
-two-NPU result is specific to these measured shapes and timings.
+The input cutoff must match the checkpoint; use 4.5 Angstrom for these
+measurements. The earlier 3.2 Angstrom example illustrates a different checkpoint.
 
-### Wide and layerwise halos
+### Strong scaling and memory
 
-| Atoms | NPUs | Wide: ms/step | Layerwise: ms/step | Wide / layerwise | Peak GiB/NPU: wide -> layerwise |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 4,096 | 2 | 156.99 | 92.60 | 1.70x | 8.37 -> 3.76 |
-| 4,096 | 4 | 102.60 | 71.52 | 1.43x | 5.00 -> 2.10 |
-| 4,096 | 8 | 76.15 | 75.77 | 1.01x | 3.01 -> 1.70 |
-| 13,824 | 2 | 465.04 | 248.75 | 1.87x | 23.13 -> 12.45 |
-| 13,824 | 4 | 246.01 | 135.22 | 1.82x | 12.54 -> 7.63 |
-| 13,824 | 8 | 143.41 | 95.74 | 1.50x | 7.12 -> 3.48 |
+| Atoms | NPUs | ms/step | atom-steps/s | Speedup | Efficiency | Allocated GiB/NPU | Reserved GiB/NPU |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4,096 | 1 | 117.04 | 34,998 | 1.00x | 100.0% | 7.14 | 7.30 |
+| 4,096 | 2 | 80.73 | 50,737 | 1.45x | 72.5% | 3.69 | 4.19 |
+| 4,096 | 4 | 64.95 | 63,063 | 1.80x | 45.0% | 2.09 | 2.39 |
+| 4,096 | 8 | 68.90 | 59,447 | 1.70x | 21.2% | 1.06 | 1.22 |
+| 13,824 | 1 | 358.40 | 38,571 | 1.00x | 100.0% | 24.03 | 24.57 |
+| 13,824 | 2 | 200.91 | 68,806 | 1.78x | 89.2% | 12.26 | 12.83 |
+| 13,824 | 4 | 117.82 | 117,336 | 3.04x | 76.1% | 6.87 | 7.22 |
+| 13,824 | 8 | 86.10 | 160,564 | 4.16x | 52.0% | 3.13 | 3.59 |
+| 32,768 | 1 | 875.32 | 37,435 | 1.00x | 100.0% | 56.95 | 58.03 |
+| 32,768 | 2 | 455.26 | 71,977 | 1.92x | 96.1% | 32.02 | 36.34 |
+| 32,768 | 4 | 235.64 | 139,058 | 3.71x | 92.9% | 14.51 | 14.96 |
+| 32,768 | 8 | 131.83 | 248,559 | 6.64x | 83.0% | 7.30 | 7.55 |
 
-Memory is the largest per-rank PyTorch NPU allocated peak. HCCL, driver memory
-and unused allocator reserves are excluded. Both layouts use the same checkpoint
-and initial structure. Initial energy and force comparisons across ranks and
-layouts pass the numerical criteria above. The wide-layout measurements also
-reuse fixed routing templates, so this comparison isolates the halo strategy.
+Efficiency is `T1 / (ranks * Tranks)`, using the single-rank time from the same
+system size, model and runtime configuration. The eight-NPU result at 32,768
+atoms is 6.64x speedup and 83.0% efficiency. At 4,096 atoms, four NPUs are faster
+than eight. Increasing system size amortizes dispatch and communication, but
+these three points do not establish monotonic scaling for other sizes or models.
 
-### Single-rank overhead relative to direct PyTorch
+Allocated and reserved memory are the largest per-rank PyTorch NPU allocator
+peaks after model and HCCL initialization. Reserved memory includes unused
+allocator cache. Neither column includes all HCCL or driver allocations.
 
-| Atoms | Direct PT: ms/call | Engine with host transfers: ms/call | Full LAMMPS MD: ms/step |
+### Matched direct PyTorch control
+
+| Atoms | Direct PT ms/call | Engine ms/call | Engine overhead |
 | ---: | ---: | ---: | ---: |
-| 4,096 | 134.30 | 134.24 | 134.90 |
-| 13,824 | 502.91 | 504.22 | 504.08 |
+| 4,096 | 114.84 | 116.61 | 1.53% |
+| 13,824 | 356.27 | 358.32 | 0.57% |
+| 32,768 | 876.92 | 879.28 | 0.27% |
 
-Direct PT calls the same HP model with the same checkpoint, initial positions
-and skin graph, keeping inputs and outputs on the NPU. The engine comparison
-includes host input/output transfers. Five warmup calls precede three
-alternating paired rounds of ten synchronized calls per route; each round has
-nine energy/force calls and one energy/force/virial call. Engine overhead is
-within timing variation at 4,096 atoms and 0.26% at 13,824 atoms. The MD column
-uses evolving coordinates and includes CPU integration and neighbor work.
+Direct PT uses the same checkpoint, initial positions and actual engine edge
+list, keeping inputs and outputs on the NPU. The Python engine includes host
+input/output transfers. Five warmup calls precede three alternating paired
+rounds of ten synchronized calls per route; each round has nine energy/force
+calls and one energy/force/virial call. Numerical comparisons pass for all three
+sizes. The complete MD timings above use evolving coordinates and CPU integration;
+small differences from the stationary control are expected.
 
 ## Diagnostics
 
@@ -303,6 +351,11 @@ during the run. `peak_reserved_bytes` includes unused allocator cache. These are
 per-rank allocator measurements, not total board memory or HCCL's external
 allocations. LAMMPS `memory` reporting covers the pair style's C++ host buffers
 and excludes Python/NPU allocations.
+
+With dynamic skin filtering, `edge_filter_seconds` records cumulative CPU
+filtering time. `edge_candidates`, `edge_retained`, `edge_filter_updates` and
+`max_active_edges` describe the live filtering decisions. These counters are
+separate from the cached skin topology and HCCL ghost schedule.
 
 `MFF_HCCL_TIMEOUT` sets the process-group timeout in seconds (default 300).
 

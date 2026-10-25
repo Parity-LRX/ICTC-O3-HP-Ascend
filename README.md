@@ -169,9 +169,11 @@ lists, domain decomposition and atom migration. See the
 checkpoint requirements, examples and qualification scope.
 Execution is dynamic eager: atom counts, neighbor edges and owner schedules
 can change without capturing or replaying a fixed-shape program.
-The eager C64/lmax2/two-interaction/correlation3 model reaches 5.27x strong scaling
-on eight NPUs at 13,824 atoms (65.8% efficiency). The guide also records the
-lower efficiency of the 4,096-atom point and matched direct-PyTorch timings.
+The eager C64/lmax2/two-interaction/correlation3 model reaches 6.64x strong scaling
+on eight NPUs at 32,768 atoms (83.0% efficiency), processing 248,559 atom-steps/s
+at 131.83 ms/step. Eight-NPU efficiency is 21.2% at 4,096 atoms and 52.0% at
+13,824 atoms. Compact owned outputs are enabled by default. The guide records
+all 1/2/4/8-NPU timings, allocator memory and matched direct-PyTorch controls.
 
 Compiled export and long-range electrostatics are not qualified on Ascend.
 Inherited CUDA sources remain available for compatibility and reference; their
