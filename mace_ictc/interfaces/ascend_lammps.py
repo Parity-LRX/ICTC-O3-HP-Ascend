@@ -186,6 +186,29 @@ class AscendLAMMPSEngine:
         if owner_linear not in ('0', '1'):
             raise ValueError('MFF_ASCEND_OWNER_LINEAR must be zero or one')
         self.owner_linear = owner_linear == '1'
+        gather = os.environ.get('MFF_ASCEND_FEATURE_GATHER', 'native')
+        if gather not in ('native', 'index_select'):
+            raise ValueError('MFF_ASCEND_FEATURE_GATHER must be native or index_select')
+        self.feature_gather = gather
+        prune = os.environ.get('MFF_ASCEND_PRUNE_SKIN', '0')
+        if prune not in ('0', '1'):
+            raise ValueError('MFF_ASCEND_PRUNE_SKIN must be zero or one')
+        self.prune_skin = prune == '1'
+        if self.prune_skin and getattr(self.model, 'assume_edges_within_radius', False):
+            raise ValueError('Skin pruning requires the model cutoff mask to remain enabled')
+        compact = os.environ.get('MFF_ASCEND_COMPACT_OUTPUTS', '0')
+        if compact not in ('0', '1'):
+            raise ValueError('MFF_ASCEND_COMPACT_OUTPUTS must be zero or one')
+        self.compact_outputs = compact == '1' and self.halo_mode == 'layerwise' and world_size > 1
+        overlap = os.environ.get('MFF_ASCEND_OVERLAP_FEATURES', '0')
+        if overlap not in ('0', '1'):
+            raise ValueError('MFF_ASCEND_OVERLAP_FEATURES must be zero or one')
+        if overlap == '1' and not self.owner_linear:
+            raise ValueError('Feature overlap requires MFF_ASCEND_OWNER_LINEAR=1')
+        self.overlap_features = (overlap == '1' and self.halo_mode == 'layerwise'
+                                 and world_size > 1 and self.depth > 1)
+        self._feature_stream = torch.npu.Stream(device=self.device) if self.overlap_features else None
+        self._feature_pending = set()
         owner_output = os.environ.get('MFF_ASCEND_OWNER_OUTPUT', '0')
         if owner_output not in ('0', '1'):
             raise ValueError('MFF_ASCEND_OWNER_OUTPUT must be zero or one')
@@ -213,7 +236,9 @@ class AscendLAMMPSEngine:
                                force_sent_bytes=0, force_received_bytes=0,
                                feature_reverse_p2p_operations=0, feature_sent_bytes=0,
                                feature_received_bytes=0, feature_forward_seconds=0.,
-                               feature_reverse_seconds=0.)
+                               feature_reverse_seconds=0., edge_filter_seconds=0.,
+                               edge_filter_updates=0, edge_candidates=0, edge_retained=0,
+                               max_active_edges=0)
         self.initial_allocated_bytes = torch.npu.memory_allocated(self.device)
         torch.npu.reset_peak_memory_stats(self.device)
         self.profile = os.environ.get('MFF_ASCEND_PROFILE', '0') == '1'
@@ -239,6 +264,7 @@ class AscendLAMMPSEngine:
                 return engine._owned_inputs(args, kwargs)
             def owned_output(module, args, output):
                 engine = reference()
+                if engine.compact_outputs and module not in engine.model.products:return output
                 return engine._pad_owned(output)
             # Products and energy readouts act independently on each node.
             # Ghost products are replaced by owner features before the next
@@ -251,7 +277,7 @@ class AscendLAMMPSEngine:
                 self._owned_hooks.append(module.register_forward_hook(owned_output))
             for index, layer in enumerate(self.model.interactions):
                 direct = [layer.self_connection]
-                if self.owner_linear:direct.append(layer.message_selector)
+                if self.owner_linear or self.compact_outputs:direct.append(layer.message_selector)
                 for module in direct:
                     if module is None:continue
                     # These paths call forward_type_idx directly, bypassing
@@ -262,7 +288,8 @@ class AscendLAMMPSEngine:
                     def owned_direct(*args, _original=original, **kwargs):
                         engine = reference()
                         args, kwargs = engine._owned_inputs(args, kwargs)
-                        return engine._pad_owned(_original(*args, **kwargs))
+                        output = _original(*args, **kwargs)
+                        return output if engine.compact_outputs else engine._pad_owned(output)
                     self._owned_methods.append((module, local, previous))
                     module.forward_type_idx = owned_direct
                 if self.owner_linear and index:
@@ -273,6 +300,10 @@ class AscendLAMMPSEngine:
                         output = engine._pad_owned(output)
                         return engine._exchange_state(output, _slot)
                     self._owned_hooks.append(layer.linear_up.register_forward_hook(exchange_linear))
+                    if self.overlap_features:
+                        def join_features(module, args, output, _slot=index-1):
+                            reference()._join_features(_slot)
+                        self._owned_hooks.append(layer.fc.register_forward_hook(join_features))
 
     def _pad_owned(self, output):
         if self.nodes == self.nlocal:return output
@@ -309,6 +340,8 @@ class AscendLAMMPSEngine:
 
     def topology(self, nlocal, nodes, atomic_numbers, src, dst, shifts,
                  ghost_nodes, ghost_slots, receive_indices, send_counts, receive_counts, generation):
+        if self._feature_pending:
+            raise RuntimeError('Topology changed during an unfinished feature exchange')
         device = self.device
         self.nlocal, self.nodes = int(nlocal), int(nodes)
         if self.owner_output:
@@ -324,6 +357,14 @@ class AscendLAMMPSEngine:
         self.src = self._host(src, np.int64, (-1,)).to(device)
         self.dst = self._host(dst, np.int64, (-1,)).to(device)
         self.shifts = self._host(shifts, np.float32, (-1, 3)).to(device)
+        if self.prune_skin:
+            # The CPU integrator already owns these buffers. Keep immutable
+            # copies across calls; LAMMPS may replace its vectors on a rebuild.
+            self._skin_edges = (np.frombuffer(src, np.int64).copy(),
+                                np.frombuffer(dst, np.int64).copy(),
+                                np.frombuffer(shifts, np.float32).reshape(-1, 3).copy())
+            self._skin_has_shifts = bool(np.any(self._skin_edges[2]))
+            self._active_edges = None
         self.batch = torch.zeros(nodes, dtype=torch.int64, device=device)
         ghosts = self._host(ghost_nodes, np.int64, (-1,)).to(device)
         slots = self._host(ghost_slots, np.int64, (-1,)).to(device)
@@ -345,6 +386,38 @@ class AscendLAMMPSEngine:
                            ('max_edges', self.src.numel()), ('max_ghost_rows', ghosts.numel()),
                            ('max_packed_rows', self.send_offsets[-1])):
             self.statistics[key] = max(self.statistics[key], int(value))
+
+    def _filter_skin(self, positions, cell):
+        """Keep every edge that can be inside the FP32 device cutoff."""
+        started = time.perf_counter()
+        source, destination, shifts = self._skin_edges
+        coordinates = np.frombuffer(positions, np.float32).reshape(-1, 3).astype(np.float64)
+        left, right = coordinates[source], coordinates[destination]
+        delta = right - left
+        bound = np.abs(right) + np.abs(left)
+        if self._skin_has_shifts:
+            box = np.frombuffer(cell, np.float32).reshape(3, 3).astype(np.float64)
+            delta += shifts.astype(np.float64) @ box
+            bound += np.abs(shifts).astype(np.float64) @ np.abs(box)
+        # Bound subtract/dot/norm roundoff conservatively, including periodic
+        # cancellation at large absolute coordinates. The device still applies
+        # its original cutoff mask to the retained edges.
+        margin = 32 * np.finfo(np.float32).eps * (bound.sum(axis=1) + self.cutoff)
+        distance2 = np.einsum('ij,ij->i', delta, delta)
+        retained = (distance2 <= (self.cutoff + margin)**2)
+        retained |= ~np.isfinite(distance2) | ~np.isfinite(margin)
+        retained |= bound.max(axis=1, initial=0.) > np.finfo(np.float32).max / 16
+        if self._active_edges is None or not np.array_equal(retained, self._active_edges):
+            self.src = torch.from_numpy(source[retained].copy()).to(self.device)
+            self.dst = torch.from_numpy(destination[retained].copy()).to(self.device)
+            self.shifts = torch.from_numpy(shifts[retained].copy()).to(self.device)
+            self._active_edges = retained
+            self.statistics['edge_filter_updates'] += 1
+        count = self.src.numel()
+        self.statistics['edge_candidates'] += source.size
+        self.statistics['edge_retained'] += count
+        self.statistics['max_active_edges'] = max(self.statistics['max_active_edges'], count)
+        self.statistics['edge_filter_seconds'] += time.perf_counter() - started
 
     def _reverse(self, forces):
         if not self.pack.rows and not self.receive_buffer.numel():
@@ -425,16 +498,44 @@ class AscendLAMMPSEngine:
             self.statistics[f'{prefix}_bytes'] += value
             self.statistics[f'feature_{prefix}_bytes'] += value
 
+    def _feature_forward_sync(self, value, plan):
+        if self.feature_gather == 'index_select':
+            send = value.index_select(0, self.receive_indices)
+        else:send = plan['owner_gather'](value)
+        self._feature_exchange(send, plan['forward_buffer'], True)
+        if self.feature_gather == 'index_select':
+            ghost = plan['forward_buffer'].index_select(0, self.ghost_slots)
+        else:ghost = plan['ghost_gather'](plan['forward_buffer'])
+        return torch.cat((value[:self.nlocal], ghost))
+
     def _feature_forward(self, value, slot=0):
         if self.profile:torch.npu.synchronize()
         started = time.perf_counter()
         plan = self._feature_plan(value.shape[1], slot)
-        self._feature_exchange(plan['owner_gather'](value), plan['forward_buffer'], True)
-        result = torch.cat((value[:self.nlocal], plan['ghost_gather'](plan['forward_buffer'])))
+        if self.overlap_features:
+            if slot in self._feature_pending:
+                raise RuntimeError('A feature slot was reused before its exchange completed')
+            main = torch.npu.current_stream(self.device)
+            stream = self._feature_stream
+            stream.wait_stream(main)
+            value.record_stream(stream)
+            with torch.npu.stream(stream):
+                result = self._feature_forward_sync(value, plan)
+            result.record_stream(main)
+            self._feature_pending.add(slot)
+        else:result = self._feature_forward_sync(value, plan)
         if self.profile:torch.npu.synchronize()
         if self.statistics['calls'] >= self.timing_skip:
             self.statistics['feature_forward_seconds'] += time.perf_counter() - started
         return result
+
+    def _join_features(self, slot):
+        if slot in self._feature_pending:
+            # linear_up has returned only views of the exchanged features so far.
+            # Its independent radial network is now enqueued on the main stream.
+            # Join before the tensor product first reads those feature values.
+            torch.npu.current_stream(self.device).wait_stream(self._feature_stream)
+            self._feature_pending.remove(slot)
 
     def _feature_reverse(self, gradient, slot=0):
         if self.profile:torch.npu.synchronize()
@@ -477,8 +578,11 @@ class AscendLAMMPSEngine:
                     callback = self._layer_state
                 prediction = self.model(pos, self.atomic_numbers, self.batch, self.src, self.dst, self.shifts, box,
                                         precomputed_edge_vec=edge_vec, layer_state_callback=callback)
-                atomic = (prediction[0] if isinstance(prediction, tuple) else prediction).reshape(self.nodes)
-                atomic = atomic + self.e0[self.atomic_numbers]
+                if self._feature_pending:
+                    raise RuntimeError('The model did not join its pending feature exchanges')
+                energy_nodes = self.nlocal if self.compact_outputs else self.nodes
+                atomic = (prediction[0] if isinstance(prediction, tuple) else prediction).reshape(energy_nodes)
+                atomic = atomic + self.e0[self.atomic_numbers[:energy_nodes]]
                 energy = atomic[:self.nlocal].sum()
             else:
                 atomic = pos.new_empty(0)
@@ -505,6 +609,7 @@ class AscendLAMMPSEngine:
         if self.generation is None:raise RuntimeError('Model topology has not been supplied')
         if self.profile:torch.npu.synchronize()
         start = time.perf_counter()
+        if self.prune_skin:self._filter_skin(positions, cell)
         pos = self._host(positions, np.float32, (self.nodes, 3)).to(self.device)
         box = self._host(cell, np.float32, (1, 3, 3)).to(self.device)
         if self.profile:torch.npu.synchronize()
@@ -558,6 +663,8 @@ class AscendLAMMPSEngine:
                      halo_mode=self.halo_mode, halo_depth=self.halo_depth, interaction_depth=self.depth,
                      owner_linear=self.owner_linear,
                      owner_output=self.owner_output,
+                     feature_gather=self.feature_gather, overlap_features=self.overlap_features,
+                     compact_outputs=self.compact_outputs, prune_skin=self.prune_skin,
                      device_index=self.device.index, synchronized_timings=self.profile,
                      timing_skip=self.timing_skip,
                      initial_allocated_bytes=self.initial_allocated_bytes,
