@@ -150,10 +150,16 @@ products and some reductions still use PyTorch NPU. A full native execution
 option is provided for tuning; it is slower than the selected vendor-GEMM
 combination at the measured points.
 
-The current execution route is eager on one NPU. Multi-NPU HCCL, compiled export,
-long-range electrostatics and Ascend LAMMPS deployment are not qualified in this
-release. Inherited CUDA sources remain available for compatibility and reference;
-their presence does not establish NPU support.
+Model execution is eager. The plain Ascend `mff/torch` LAMMPS backend runs one
+persistent model per MPI rank, with Ascend C ghost-force packing and accumulation
+and HCCL communication between NPUs. LAMMPS retains host integration, neighbor
+lists, domain decomposition and atom migration. See the
+[Ascend LAMMPS guide](lammps_user_mfftorch/docs/ASCEND.md) for the build,
+checkpoint requirements, examples and qualification scope.
+
+Compiled export and long-range electrostatics are not qualified on Ascend.
+Inherited CUDA sources remain available for compatibility and reference; their
+presence does not establish NPU support.
 
 ## Numerical validation
 

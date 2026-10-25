@@ -3,6 +3,7 @@ recursive-include LICENSES *.txt
 recursive-include docs *.md
 recursive-include examples *.py
 recursive-include lammps_user_mfftorch *.md *.txt *.cmake *.h *.cpp *.cu *.sh *.in in.*
+include lammps_user_mfftorch/install_ascend.py
 prune benchmarks
 prune validation
 prune scripts

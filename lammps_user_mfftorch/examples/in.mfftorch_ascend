@@ -1,0 +1,17 @@
+# Run inside an Ascend compute allocation with the matching eager checkpoint.
+# Replace the cutoff and element mapping with the saved model's values.
+units metal
+atom_style atomic
+boundary p p p
+newton off
+read_data system.data
+neighbor 0.5 bin
+neigh_modify every 1 delay 0 check yes
+pair_style mff/torch 3.2 npu
+pair_coeff * * model.pth H C O
+velocity all create 300 20261025 mom yes rot no dist gaussian
+fix integrator all nve
+timestep 0.0005
+thermo 10
+thermo_style custom step temp pe ke etotal press
+run 100

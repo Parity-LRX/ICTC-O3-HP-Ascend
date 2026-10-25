@@ -1,7 +1,9 @@
 # LAMMPS USER-MFFTORCH
 
-This directory is inherited CUDA deployment code. Ascend LAMMPS compilation
-and execution are not qualified by ICTC-O3-HP-Ascend 0.1.0.
+The dedicated plain Ascend backend uses a persistent eager model, Ascend C and
+HCCL. See [the Ascend build and usage guide](docs/ASCEND.md). It has a separate
+installer and does not require Kokkos or ML-IAP. The CUDA deployment paths below
+retain their existing LibTorch/AOTInductor interface.
 
 `USER-MFFTORCH` is a LAMMPS package for running exported MACE-ICTC models through
 LibTorch/AOTInductor from C++. It is intended for production MD after a model has
