@@ -5,9 +5,9 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(RUN_MODE "npu" CACHE STRING "Ascend C execution mode")
 include(${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
 
-ascendc_library(ictc_ascendc_kernel STATIC csrc/vector.cpp csrc/weighted_map.cpp csrc/epilogue.cpp csrc/matmul.cpp)
+ascendc_library(ictc_ascendc_kernel STATIC csrc/vector.cpp csrc/weighted_map.cpp csrc/epilogue.cpp csrc/epilogue_adjoint.cpp csrc/matmul.cpp)
 ascendc_include_directories(ictc_ascendc_kernel PRIVATE ${ICTC_HOST_CXX_INCLUDES})
-add_library(ictc_ascendc SHARED csrc/bindings.cpp csrc/epilogue_bindings.cpp csrc/matmul_bindings.cpp)
+add_library(ictc_ascendc SHARED csrc/bindings.cpp csrc/epilogue_bindings.cpp csrc/epilogue_adjoint_bindings.cpp csrc/matmul_bindings.cpp)
 target_include_directories(ictc_ascendc PRIVATE ${TORCH_INCLUDE_DIRS}
     ${TORCH_NPU_PATH}/include ${ASCEND_CANN_PACKAGE_PATH}/include
     ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/platform)

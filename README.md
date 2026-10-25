@@ -113,7 +113,10 @@ species banks and symmetric contractions, and [the upstream provenance](UPSTREAM
   path gates and FP32 destination accumulation. Its first and mixed second
   adjoints keep channels contiguous across the autograd boundary. Adjacent output
   intervals share DMA transfers; only constant projection columns are reordered.
-  Small workloads retain the established path.
+  First adjoints share node cotangent transfers. Mixed second adjoints compute
+  their requested edge gradients and combined node accumulation in one kernel.
+  Tiling budgets all active operands and outputs; unsupported tiles retain
+  separate adjoints. Small workloads retain the established path.
   Recursive matrix adjoints retain live first, mixed second and higher derivatives. Standalone edge products
   retain their analytic path adjoints; symmetric contractions use analytic first
   and mixed second adjoints with differentiable higher-order formulas.
@@ -148,7 +151,7 @@ their presence does not establish NPU support.
 On an Ascend 910B3, four initialized model configurations cover angular degrees
 1–3, correlation orders 1–3 and one to three interactions. Energies, forces and
 the parameter and position gradients of the energy-and-force loss pass CPU FP64 comparisons;
-the maximum observed relative L2 error across all three modes is `2.31e-6`.
+the maximum observed relative L2 error across all three modes is `2.312e-6`.
 
 Validation also covers 28 sparse-operator checks, both packed layouts, chunked
 masked graph messages, empty graphs, mutable species metadata, rectangular
@@ -160,8 +163,9 @@ third derivatives. Grouped graph messages also pass third-order checks with live
 path coefficients, trainable masks, unequal input/edge/output degrees and both
 packed layouts. Native graph epilogues additionally cover 1, 7, 17, 64 and 129
 channels, fixed masks, frozen operands and strided graph indices through third
-derivatives. These checks use synthetic inputs and do not establish the
-accuracy of a fitted potential.
+derivatives. Fused adjoints also cover every requested output subset, missing
+higher-adjoint inputs and strided input views against FP64. These checks use
+synthetic inputs and do not establish the accuracy of a fitted potential.
 
 ## Training and inference performance
 
@@ -172,29 +176,28 @@ for every route. All latencies include both energy and forces.
 
 | Model | Operation | Performance ms / atom-steps/s | Capacity ms / atom-steps/s | Allocated peak, performance / capacity (MiB) |
 | --- | --- | ---: | ---: | ---: |
-| C32, lmax 1 | Inference | 60.4 / 67,854 | 92.9 / 44,113 | 1,704 / 776 |
-| C32, lmax 1 | Training + AdamW | 138.8 / 29,501 | 292.1 / 14,025 | 3,597 / 2,007 |
-| C64, lmax 2 | Inference | 112.2 / 36,521 | 313.9 / 13,047 | 5,299 / 2,330 |
-| C64, lmax 2 | Training + AdamW | 304.1 / 13,470 | 921.7 / 4,444 | 12,607 / 4,613 |
+| C32, lmax 1 | Inference | 60.8 / 67,393 | 92.9 / 44,113 | 1,704 / 776 |
+| C32, lmax 1 | Training + AdamW | 141.6 / 28,918 | 292.1 / 14,025 | 3,597 / 2,007 |
+| C64, lmax 2 | Inference | 105.4 / 38,872 | 313.9 / 13,047 | 5,300 / 2,330 |
+| C64, lmax 2 | Training + AdamW | 273.2 / 14,995 | 921.7 / 4,444 | 10,956 / 4,613 |
 
-The paired baseline is the preceding grouped-GEMM performance mode. Native
-gate/reduction epilogues reduce C64 inference latency from 138.5 to 112.2 ms
-and full training from 397.1 to 304.1 ms. C64 allocation peaks decrease from
-8,864 to 5,299 MiB for inference and from 19,580 to 12,607 MiB for training.
-The corresponding throughput increases are 23.5% for inference and 30.6% for training.
-The 512-atom checks and the narrower C32/lmax-1 messages retain the preceding
-route. Dispatch depends on the actual working set rather than fixed model
-hyperparameters.
+The paired baseline is the preceding performance mode with native epilogues and
+separate adjoints. Sharing first-adjoint transfers and fusing mixed second
+adjoints reduces C64 inference from 112.0 to 105.4 ms and full training from
+303.9 to 273.2 ms. Throughput increases by 6.3% and 11.3%, respectively.
+C64 allocation peaks are unchanged within this paired run; cross-run peaks
+also depend on allocation history.
 
 Across seven channel/degree configurations spanning 16–128 channels, the
-18 paired measurements show no latency regression above 1%. Memory savings
-depend on the workload: C96/lmax-2 training is 19.3% faster, but its allocation
-peak increases by 7.6%.
+18 paired measurements show no latency regression above 1%. The 512-atom
+checks and narrower working sets retain the preceding route. Dispatch uses the
+actual geometry and UB budget. C96/lmax-2 training improves from 476.8 to
+429.8 ms, with a 1.1% decrease in its allocation peak.
 
 A separate continuous-training check uses 64 timed steps per route, six warmups,
 alternating 16-step blocks, per-step synchronization and Python garbage collection
-enabled. C64 mean step time decreases from 400.2 to 306.5 ms, increasing sustained
-throughput by 30.6%; the largest observed step on the new route is 306.9 ms.
+enabled. C64 mean step time decreases from 304.2 to 273.5 ms, increasing sustained
+throughput by 11.2%; the largest observed step on the new route is 273.8 ms.
 
 Performance figures use the latest paired run. Capacity and native figures come
 from their earlier qualification with the same protocol and unchanged kernels.

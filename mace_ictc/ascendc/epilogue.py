@@ -127,6 +127,95 @@ def _reference(left,right,plan):
                       plan['_ascendc_ones'],None,plan,True).transpose(1,2)
 
 
+def _adjoint_schedule(plan,left,second,flags,masked):
+    """Budget both queue slots using the actual requested derivative outputs."""
+    q,p,_,m=plan['sizes']
+    c=left.shape[2]
+    ub,cores=load_library().hardware()
+    cap=int(os.environ.get('ICTC_ASCEND_EPILOGUE_CHANNELS','64'))
+    reserve=int(os.environ.get('ICTC_ASCEND_EPILOGUE_RESERVE','32768'))
+    if cap<8 or cap%8 or reserve<4096 or reserve>=ub:
+        raise ValueError('Invalid epilogue channel tile or UB reserve')
+    key='adjoint',str(left.device),c,second,flags,masked,cap,reserve,ub
+    cache=plan.setdefault('_ascendc_epilogue_schedule',{})
+    if key in cache:return cache[key]
+    dl,dr,dg,hl,hr=(bool(flags&bit) for bit in (1,2,4,8,16))
+    use_l=(not second and dr) or (second and dg and hr)
+    use_r=(not second and dl) or (second and dg and hl)
+    use_hl=second and hl and (dr or dg)
+    use_hr=second and hr and (dl or dg)
+    blocks=(c+cap-1)//cap
+    bc=_align((c+blocks-1)//blocks)
+    rows=0
+    if q<=4095 and p<=4095:
+        while bc>=8:
+            rows=min(4095,8192//(q*bc))
+            while rows:
+                vec,rc,pv=rows*q*bc,rows*bc,rows*p*bc
+                inp=(vec if use_l else 0)+(pv if use_r else 0)+(vec if dl or dr else 0)+(
+                    vec if use_hl else 0)+(pv if use_hr else 0)+_align(2*rows)+(_align(rows) if masked else 0)
+                out=(vec if dl else 0)+(pv if dr else 0)+(vec if dg else 0)
+                used=4*(2*inp+2*out+3*vec+3*rc+_align(4*p))
+                if used+reserve<=ub:break
+                rows-=1
+            if rows:break
+            bc-=8
+    if not rows:
+        cache[key]=None
+        return None
+    path_for_q=[0]*q
+    for start,path,_,width in plan['_ascendc_epilogue']:
+        path_for_q[start:start+width]=[path]*width
+    packet=[]
+    packet.extend((r*p*bc+path_for_q[a]*bc+ch)*4
+                  for r in range(rows) for a in range(q) for ch in range(bc))
+    packet.extend(r*4 for r in range(rows) for _ in range(q*bc))
+    packet.extend((r*q*bc+ch)*4 for r in range(rows) for ch in range(bc))
+    packet.extend(r*4 for r in range(rows) for _ in range(bc))
+    metadata=torch.tensor([v for spec in plan['_ascendc_epilogue'] for v in spec],
+                          dtype=torch.int32,device=left.device)
+    indices=torch.tensor(packet,dtype=torch.int32,device=left.device)
+    result=rows,bc,metadata,indices,used,ub,cores
+    cache[key]=result
+    return result
+
+
+def _edge_layout(value):
+    return value if (value.stride(2)==1 and value.stride(1)==value.shape[2] and
+                     value.stride(0)>=value.shape[1]*value.shape[2]) else value.contiguous()
+
+
+def _adjoints(left,right,grad,plan,needed,hleft=None,hright=None,*,second=False):
+    """Share graph reads across first or mixed second bilinear adjoints."""
+    policy=os.environ.get('ICTC_ASCEND_FUSED_ADJOINTS','auto')
+    if policy not in ('0','1','auto'):
+        raise ValueError('The fused adjoint policy must be auto, zero or one')
+    if policy=='0':return None
+    outputs=list(needed)
+    if second:
+        outputs[0]=outputs[0] and hright is not None
+        outputs[1]=outputs[1] and hleft is not None
+        outputs[2]=outputs[2] and (hleft is not None or hright is not None)
+    else:outputs.append(False)
+    flags=sum(bit for bit,need in zip((1,2,4),outputs) if need)
+    if not flags:return (None,None,None) if second else (None,None)
+    if hleft is not None:flags|=8
+    if hright is not None:flags|=16
+    graph=plan['_ascendc_graph'];mask=graph['mask']
+    schedule=_adjoint_schedule(plan,left,second,flags,mask is not None)
+    if schedule is None:return None
+    rows,bc,meta,indices,*_=schedule
+    n,q,c=left.shape;p,_,m=plan['sizes'][1:]
+    dummy=left.new_empty(0)
+    shape=[n,c,q,p,m,int(second),rows,bc,int(mask is not None),graph['destination_nodes'],flags]
+    values=load_library().epilogue_adjoint(left,right,grad.contiguous() if flags&3 else dummy,
+        dummy if hleft is None else _edge_layout(hleft),
+        dummy if hright is None else _edge_layout(hright),graph['dst'].contiguous(),
+        dummy if mask is None else mask.contiguous(),meta,indices,shape)
+    result=tuple(value if need else None for value,need in zip(values,outputs))
+    return result if second else result[:2]
+
+
 class _PhysicalAdjoint(torch.autograd.Function):
     """Bilinear adjoints with the same contiguous channel axis as the GEMM."""
     @staticmethod
@@ -135,7 +224,8 @@ class _PhysicalAdjoint(torch.autograd.Function):
         ctx.set_materialize_grads(False)
         ctx.save_for_backward(left,right,grad,*_graph_tensors(plan))
         ctx.spec=plan,needed
-        return tuple(_native(left,right,plan,i+1,grad) if need else None
+        fused=_adjoints(left,right,grad,plan,needed)
+        return fused if fused is not None else tuple(_native(left,right,plan,i+1,grad) if need else None
                      for i,need in enumerate(needed))
 
     @staticmethod
@@ -162,6 +252,8 @@ class _PhysicalAdjoint(torch.autograd.Function):
                     for i,value in zip(active,values):
                         result[i]=value if needed[i] else None
             return *result,None,None
+        fused=_adjoints(left,right,grad,plan,needed,hleft,hright,second=True)
+        if fused is not None:return *fused,None,None
         dl=dr=dg=None
         if hleft is not None:
             if needed[1]:dr=_native(hleft,right,plan,2,grad)
@@ -190,8 +282,10 @@ class _PhysicalProduct(torch.autograd.Function):
         if torch.is_grad_enabled():
             values=_PhysicalAdjoint.apply(left,right,grad,ctx.plan,needed)
         else:
-            values=tuple(_native(left,right,ctx.plan,i+1,grad) if need else None
-                         for i,need in enumerate(needed))
+            values=_adjoints(left,right,grad,ctx.plan,needed)
+            if values is None:
+                values=tuple(_native(left,right,ctx.plan,i+1,grad) if need else None
+                             for i,need in enumerate(needed))
         return *values,None
 
 

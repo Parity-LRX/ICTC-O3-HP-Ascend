@@ -204,6 +204,13 @@ Cores. These messages keep `[edges, angular rows, channels]` contiguous through
 the first and mixed second adjoints. Constant geometry columns are arranged to
 merge adjacent output intervals into fewer DMA transfers; learned path weights
 and the public output order are preserved.
+First adjoints share node cotangent reads. Mixed second adjoints combine the
+requested edge gradients and the two node-gradient terms in one Vector kernel,
+reducing repeated transfers and destination updates. Their UB schedule includes
+all active operands, all requested outputs and both queue slots. Tiles that
+exceed this budget retain separate native adjoints.
+Set `ICTC_ASCEND_FUSED_ADJOINTS=0` to retain the native gate/reduction epilogue
+with separate adjoints; the default is `auto`.
 The automatic policy uses the actual active angular width and channel/edge
 working set, then checks the complete UB and DMA limits. Small messages and
 trainable masks retain PyTorch postprocessing. Set `ICTC_ASCEND_EPILOGUE=0` before
