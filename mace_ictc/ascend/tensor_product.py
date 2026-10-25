@@ -132,8 +132,22 @@ def _automatic_edge_chunk(owner, sample, features, harmonics):
     bond = sum((2*i+1)*(2*k+1) for i,j,k in owner.paths
                if i in features and j in harmonics)
     bytes_per_edge = sample.element_size()*(channels*(angular+output+2*owner.num_paths)+bond)
-    limit = max(1, min(131072, (3*1024**3)//max(1, bytes_per_edge)))
+    cap = getattr(owner, '_ascend_edge_chunk_cap', 131072)
+    if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
+        raise ValueError('Automatic edge-chunk cap must be a positive integer')
+    budget = getattr(owner, '_ascend_edge_scratch_bytes', 3*1024**3)
+    if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
+        raise ValueError('Automatic edge scratch budget must be positive')
+    limit = max(1, min(cap, budget//max(1, bytes_per_edge)))
     return (limit//128)*128 if limit >= 128 else limit
+
+
+def _destination_nodes(owner, source_nodes):
+    """Deployment may aggregate owned destinations from a larger source halo."""
+    nodes = getattr(owner, '_ascend_destination_nodes', source_nodes)
+    if not isinstance(nodes, int) or isinstance(nodes, bool) or not 0 <= nodes <= source_nodes:
+        raise ValueError('Destination node count must be between zero and the source node count')
+    return nodes
 
 
 def graph_message(owner, features, harmonics, gates, src, dst, mask=None,
@@ -147,7 +161,8 @@ def graph_message(owner, features, harmonics, gates, src, dst, mask=None,
                 if edge_chunk_size is None else edge_chunk_size)
         # Grouped layout work needs enough edges to amortize its extra launches.
         # Retain the established small-chunk route for arbitrary model widths.
-        if schedule=='grouped' or (src.numel()>=65536 and chosen>=32768):
+        minimum = getattr(owner, '_ascend_grouped_min_edges', 65536)
+        if schedule=='grouped' or (src.numel()>=minimum and chosen>=32768):
             from .channel_message import graph_message as channel_message
             return channel_message(owner,features,harmonics,gates,src,dst,mask,edge_chunk_size=chosen)
     if (native_graph_enabled() and getattr(owner,'_ascend_tp_preproject',True)
@@ -157,7 +172,8 @@ def graph_message(owner, features, harmonics, gates, src, dst, mask=None,
     sample = next(iter(features.values()))
     if edge_chunk_size is None:
         edge_chunk_size = _automatic_edge_chunk(owner, sample, features, harmonics)
-    nodes, channels = sample.shape[:2]
+    source_nodes, channels = sample.shape[:2]
+    nodes = _destination_nodes(owner, source_nodes)
     output = {l: sample.new_zeros(nodes, owner.path_counts_by_l.get(l, 0)*channels, 2*l+1)
               for l in range(owner.lmax+1)}
     if src.numel() == 0:

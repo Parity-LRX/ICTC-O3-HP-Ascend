@@ -169,7 +169,7 @@ void PairMFFTorch::load_engine() {
     Ref halo_depth(PyObject_GetAttrString(engine_,"halo_depth"));halo_depth_=static_cast<int>(PyLong_AsLong(halo_depth));
     if(depth_<1 || (requested_depth_ && requested_depth_!=depth_))throw std::runtime_error("Model message depth does not match pair_style depth");
     if(halo_depth_<1 || halo_depth_>depth_)throw std::runtime_error("Invalid model halo depth");
-  } catch(const std::exception& e){error->all(FLERR,e.what());}
+  } catch(const std::exception& e){error->one(FLERR,e.what());}
 }
 void PairMFFTorch::init_style() {
   if(!engine_)error->all(FLERR,"mff/torch needs pair_coeff before run");
@@ -215,7 +215,7 @@ void PairMFFTorch::update_topology() {
       const int j=list->firstneigh[i][k]&NEIGHMASK;
       if(comm->nprocs==1) {
         const int owner=static_cast<int>(owner_index_[j]);
-        if(owner_rank_[j]!=comm->me || owner<0 || owner>=owned)error->all(FLERR,"Invalid periodic ghost owner mapping");
+        if(owner_rank_[j]!=comm->me || owner<0 || owner>=owned)error->one(FLERR,"Invalid periodic ghost owner mapping");
         const double dz=(atom->x[j][2]-atom->x[owner][2])/zz;
         const double dy=(atom->x[j][1]-atom->x[owner][1]-dz*domain->yz)/yy;
         const double dx=(atom->x[j][0]-atom->x[owner][0]-dy*domain->xy-dz*domain->xz)/xx;
@@ -244,14 +244,24 @@ void PairMFFTorch::update_topology() {
     PyTuple_SET_ITEM(args.value,8,view(receive_indices_));PyTuple_SET_ITEM(args.value,9,view(send_counts_));
     PyTuple_SET_ITEM(args.value,10,view(receive_counts_));PyTuple_SET_ITEM(args.value,11,PyLong_FromLongLong(neighbor_generation_));
     Ref method(PyObject_GetAttrString(engine_,"topology"));Ref result(PyObject_CallObject(method,args));
-  }catch(const std::exception& e){error->all(FLERR,e.what());}
+    const int commits=PyObject_HasAttrString(engine_,"topology_commit");
+    if(commits<0)python_error("Cannot inspect Ascend topology protocol");
+    if(commits) {
+      // Re-capture may perform extra model/HCCL warmups. Every rank must
+      // agree on invalidation even when only one local graph has changed.
+      const int local_changed=PyObject_IsTrue(result);int changed=0;
+      if(local_changed<0)python_error("Invalid Ascend topology-change result");
+      MPI_Allreduce(&local_changed,&changed,1,MPI_INT,MPI_MAX,world);
+      Ref committed(PyObject_CallMethod(engine_,"topology_commit","i",changed));
+    }
+  }catch(const std::exception& e){error->one(FLERR,e.what());}
 }
 void PairMFFTorch::exchange_plan() {
   const int size=comm->nprocs;
   std::vector<std::map<int64_t,int64_t>> peers(size);
   for(int m=atom->nlocal;m<nodes_;m++) {
     const int i=model_to_atom_[m],rank=owner_rank_[i];
-    if(rank<0 || rank>=size || owner_index_[i]<0)error->all(FLERR,"Incomplete ghost owner metadata");
+    if(rank<0 || rank>=size || owner_index_[i]<0)error->one(FLERR,"Incomplete ghost owner metadata");
     peers[rank].emplace(owner_index_[i],0);
   }
   std::vector<int> sc(size),rc(size),sd(size),rd(size);
@@ -303,7 +313,7 @@ void PairMFFTorch::compute(int eflag,int vflag) {
     }
     if(vflag_global)for(int axis=0;axis<6;axis++)virial[axis]+=vir[axis];
     output_seconds_+=MPI_Wtime()-started;
-  } catch(const std::exception& e){error->all(FLERR,e.what());}
+  } catch(const std::exception& e){error->one(FLERR,e.what());}
 }
 double PairMFFTorch::memory_usage() {
   return sizeof(float)*(positions_.capacity()+shifts_.capacity()+force_result_.capacity()+energy_result_.capacity())+

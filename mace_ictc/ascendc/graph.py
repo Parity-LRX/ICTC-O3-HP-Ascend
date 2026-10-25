@@ -19,13 +19,14 @@ def _validate(src,dst,nodes,device):
 
 
 def graph_message(owner,features,harmonics,gates,src,dst,mask=None,*,edge_chunk_size=None):
-    from mace_ictc.ascend.tensor_product import _plan,_automatic_edge_chunk
+    from mace_ictc.ascend.tensor_product import _plan,_automatic_edge_chunk,_destination_nodes
     from mace_ictc.ascend.structured_product import _FixedLinear
     from mace_ictc.ascend.sparse_product import _Product
     from mace_ictc.ascend.runtime import require_npu_fp32
     sample=next(iter(features.values()))
-    nodes,channels=sample.shape[:2]
-    _validate(src,dst,nodes,sample.device)
+    source_nodes,channels=sample.shape[:2]
+    nodes=_destination_nodes(owner,source_nodes)
+    _validate(src,dst,source_nodes,sample.device)
     require_npu_fp32(owner.weight,gates,*features.values(),*harmonics.values())
     edges=src.numel()
     if gates.shape not in ((edges,owner.num_paths*channels),(edges,owner.num_paths,channels)):
@@ -51,7 +52,7 @@ def graph_message(owner,features,harmonics,gates,src,dst,mask=None,*,edge_chunk_
         right=_FixedLinear.apply(sh[begin:end],base['bond_projection']).unsqueeze(1)
         weight=(gates[begin:end].reshape(end-begin,owner.num_paths,channels).transpose(1,2)*
                 owner.weight.T.unsqueeze(0)).contiguous()
-        graph=dict(src=src[begin:end].contiguous(),dst=dst[begin:end].contiguous(),
+        graph=dict(src=src[begin:end].contiguous(),dst=dst[begin:end].contiguous(),destination_nodes=nodes,
                    mask=None if mask is None else mask[begin:end].reshape(-1).to(dtype=sample.dtype).contiguous())
         plan={**base,'_ascendc_graph':graph}
         value=_Product.apply(left,right,weight,None,plan,False)

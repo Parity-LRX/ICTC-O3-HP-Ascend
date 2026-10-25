@@ -31,10 +31,11 @@ class _BatchedMatrix(torch.autograd.Function):
 
 
 def graph_message(owner,features,harmonics,gates,src,dst,mask=None,*,edge_chunk_size=None):
-    from .tensor_product import _plan,_automatic_edge_chunk
+    from .tensor_product import _plan,_automatic_edge_chunk,_destination_nodes
     from .runtime import require_npu_fp32
     sample=next(iter(features.values()))
-    nodes,channels=sample.shape[:2]
+    source_nodes,channels=sample.shape[:2]
+    nodes=_destination_nodes(owner,source_nodes)
     require_npu_fp32(owner.weight,gates,*features.values(),*harmonics.values())
     edges=src.numel()
     if gates.shape not in ((edges,owner.num_paths*channels),(edges,owner.num_paths,channels)):

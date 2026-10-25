@@ -150,20 +150,30 @@ class _RowSum:
 
 class _FeatureHalo(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, value, anchor, engine):
-        ctx.engine, ctx.generation = engine, engine.generation
-        return engine._feature_forward(value)
+    def forward(ctx, value, anchor, engine, slot):
+        ctx.engine, ctx.generation, ctx.slot = engine, engine.generation, slot
+        return engine._feature_forward(value, slot)
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, gradient):
         if ctx.generation != ctx.engine.generation:
             raise RuntimeError('Feature-halo topology changed before its adjoint completed')
-        return ctx.engine._feature_reverse(gradient), gradient.new_zeros(()), None
+        return ctx.engine._feature_reverse(gradient, ctx.slot), gradient.new_zeros(()), None, None
 
 
 class AscendLAMMPSEngine:
+    def __new__(cls, *args, **kwargs):
+        execution = os.environ.get('MFF_ASCEND_EXECUTION', 'eager')
+        if execution not in ('eager', 'graph'):
+            raise ValueError('MFF_ASCEND_EXECUTION must be eager or graph')
+        if cls is AscendLAMMPSEngine and execution == 'graph':
+            from .ascend_graph import CapturedLAMMPSEngine
+            return object.__new__(CapturedLAMMPSEngine)
+        return object.__new__(cls)
+
     def __init__(self, checkpoint, cutoff, device_index, rank, world_size, master, port):
+        self.execution = 'eager'
         torch.set_num_threads(int(os.environ.get('MFF_TORCH_THREADS', '2')))
         if not 0 <= device_index < torch.npu.device_count():
             raise ValueError(f'Local rank {device_index} has no visible NPU; use one MPI rank per allocated NPU')
@@ -179,6 +189,14 @@ class AscendLAMMPSEngine:
                                        'layerwise' if world_size > 1 else 'wide')
         if self.halo_mode not in ('wide', 'layerwise'):
             raise ValueError('MFF_ASCEND_HALO must be wide or layerwise')
+        owner_linear = os.environ.get('MFF_ASCEND_OWNER_LINEAR', '0')
+        if owner_linear not in ('0', '1'):
+            raise ValueError('MFF_ASCEND_OWNER_LINEAR must be zero or one')
+        self.owner_linear = owner_linear == '1'
+        owner_output = os.environ.get('MFF_ASCEND_OWNER_OUTPUT', '0')
+        if owner_output not in ('0', '1'):
+            raise ValueError('MFF_ASCEND_OWNER_OUTPUT must be zero or one')
+        self.owner_output = owner_output == '1' and self.halo_mode == 'layerwise' and world_size > 1
         self.halo_depth = 1 if self.halo_mode == 'layerwise' else self.depth
         if abs(float(cutoff) - self.cutoff) > 1e-6:
             raise ValueError(f'Pair cutoff {cutoff} does not match checkpoint cutoff {self.cutoff}')
@@ -213,6 +231,13 @@ class AscendLAMMPSEngine:
         self._owned_hooks = []
         self._owned_methods = []
         self._owned_metadata_views = {}
+        self._owned_destination_counts = []
+        if self.owner_output:
+            for layer in self.model.interactions:
+                module = layer.tp
+                self._owned_destination_counts.append((module,
+                    '_ascend_destination_nodes' in module.__dict__,
+                    module.__dict__.get('_ascend_destination_nodes')))
         if self.halo_mode == 'layerwise' and world_size > 1:
             import weakref
             reference = weakref.ref(self)
@@ -231,20 +256,30 @@ class AscendLAMMPSEngine:
             for module in modules:
                 self._owned_hooks.append(module.register_forward_pre_hook(owned_inputs, with_kwargs=True))
                 self._owned_hooks.append(module.register_forward_hook(owned_output))
-            for layer in self.model.interactions:
-                module = layer.self_connection
-                if module is None:continue
-                # The backbone calls forward_type_idx directly, bypassing
-                # Module hooks. Retain and restore any existing instance override.
-                local = 'forward_type_idx' in module.__dict__
-                previous = module.__dict__.get('forward_type_idx')
-                original = module.forward_type_idx
-                def owned_self_connection(*args, _original=original, **kwargs):
-                    engine = reference()
-                    args, kwargs = engine._owned_inputs(args, kwargs)
-                    return engine._pad_owned(_original(*args, **kwargs))
-                self._owned_methods.append((module, local, previous))
-                module.forward_type_idx = owned_self_connection
+            for index, layer in enumerate(self.model.interactions):
+                direct = [layer.self_connection]
+                if self.owner_linear:direct.append(layer.message_selector)
+                for module in direct:
+                    if module is None:continue
+                    # These paths call forward_type_idx directly, bypassing
+                    # Module hooks. Restore any existing instance override.
+                    local = 'forward_type_idx' in module.__dict__
+                    previous = module.__dict__.get('forward_type_idx')
+                    original = module.forward_type_idx
+                    def owned_direct(*args, _original=original, **kwargs):
+                        engine = reference()
+                        args, kwargs = engine._owned_inputs(args, kwargs)
+                        return engine._pad_owned(_original(*args, **kwargs))
+                    self._owned_methods.append((module, local, previous))
+                    module.forward_type_idx = owned_direct
+                if self.owner_linear and index:
+                    self._owned_hooks.append(layer.linear_up.register_forward_pre_hook(
+                        owned_inputs, with_kwargs=True))
+                    def exchange_linear(module, args, output, _slot=index-1):
+                        engine = reference()
+                        output = engine._pad_owned(output)
+                        return engine._exchange_state(output, _slot)
+                    self._owned_hooks.append(layer.linear_up.register_forward_hook(exchange_linear))
 
     def _pad_owned(self, output):
         if self.nodes == self.nlocal:return output
@@ -283,6 +318,12 @@ class AscendLAMMPSEngine:
                  ghost_nodes, ghost_slots, receive_indices, send_counts, receive_counts, generation):
         device = self.device
         self.nlocal, self.nodes = int(nlocal), int(nodes)
+        if self.owner_output:
+            destination = np.frombuffer(dst, dtype=np.int64)
+            if destination.size and (destination.min() < 0 or destination.max() >= nlocal):
+                raise ValueError('Layerwise graph destinations must be owned atoms')
+            for module, _, _ in self._owned_destination_counts:
+                module._ascend_destination_nodes = self.nlocal
         self.atomic_numbers = self._host(atomic_numbers, np.int64, (nodes,)).to(device)
         species = set(self.model.atomic_numbers)
         if not set(np.frombuffer(atomic_numbers, dtype=np.int64)).issubset(species):
@@ -333,7 +374,7 @@ class AscendLAMMPSEngine:
         if operations:
             if self.group is None:
                 raise RuntimeError('Model ghost exchange requires an HCCL process group')
-            for request in dist.batch_isend_irecv(operations):request.wait()
+            self._wait_p2p(operations)
         self.statistics['p2p_operations'] += len(operations)
         self.statistics['force_p2p_operations'] += len(operations)
         for prefix, counts in (('sent', self.send_counts), ('received', self.receive_counts)):
@@ -342,21 +383,25 @@ class AscendLAMMPSEngine:
             self.statistics[f'force_{prefix}_bytes'] += count
         return forces[:self.nlocal] + self.accumulate(receive)
 
-    def _feature_plan(self, width):
-        if width not in self.feature_plans:
+    def _wait_p2p(self, operations):
+        for request in dist.batch_isend_irecv(operations):request.wait()
+
+    def _feature_plan(self, width, slot=0):
+        key = int(slot), int(width)
+        if key not in self.feature_plans:
             device = self.device
             ghost_rows = self.ghost_nodes.numel()
             received_rows = self.receive_indices.numel()
             ghost_order = torch.arange(ghost_rows, device=device)
             received_order = torch.arange(received_rows, device=device)
-            self.feature_plans[width] = dict(
+            self.feature_plans[key] = dict(
                 owner_gather=_RowSum(self.receive_indices, received_order, received_rows, width, device, self._routing_templates),
                 ghost_gather=_RowSum(self.ghost_slots, ghost_order, ghost_rows, width, device, self._routing_templates),
                 ghost_pack=_RowSum(self.ghost_nodes, self.ghost_slots, self.send_offsets[-1], width, device, self._routing_templates),
                 owner_sum=_RowSum(received_order, self.receive_indices, self.nlocal, width, device, self._routing_templates),
                 forward_buffer=torch.empty(self.send_offsets[-1], width, device=device, dtype=torch.float32),
                 reverse_buffer=torch.empty(received_rows, width, device=device, dtype=torch.float32))
-        return self.feature_plans[width]
+        return self.feature_plans[key]
 
     def _feature_exchange(self, send, receive, forward):
         send_offsets = self.receive_offsets if forward else self.send_offsets
@@ -378,7 +423,7 @@ class AscendLAMMPSEngine:
                 received_rows += d - c
         if operations:
             if self.group is None:raise RuntimeError('Feature-halo exchange requires HCCL')
-            for request in dist.batch_isend_irecv(operations):request.wait()
+            self._wait_p2p(operations)
         sent_bytes, received_bytes = 4 * send.shape[1] * sent_rows, 4 * send.shape[1] * received_rows
         self.statistics['p2p_operations'] += len(operations)
         key = 'feature_forward_p2p_operations' if forward else 'feature_reverse_p2p_operations'
@@ -387,10 +432,10 @@ class AscendLAMMPSEngine:
             self.statistics[f'{prefix}_bytes'] += value
             self.statistics[f'feature_{prefix}_bytes'] += value
 
-    def _feature_forward(self, value):
+    def _feature_forward(self, value, slot=0):
         if self.profile:torch.npu.synchronize()
         started = time.perf_counter()
-        plan = self._feature_plan(value.shape[1])
+        plan = self._feature_plan(value.shape[1], slot)
         self._feature_exchange(plan['owner_gather'](value), plan['forward_buffer'], True)
         result = torch.cat((value[:self.nlocal], plan['ghost_gather'](plan['forward_buffer'])))
         if self.profile:torch.npu.synchronize()
@@ -398,10 +443,10 @@ class AscendLAMMPSEngine:
             self.statistics['feature_forward_seconds'] += time.perf_counter() - started
         return result
 
-    def _feature_reverse(self, gradient):
+    def _feature_reverse(self, gradient, slot=0):
         if self.profile:torch.npu.synchronize()
         started = time.perf_counter()
-        plan = self._feature_plan(gradient.shape[1])
+        plan = self._feature_plan(gradient.shape[1], slot)
         self._feature_exchange(plan['ghost_pack'](gradient), plan['reverse_buffer'], False)
         owned = gradient[:self.nlocal] + plan['owner_sum'](plan['reverse_buffer'])
         result = torch.cat((owned, gradient.new_zeros(self.nodes - self.nlocal, gradient.shape[1])))
@@ -411,13 +456,57 @@ class AscendLAMMPSEngine:
         return result
 
     def _layer_state(self, layer, value):
-        if layer == self.depth - 1:return value
+        if layer == self.depth - 1 or self.owner_linear:return value
+        return self._exchange_state(value, layer)
+
+    def _exchange_state(self, value, slot=0):
         if not self.ghost_nodes.numel() and not self.receive_indices.numel():return value
         width = value.numel() // self.nodes
         # Keep the exchange in the requested position/strain autograd graph even
         # on ranks whose local feature happens to be coordinate-independent.
         flat = value.reshape(self.nodes, width)
-        return _FeatureHalo.apply(flat, self._halo_anchor, self).reshape(value.shape)
+        return _FeatureHalo.apply(flat, self._halo_anchor, self, slot).reshape(value.shape)
+
+    def _device_prediction(self, pos, box, want_virial):
+        with torch.enable_grad():
+            pos.requires_grad_(True)
+            edge_vec = None
+            if self.nodes:
+                from mace_ictc.ascend.geometry import edge_vectors
+                edge_vec = edge_vectors(pos, box, self.shifts, self.batch, self.src, self.dst)
+                if edge_vec is None:
+                    edge_cells = box[self.batch[self.src]]
+                    shifts = torch.einsum('ni,nij->nj', self.shifts, edge_cells)
+                    edge_vec = pos[self.dst] - pos[self.src] + shifts
+                callback = None
+                if self.halo_mode == 'layerwise' and self.world_size > 1 and self.depth > 1:
+                    self._halo_anchor = pos.sum()*0
+                    callback = self._layer_state
+                prediction = self.model(pos, self.atomic_numbers, self.batch, self.src, self.dst, self.shifts, box,
+                                        precomputed_edge_vec=edge_vec, layer_state_callback=callback)
+                atomic = (prediction[0] if isinstance(prediction, tuple) else prediction).reshape(self.nodes)
+                atomic = atomic + self.e0[self.atomic_numbers]
+                energy = atomic[:self.nlocal].sum()
+            else:
+                atomic = pos.new_empty(0)
+                energy = pos.sum() * 0
+            variables = (pos, edge_vec) if want_virial and self.nodes else (pos,)
+            connected = energy + pos.sum()*0
+            if want_virial and self.nodes:connected = connected + edge_vec.sum()*0
+            gradients = torch.autograd.grad(connected,
+                                            variables, allow_unused=True)
+            self._halo_anchor = None
+        forces = -gradients[0].detach()
+        if want_virial and self.nodes and self.src.numel():
+            # Homogeneous strain transforms every periodic edge as r -> r T.
+            # Its derivative is r.T @ dE/dr. Using short edge displacements
+            # avoids cancellation between large absolute-position/cell terms.
+            tensor = -(edge_vec.detach().T @ gradients[1].detach())
+            tensor = (tensor + tensor.T) * .5
+            virial = torch.stack((tensor[0, 0], tensor[1, 1], tensor[2, 2],
+                                  tensor[0, 1], tensor[0, 2], tensor[1, 2]))
+        else:virial = pos.new_zeros(6)
+        return forces, atomic, energy, virial
 
     def compute(self, positions, cell, want_virial):
         if self.generation is None:raise RuntimeError('Model topology has not been supplied')
@@ -427,37 +516,7 @@ class AscendLAMMPSEngine:
         box = self._host(cell, np.float32, (1, 3, 3)).to(self.device)
         if self.profile:torch.npu.synchronize()
         transferred = time.perf_counter()
-        with torch.enable_grad():
-            pos.requires_grad_(True)
-            strain = torch.zeros(3, 3, device=self.device, dtype=pos.dtype, requires_grad=bool(want_virial))
-            if want_virial:
-                transform = torch.eye(3, device=self.device, dtype=pos.dtype) + strain
-                x, h = pos @ transform, box @ transform
-            else:x, h = pos, box
-            if self.nodes:
-                callback = None
-                if self.halo_mode == 'layerwise' and self.world_size > 1 and self.depth > 1:
-                    self._halo_anchor = pos.sum()*0 + strain.sum()*0
-                    callback = self._layer_state
-                prediction = self.model(x, self.atomic_numbers, self.batch, self.src, self.dst, self.shifts, h,
-                                        layer_state_callback=callback)
-                atomic = (prediction[0] if isinstance(prediction, tuple) else prediction).reshape(self.nodes)
-                atomic = atomic + self.e0[self.atomic_numbers]
-                energy = atomic[:self.nlocal].sum()
-            else:
-                atomic = pos.new_empty(0)
-                energy = pos.sum() * 0
-            variables = (pos, strain) if want_virial else (pos,)
-            gradients = torch.autograd.grad(energy + pos.sum()*0 + strain.sum()*0,
-                                            variables, allow_unused=True)
-            self._halo_anchor = None
-        forces = -gradients[0].detach()
-        if want_virial:
-            tensor = -gradients[1].detach()
-            tensor = (tensor + tensor.T) * .5
-            virial = torch.stack((tensor[0, 0], tensor[1, 1], tensor[2, 2],
-                                  tensor[0, 1], tensor[0, 2], tensor[1, 2]))
-        else:virial = pos.new_zeros(6)
+        forces, atomic, energy, virial = self._device_prediction(pos, box, bool(want_virial))
         if self.profile:torch.npu.synchronize()
         evaluated = time.perf_counter()
         with torch.no_grad():
@@ -482,6 +541,10 @@ class AscendLAMMPSEngine:
         return result
 
     def close(self):
+        for module, local, previous in self._owned_destination_counts:
+            if local:module._ascend_destination_nodes = previous
+            elif '_ascend_destination_nodes' in module.__dict__:del module._ascend_destination_nodes
+        self._owned_destination_counts.clear()
         for handle in self._owned_hooks:handle.remove()
         self._owned_hooks.clear()
         for module, local, previous in self._owned_methods:
@@ -497,7 +560,11 @@ class AscendLAMMPSEngine:
             path.mkdir(parents=True, exist_ok=True)
             (path/f'ascend_rank{self.rank}.json').write_text(json.dumps(
                 dict(rank=self.rank, world_size=self.world_size, state_source=self.state_source,
+                     execution=self.execution,
+                     p2p_mode=getattr(self, 'p2p_mode', 'coalesced'),
                      halo_mode=self.halo_mode, halo_depth=self.halo_depth, interaction_depth=self.depth,
+                     owner_linear=self.owner_linear,
+                     owner_output=self.owner_output,
                      device_index=self.device.index, synchronized_timings=self.profile,
                      timing_skip=self.timing_skip,
                      initial_allocated_bytes=self.initial_allocated_bytes,
