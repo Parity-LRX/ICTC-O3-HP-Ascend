@@ -121,8 +121,8 @@ owned atoms and support two halo layouts, selected with `MFF_ASCEND_HALO`:
 
 | Setting | Neighbor halo | Intermediate features |
 | --- | --- | --- |
-| `wide` (current default) | Interaction depth times the cutoff, plus skin | Recomputed in the multi-hop halo |
-| `layerwise` | One cutoff, plus skin | Received from owners through HCCL after each non-final interaction |
+| `layerwise` (multi-rank default) | One cutoff, plus skin | Received from owners through HCCL after each non-final interaction |
+| `wide` | Interaction depth times the cutoff, plus skin | Recomputed in the multi-hop halo |
 
 ```bash
 export MFF_ASCEND_HALO=layerwise
@@ -190,6 +190,61 @@ feature-forward and feature-adjoint HCCL operation counts are checked alongside
 the numerical results. Recorded one-, two-, four- and eight-rank checks use an
 exclusive eight-NPU allocation. Partial-NPU allocations have not been qualified
 with this software stack.
+
+## Measured MD performance
+
+The following initialized H/C/O model has 64 channels, angular degree 2, two
+interactions and correlation order 3. Runs use one Ascend 910B3 per MPI rank,
+strict FP32, eager execution, a 4.5 Angstrom cutoff, 0.5 Angstrom skin and a
+0.5 fs NVE timestep. The configurations have 56 physical neighbors and 80 cached
+skin edges per atom initially. Values are median LAMMPS loop times from three
+10-step runs after five warmup steps. Synchronized diagnostic runs are separate.
+
+### Strong scaling with layerwise exchange
+
+| NPUs | 4,096 atoms: ms/step | Speedup | Efficiency | 13,824 atoms: ms/step | Speedup | Efficiency |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 134.90 | 1.00x | 100% | 504.08 | 1.00x | 100% |
+| 2 | 92.60 | 1.46x | 72.8% | 248.75 | 2.03x | 101.3% |
+| 4 | 71.52 | 1.89x | 47.2% | 135.22 | 3.73x | 93.2% |
+| 8 | 75.77 | 1.78x | 22.3% | 95.74 | 5.27x | 65.8% |
+
+Efficiency is `T1 / (ranks * Tranks)`. The larger eight-NPU point processes
+144,389 atom-steps/s. At 4,096 atoms, four NPUs are faster than eight; per-rank
+work is too small to sustain efficient scaling. The slightly superlinear
+two-NPU result is specific to these measured shapes and timings.
+
+### Wide and layerwise halos
+
+| Atoms | NPUs | Wide: ms/step | Layerwise: ms/step | Wide / layerwise | Peak GiB/NPU: wide -> layerwise |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4,096 | 2 | 156.99 | 92.60 | 1.70x | 8.37 -> 3.76 |
+| 4,096 | 4 | 102.60 | 71.52 | 1.43x | 5.00 -> 2.10 |
+| 4,096 | 8 | 76.15 | 75.77 | 1.01x | 3.01 -> 1.70 |
+| 13,824 | 2 | 465.04 | 248.75 | 1.87x | 23.13 -> 12.45 |
+| 13,824 | 4 | 246.01 | 135.22 | 1.82x | 12.54 -> 7.63 |
+| 13,824 | 8 | 143.41 | 95.74 | 1.50x | 7.12 -> 3.48 |
+
+Memory is the largest per-rank PyTorch NPU allocated peak. HCCL, driver memory
+and unused allocator reserves are excluded. Both layouts use the same checkpoint
+and initial structure. Initial energy and force comparisons across ranks and
+layouts pass the numerical criteria above. The wide-layout measurements also
+reuse fixed routing templates, so this comparison isolates the halo strategy.
+
+### Single-rank overhead relative to direct PyTorch
+
+| Atoms | Direct PT: ms/call | Engine with host transfers: ms/call | Full LAMMPS MD: ms/step |
+| ---: | ---: | ---: | ---: |
+| 4,096 | 134.30 | 134.24 | 134.90 |
+| 13,824 | 502.91 | 504.22 | 504.08 |
+
+Direct PT calls the same HP model with the same checkpoint, initial positions
+and skin graph, keeping inputs and outputs on the NPU. The engine comparison
+includes host input/output transfers. Five warmup calls precede three
+alternating paired rounds of ten synchronized calls per route; each round has
+nine energy/force calls and one energy/force/virial call. Engine overhead is
+within timing variation at 4,096 atoms and 0.26% at 13,824 atoms. The MD column
+uses evolving coordinates and includes CPU integration and neighbor work.
 
 ## Diagnostics
 

@@ -151,11 +151,15 @@ option is provided for tuning; it is slower than the selected vendor-GEMM
 combination at the measured points.
 
 Model execution is eager. The plain Ascend `mff/torch` LAMMPS backend runs one
-persistent model per MPI rank, with Ascend C ghost-force packing and accumulation
-and HCCL communication between NPUs. LAMMPS retains host integration, neighbor
+persistent model per MPI rank, with Ascend C packing and accumulation and HCCL
+communication between NPUs. Multi-rank runs default to a single-cutoff halo
+with feature and adjoint exchange. LAMMPS retains host integration, neighbor
 lists, domain decomposition and atom migration. See the
 [Ascend LAMMPS guide](lammps_user_mfftorch/docs/ASCEND.md) for the build,
 checkpoint requirements, examples and qualification scope.
+The C64/lmax2/two-interaction/correlation3 model reaches 5.27x strong scaling
+on eight NPUs at 13,824 atoms (65.8% efficiency). The guide also records the
+lower efficiency of the 4,096-atom point and matched direct-PyTorch timings.
 
 Compiled export and long-range electrostatics are not qualified on Ascend.
 Inherited CUDA sources remain available for compatibility and reference; their

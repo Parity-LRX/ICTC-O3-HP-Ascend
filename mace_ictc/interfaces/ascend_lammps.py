@@ -175,7 +175,8 @@ class AscendLAMMPSEngine:
         self.model, self.e0, self.state_source = load_checkpoint(checkpoint, self.device)
         self.cutoff = float(self.model.max_radius)
         self.depth = int(self.model.num_interaction)
-        self.halo_mode = os.environ.get('MFF_ASCEND_HALO', 'wide')
+        self.halo_mode = os.environ.get('MFF_ASCEND_HALO',
+                                       'layerwise' if world_size > 1 else 'wide')
         if self.halo_mode not in ('wide', 'layerwise'):
             raise ValueError('MFF_ASCEND_HALO must be wide or layerwise')
         self.halo_depth = 1 if self.halo_mode == 'layerwise' else self.depth
