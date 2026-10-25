@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """Whole-network entrypoints; precision and trainability stay caller-controlled."""
 import torch
+from contextlib import nullcontext
 
 
 def create_model(*, channels=64, lmax=3, edge_lmax=None, num_interactions=2,
@@ -77,7 +78,11 @@ def energy_and_forces(model, positions, atomic_numbers, batch, edge_src, edge_ds
         raise ValueError("Atomic numbers and graph batch must have shape [N]")
     if owned_mask is not None and (owned_mask.shape != (n,) or owned_mask.requires_grad):
         raise ValueError("owned_mask must be a fixed [N] tensor")
-    with torch.enable_grad():
+    scope = nullcontext()
+    if positions.device.type == "npu":
+        from mace_ictc.ascend.runtime import graph_queue_scope
+        scope = graph_queue_scope()
+    with scope, torch.enable_grad():
         pos = positions if positions.requires_grad else positions.detach().requires_grad_(True)
         output = model(pos, atomic_numbers, batch, edge_src, edge_dst, edge_shifts, cell)
         atomic = (output[0] if isinstance(output, tuple) else output).reshape(n)

@@ -192,16 +192,21 @@ and a maximum of 131,072 edges. This estimate excludes saved activations and oth
 model storage; it does not guarantee a total memory limit. Set a positive integer,
 for example `message_chunk_edges=16384`, to limit edge intermediates more tightly.
 Standalone graph-message factories retain their explicit 16,384-edge default.
-On large graphs, `message_chunk_edges=32768` keeps the grouped performance route
-available with smaller intermediates; `16384` selects the established small-chunk route.
+The grouped performance route is also selected for wide/angular messages whose
+active edge tile times channels times output angular width reaches 64 Mi elements.
+Consequently a small explicit edge chunk can still use grouped GEMMs when the
+actual model width amortizes their launch overhead.
 
 For graphs with at least 65,536 edges and chunks of at least 32,768 edges,
-performance graph messages keep channels contiguous and group paths by their
-actual input degree. Each group uses one GEMM without zero padding. Recursive
+or messages meeting the volume criterion above, performance graph messages keep
+channels contiguous and group paths by their actual input degree. Each group
+uses one GEMM without zero padding. Recursive
 matrix adjoints support force inference and energy-and-force training. Smaller
 workloads retain the established path schedule to avoid extra launch overhead.
 Grouped path splits assemble bond and gate gradients without one full slice-adjoint buffer
-per path. Standalone edge products retain their established analytic adjoints.
+per path. Shared edge-chunk splits also join gate and harmonic cotangents without
+allocating a full-edge slice gradient for each chunk. Standalone edge products
+retain their established analytic adjoints.
 Large working sets also fuse path gates and destination accumulation on Vector
 Cores. These messages keep `[edges, angular rows, channels]` contiguous through
 the first and mixed second adjoints. Constant geometry columns are arranged to
@@ -213,8 +218,12 @@ reducing repeated transfers and destination updates. Their UB schedule includes
 all active operands, all requested outputs and the selected input/output queue slots. Tiles that
 exceed this budget retain separate native adjoints.
 Input-degree groups accumulate compact `[nodes, group angular rows, channels]`
-buffers and restore the public angular/path order at node count. Coupling
-coefficients and learned parameter tensors are unchanged. Native narrow-matrix
+buffers across all edge chunks and restore the public angular/path order once
+at node count. Native epilogues can reuse each group accumulator instead of
+allocating and adding another full-node tensor per chunk. The accumulator is
+private to one forward call; its autograd chain retains first, mixed second
+and higher derivatives. Coupling coefficients and learned parameter tensors
+are unchanged. Native narrow-matrix
 adjoints keep their original matrix storage, including transposed operands;
 unsupported widths retain CANN execution.
 
@@ -246,6 +255,26 @@ The return value also reports `kernel_backend` and `ascendc_mode`.
 Standalone tensor products use the analytic route, including mixed second adjoints
 and a differentiable fallback for higher derivatives. Learned coefficients and
 external gates remain live inputs in both routes.
+
+The default NPU operator task queue is retained. Performance-mode native
+products, matrix blocks and graph epilogues inspect live PyTorch allocations
+before launching the next operation. At three quarters of total device memory
+or above, they finish the current stream to release eligible queued temporaries.
+These checks also apply during first and mixed second adjoints and direct model
+calls, while ordinary workloads retain pipeline overlap.
+
+`energy_and_forces` additionally marks performance messages whose estimated
+full-edge storage reaches one third of total device memory. It finishes marked
+streams before returning energy and forces, for inference and force-loss
+training. The estimate uses the same channel/angular/path formula as automatic
+chunk sizing. External loss backward and optimizer updates follow this call as
+usual. Actual peaks also depend on saved autograd graphs and external runtime
+storage.
+
+Runtime stream synchronization is included in reported latency. Capacity/native
+messages use their existing schedules. Set `ICTC_ASCEND_BOUND_GRAPH_QUEUE=0` to
+disable these performance-mode queue bounds. The runtime does not overwrite
+`TASK_QUEUE_ENABLE`.
 
 `energy_and_forces(model, positions, atomic_numbers, batch, edge_src, edge_dst,
 edge_shifts, cell, training=False)` returns `energy [B]`, `forces [N,3]` and

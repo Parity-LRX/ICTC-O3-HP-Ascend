@@ -111,7 +111,8 @@ species banks and symmetric contractions, and [the upstream provenance](UPSTREAM
   actual input angular degree and apply one GEMM per group. Constant geometry
   columns are reordered without padding; live path gates and output order are
   retained. Node-sized transforms and grouped path splits reduce edge-sized copies
-  and slice-adjoint zero fills. Large working sets use a Vector epilogue for
+  and slice-adjoint zero fills. Shared chunk splits join harmonic/gate gradients
+  across the graph. Large working sets use a Vector epilogue for
   path gates and FP32 destination accumulation. Its first and mixed second
   adjoints keep channels contiguous across the autograd boundary. Adjacent output
   intervals share DMA transfers; only constant projection columns are reordered.
@@ -119,9 +120,10 @@ species banks and symmetric contractions, and [the upstream provenance](UPSTREAM
   their requested edge gradients and combined node accumulation in one kernel.
   Tiling budgets all active operands and outputs; unsupported tiles retain
   separate adjoints. Small workloads retain the established path.
-  Each input-degree group can accumulate into a compact node buffer; node-sized
-  angular reordering restores the public path order. This keeps graph transfers
-  contiguous without changing coupling coefficients. Narrow batched adjoints
+  Each input-degree group reuses a private compact node accumulator across
+  edge chunks; node-sized angular reordering restores the public path order once.
+  This keeps graph transfers contiguous without changing coupling coefficients.
+  Narrow batched adjoints
   use bounded Vector schedules where applicable, with CANN fallback.
   Tiles spanning the full channel axis coalesce contiguous angular rows into
   single DMA blocks. Channel tails and separated rows retain strided transfers.
@@ -144,6 +146,12 @@ species banks and symmetric contractions, and [the upstream provenance](UPSTREAM
   gate/reduction epilogue where its working set is large enough; smaller messages
   retain PyTorch accumulation. Capacity/native modes also fuse the tensor product
   itself inside Ascend C kernels.
+- Performance mode applies stream backpressure near the device allocation
+  budget, including inside native adjoints. Very large energy/force calls finish
+  marked streams before returning. The triggers use live allocations, actual
+  message widths and total device memory; ordinary workloads retain pipeline
+  overlap. The default operator task queue is preserved. See the API guide for
+  the scheduling override and latency scope.
 - FP32 execution disables HF32 and requires autocast to be off. No reduced-precision
   approximation is used.
 
@@ -178,69 +186,84 @@ channels, fixed masks, frozen operands and strided graph indices through third
 derivatives. Fused adjoints also cover every requested output subset, missing
 higher-adjoint inputs and strided input views against FP64. These checks use
 synthetic inputs and do not establish the accuracy of a fitted potential.
-The latest qualification also covers 204 batched-matrix cases, single-input
-quadratic derivatives and single/multiple-cell geometry through third derivatives,
-including live cell and periodic-shift inputs.
+The kernel suite also covers 204 batched-matrix cases, single-input quadratic
+derivatives and single/multiple-cell geometry through third derivatives,
+including live cell and periodic-shift inputs. Chunk-accumulator checks cover
+15 live/frozen input subsets through third derivatives. Full-model checks also
+compare energies, forces and learned parameters after 70 AdamW updates.
 
 ## Training and inference performance
 
-One active Ascend 910B3, FP32 with HF32 disabled, eager execution. Each model has
-two interactions and correlation order 3. The following points use 4,096 atoms
-and 56 directed neighbors per atom. Baseline and current performance mode use
-identical initialized weights and graphs. All latencies include energy and forces.
+One active Ascend 910B3, eager FP32 with HF32 disabled. Initialized models use
+two interactions, correlation order 3 and 56 directed neighbors per atom.
+Previous and optimized schedules use identical weights and graphs at each point.
+Previous denotes the preceding production schedules.
 
-| Model | Operation | Previous → current (ms) | Current atom-steps/s | Allocated peak (MiB) |
-| --- | --- | ---: | ---: | ---: |
-| C32, lmax 1 | Inference | 55.32 → 55.68 | 73,565 | 1,212 |
-| C32, lmax 1 | Training + AdamW | 134.40 → 134.48 | 30,459 | 2,948 |
-| C64, lmax 2 | Inference | 84.79 → 83.74 | 48,912 | 5,273 |
-| C64, lmax 2 | Training + AdamW | 236.67 → 233.80 | 17,520 | 10,796 |
+![Training and inference throughput](docs/figures/ascend_throughput.svg)
 
-The paired baseline uses the preceding production schedules, including compact
-node outputs, contiguous row gathers and narrow Vector adjoints. Coalescing DMA
-transfers for full-channel tiles increases C64 inference throughput by 1.25% and
-full training throughput by 1.23%. Selection follows actual shapes and hardware
-limits; channel tails retain strided transfers.
+Top: inference with energy and forces. Bottom: complete energy-and-force loss,
+second-order backward, AdamW and `zero_grad`. Points are medians of three rounds;
+shading shows the measured round range. `K` denotes 1,024 atoms. The previous
+schedule is shown only where it completed the measurement. Training throughput
+increases across all sampled sizes in the four surveyed model configurations.
+Inference reaches a plateau, with remaining endpoint declines of about 0.7–1.3%.
+Throughput counts atoms processed per energy-and-force call or full training step.
 
-Across seven channel/degree configurations spanning 16–128 channels, 18 paired
-measurements at 512 or 4,096 atoms show a maximum latency regression of 0.64%.
-The C64 allocation peaks are unchanged in this paired comparison.
+![Allocated memory as atom count increases](docs/figures/ascend_memory.svg)
+
+Memory curves show total PyTorch allocation peaks for one resident model, graph
+and optimizer where applicable. Driver and external CANN allocations are excluded.
+OOM labels identify the next failed sample, not an exact capacity limit.
+Wide-model training can trade additional activation storage for faster execution.
+
+Largest successful samples in performance mode:
+
+- C64/lmax 2: 32,768 atoms for inference and
+  16,384 for full training.
+- C128/lmax 3: 8,192 atoms for inference and
+  4,096 for full training.
+- C256/lmax 3: 4,096 atoms for inference and
+  2,048 for full training.
+
+A separate capacity-mode sweep, with synchronization after every call, reaches
+65,536 atoms for C64/lmax 2 and
+16,384 for C256/lmax 3. Capacity mode
+uses a different operator schedule and is slower. Near full memory, the measured
+C256/lmax-3 capacity throughput decreases by about 0.8% from 8,192 to 16,384 atoms.
 
 ### Matched single-device K100 comparison
 
-The C64/lmax-2 case above also loads the same saved weights, exact graph and
-trainable parameter set on one K100. Loss, AdamW hyperparameters and timing
-protocol match. Both devices use eager FP32 with HF32/TF32 disabled.
+This separate C64/lmax-2 measurement uses 4,096 atoms and loads the same saved
+weights, exact graph and trainable parameter set on one K100. Loss, AdamW and
+timing protocol match. Both devices use eager FP32 with HF32/TF32 disabled.
 
 | Operation | K100 (ms) | Ascend 910B3 (ms) | Ascend / K100 latency |
 | --- | ---: | ---: | ---: |
-| Energy + force inference | 40.63 | 83.74 | 2.06× |
-| Energy + force training + AdamW | 112.68 | 233.80 | 2.07× |
+| Inference (energy + forces) | 40.63 | 79.82 | 1.965× |
+| Training + AdamW | 112.68 | 226.87 | 2.013× |
 
-These ratios describe this initialized model and fixed graph, rather than a
-hardware-wide performance ratio.
+These ratios describe this initialized model and fixed graph.
+Across 18 paired points at 512 or 4,096 atoms, the largest measured latency
+regression is 1.91%.
 
-### Sustained training and measurement protocol
+### Sustained training and timing scope
 
-A separate continuous-training check uses 64 timed steps per route, six warmups,
-alternating 16-step blocks, per-step synchronization and Python garbage collection
-enabled. C64 mean step time decreases from 245.54 to 242.45 ms, increasing
-sustained throughput by 1.28% to 16,895 atom-steps/s. The new median is 242.34 ms,
-95th percentile 243.13 ms and maximum 244.13 ms. Per-step synchronization makes
-this a different timing protocol from the three-call rounds above.
+A separate 64-step check uses six warmups, alternating 16-step blocks, per-step
+synchronization and Python garbage collection enabled. C64 mean training time
+changes from 242.92 to 235.07 ms,
+with current throughput 17,425 atom-steps/s.
+Final energies, forces and learned parameters pass the post-update comparison.
 
-Throughput counts processed atoms per energy-and-force call or full training step.
-Memory values are PyTorch allocation peaks above the warmed baseline; they exclude
-driver memory and external runtime allocations and are not an OOM-capacity test.
-
-Measurements are medians of three alternating paired rounds, three calls per
-round, after three warmup calls. Inference freezes model weights and computes
-both energy and forces. Training includes force-loss second derivatives, AdamW
-and `zero_grad`. Timing excludes JIT compilation, graph construction, neighbor
-rebuilding and host transfers. The graph is a periodic perturbed lattice at
-0.125 atoms/Å³ with a 4.5 Å cutoff. The node is allocated exclusively, and the
-model runs on one NPU. Every point passes energy, force, parameter-gradient and
-position-gradient checks before timing.
+The primary and scaling protocol uses three warmups followed by three
+alternating paired rounds of three calls. Runtime configuration, graph creation,
+neighbor rebuilding, JIT compilation and transfers are outside timing. Runtime
+stream synchronization for large messages is included. Inference freezes model
+weights and computes forces through autograd. The graph is a periodic perturbed
+lattice at 0.125 atoms/Å³ with a 4.5 Å cutoff. Each model runs on one NPU; the
+eight-device allocation runs independent workers, rather than distributed models.
+Paired points check energies, forces and training parameter gradients before
+timing. Candidate-only samples beyond a reference OOM additionally require finite
+outputs; their status is retained separately from completed paired measurements.
 
 ## License
 
