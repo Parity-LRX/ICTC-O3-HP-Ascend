@@ -54,10 +54,13 @@ process settings are not automatically restored. Call it before constructing
 a forward graph. A supplied `path` overrides the environment variable.
 
 `load_library(path=None)` only loads/registers the library; it does not enable
-operator dispatch or configure precision. `hardware()` returns the current
-NPU's `(UB capacity in bytes, Vector Core count)` after loading the library.
+operator dispatch or configure precision. Once loaded, later calls without a
+path reuse that library even if `ICTC_ASCENDC_LIBRARY` changes. Loading another
+library explicitly in the same process raises an error.
+`hardware(device=None)` returns `(UB capacity in bytes, Vector Core count)`
+for the current NPU or a supplied NPU index, device string or `torch.device`.
 These entry points share the same backend state as `mace_ictc.ascendc`.
-Imports never start compilation or load a native library.
+Importing these backend entry points does not build or load the native library.
 
 `performance` is the default mode for training and inference. It combines
 channel-contiguous GEMMs with native Vector kernels and differentiable
