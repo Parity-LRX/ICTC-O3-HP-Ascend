@@ -106,6 +106,16 @@ An existing path-preserving ICTC tensor-product module can be wrapped with
 trainability are preserved. A new factory module has fixed unit path coefficients;
 external gates remain live.
 
+With Ascend C enabled in `performance` mode, standalone `EdgeTensorProduct`
+groups coupling paths by input angular degree and uses channel-contiguous
+batched GEMMs. Each path writes directly into one packed output buffer.
+The `ir_mul` input blocks retain their batch strides without an additional
+feature copy. Path-weight adjoints recompute the required GEMM bases instead
+of retaining all intermediate path outputs. Analytic matrix adjoints remain
+differentiable through higher derivatives. Both layouts, independent input,
+edge and output degrees, live coefficients, and empty batches are supported.
+Capacity mode retains the native sparse execution path.
+
 ## Graph messages
 
 `PackedGraphMessage` has the same factory and packed buffers as `EdgeTensorProduct`.

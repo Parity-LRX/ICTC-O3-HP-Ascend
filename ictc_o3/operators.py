@@ -127,6 +127,12 @@ class EdgeTensorProduct(torch.nn.Module):
         return result
 
     def forward(self, features, harmonics, gates):
+        from mace_ictc.ascendc.runtime import is_enabled, mode
+        if (is_enabled() and mode() == 'performance'
+                and getattr(self.tp, '_ascend_tp_preproject', True)
+                and getattr(self.tp, '_ascend_tp_schedule', 'structured') == 'structured'):
+            from mace_ictc.ascend.packed_tensor_product import tensor_product as packed_product
+            return packed_product(self, features, harmonics, gates)
         blocks = tensor_product(self.tp, self._blocks(features),
                                 self._harmonics(harmonics, features.shape[0]), gates)
         return self._pack_output(blocks)
