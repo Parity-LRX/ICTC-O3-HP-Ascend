@@ -14,7 +14,7 @@ import torch
 from torch.fx.experimental.proxy_tensor import get_proxy_mode
 from torch._subclasses.fake_tensor import is_fake
 from .adjoint_requirements import required_gradients
-from .monomial_operator import triton
+from mace_ictc.ascend.sparse_product import triton
 
 _PLANS={}
 

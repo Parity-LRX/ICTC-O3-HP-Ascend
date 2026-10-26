@@ -13,7 +13,7 @@ from torch.fx.experimental.proxy_tensor import get_proxy_mode
 from torch._subclasses.fake_tensor import is_fake
 
 from ._mace_cg import _wigner_nj
-from .sparse_weighted_product import sparse_product_plan, sparse_weighted_product, sparse_quadratic
+from .sparse_weighted_product import sparse_product_plan
 
 
 def _compress(value, order, size):
@@ -63,7 +63,7 @@ def _plan(owner, x):
     cached=getattr(owner,"_factorized_u_cache",None)
     if cached is not None and cached[0]==key:return cached[1]
     with torch.no_grad():
-        qblocks=[value.detach().to(device="cpu",dtype=torch.float64) for value in qs]
+        qblocks=[value.detach().cpu().double() for value in qs]
         q=torch.block_diag(*qblocks[:owner.lmax+1]);size=q.shape[0]
         targets=[o3.Irrep(module.output_lmax,(-1)**module.output_lmax) for module in modules]
         paths_by_order={order:_wigner_nj([modules[0].coupling_irreps]*order,dtype=torch.float64,filter_ir_out=targets)
@@ -73,7 +73,7 @@ def _plan(owner, x):
             ir=o3.Irrep(module.output_lmax,(-1)**module.output_lmax)
             for order in range(1,correlation+1):
                 paths=[item for item in paths_by_order[order] if item[0]==ir]
-                u=module.U_tensors(order).detach().to(device="cpu",dtype=torch.float64)
+                u=module.U_tensors(order).detach().cpu().double()
                 if ir.l==0:u=u.unsqueeze(0)
                 # Reduced-CG U tensors span a subset of the full polynomial
                 # space. Their learned path count need not equal the complete
@@ -149,70 +149,3 @@ def _plan(owner, x):
         plan["input_size"]=size
         owner._factorized_u_cache=(key,plan)
         return plan
-
-
-def factorized_contractions(owner, x, idx):
-    if (torch.compiler.is_compiling() or get_proxy_mode() is not None
-            or torch._C._are_functorch_transforms_active() or is_fake(x)):
-        return None
-    plan=_plan(owner,x)
-    if plan is None:
-        if getattr(owner,"_require_factorized_plan",False):
-            raise ValueError("SC constants do not reconstruct within the generated-plan precision budget")
-        return None
-    from .reference_u_residency import offload_reference_u
-    offload_reference_u(owner,x)
-    for leg in (plan["pair"],plan["pair_adjoint"],plan["final"]):
-        if leg is not None:leg["adaptive_tiling"]=bool(getattr(owner,"_adaptive_sparse_tiling",False))
-    n,c,_=x.shape
-    native=x@plan["q"]
-    banks=[]
-    for module,order,projection in plan["projections"]:
-        weights=[module.weights_max,*module.weights]
-        banks.append(torch.einsum("rp,zpc->zcr",projection,weights[module.correlation-order].to(x)))
-    bank=torch.cat(banks,-1)
-    if (getattr(owner,"_species_circuit",False) and getattr(owner,"_factorized_circuit",False)
-            and not getattr(owner,"_partitioned_circuit",False) and not getattr(owner,"_staged_circuit",False)):
-        from .species_circuit import species_circuit
-        active_plan=plan
-        if getattr(owner,"_compact_circuit_adjoints",False):
-            from .partitioned_circuit import compact_plan
-            active_plan=compact_plan(plan)
-        output=species_circuit(native,bank,idx,active_plan)
-        parts=output.split(plan["sizes"],-1)
-        return torch.cat([(part@q.T).reshape(n,-1) for part,q in zip(parts,plan["qout"])],-1)
-    output=x.new_zeros(n,c,sum(plan["sizes"]))
-    for species in range(bank.shape[0]):
-        rows=torch.nonzero(idx==species,as_tuple=True)[0]
-        if rows.numel()==0:continue
-        features=native.index_select(0,rows)
-        if getattr(owner,"_staged_circuit",False):
-            from .staged_circuit import staged_circuit
-            value=staged_circuit(features,bank[species],plan)
-            output=output.index_add(0,rows,value)
-            continue
-        if getattr(owner,"_factorized_circuit",False):
-            active_plan=plan
-            if getattr(owner,"_compact_circuit_adjoints",False):
-                from .partitioned_circuit import compact_plan
-                active_plan=compact_plan(plan)
-            if getattr(owner,"_partitioned_circuit",False):
-                from .partitioned_circuit import partitioned_circuit
-                value=partitioned_circuit(features,bank[species],active_plan)
-            else:
-                from .factorized_circuit import factorized_circuit
-                value=factorized_circuit(features,bank[species],active_plan)
-            output=output.index_add(0,rows,value)
-            continue
-        if plan["pair"] is not None and getattr(owner,"_bounded_pair_circuit",False) and "pair_blocks" in plan:
-            from .bounded_quadratic import bounded_quadratic
-            pairs=bounded_quadratic(features,plan)
-        else:
-            pairs=(sparse_quadratic(features,plan["ones"],plan["pair"],plan["pair_adjoint"])
-                   if plan["pair"] is not None else features[:,:,:0])
-        left=torch.cat((pairs,features),-1)
-        right=torch.cat((features,features.new_ones(*features.shape[:2],1)),-1)
-        value=sparse_weighted_product(left,right,bank[species],plan["final"])
-        output=output.index_add(0,rows,value)
-    parts=output.split(plan["sizes"],-1)
-    return torch.cat([(part@q.T).reshape(n,-1) for part,q in zip(parts,plan["qout"])],-1)

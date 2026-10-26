@@ -5,7 +5,15 @@ import torch.nn.functional as F
 from mace_ictc.ascend.linear import channel_linear, species_channel_linear
 from mace_ictc.ascend.runtime import require_npu_fp32, strict_fp32
 from mace_ictc.ascend.tensor_product import tensor_product, graph_message
-from mace_ictc.hp.operators import _degree, _positive_integer
+def _degree(value, name):
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{name} must be a nonnegative integer")
+
+
+def _positive_integer(value, name):
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+
 
 
 class EdgeTensorProduct(torch.nn.Module):

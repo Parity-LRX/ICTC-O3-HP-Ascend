@@ -17,28 +17,15 @@ The PolyForm offer covers the following new HP components and their newly
 added integration changes, to the extent their copyright is controlled by
 the project rights holders:
 
-- `mace_ictc/hp/`: documented standalone operators and whole-model APIs.
-- `mace_ictc/models/generated_cartesian_message.py`,
-  `generated_message_second.py`, `generated_direction_harmonics.py`:
-  independent CUDA/Triton source generation and adjoints.
-- `generated_csr_forward.py`, `species_linear.py`, `fp32_policy.py` in
-  `mace_ictc/models/`: destination-owned FP32 reduction, shared species GEMMs
-  and the strict FP32 execution policy.
-- `reference_u_residency.py`: lossless reference-constant residency and
-  cache/version-preserving device restoration.
-- `angular_operator.py`, `bond_projection.py`, `banked_contraction.py`,
-  `compact_contraction.py`, `factorized_contraction.py`, `factorized_circuit.py`,
-  `partitioned_circuit.py`, `staged_circuit.py`, `bounded_quadratic.py`,
-  `polynomial_gemm.py`, `monomial_operator.py`, `fused_polynomial_matmul.py`,
-  `fused_message.py`, `rematerialized_message.py`, `streamed_gate_message.py`,
-  `fused_path_message.py`, `fused_activation.py`, `direct_harmonic_gradient.py`,
-  `csr_group_message.py`, `message_layout.py`, `adjoint_requirements.py`,
-  `operator_plans.py` in `mace_ictc/models/`: new planning, layout, contraction
-  and graph-operator implementations.
-- `mace_ictc/interfaces/deployment_triton.py`, `deployment_sparse.py`: prepared
-  HP deployment operators and bounded high-degree contractions/adjoints.
-- `mace_ictc/csrc/cached_edge_*`, `grouped_edge_geometry.*`, `csr_message.*`:
-  new HP C++/CUDA kernels.
+- `mace_ictc/hp/`: model construction and whole-model APIs.
+- `ictc_o3/` and `mace_ictc/ascend/`: Ascend operator APIs, schedules and adjoints.
+- `mace_ictc/ascendc/`: native Ascend C kernels, UB tiling and Python bindings.
+- `generated_direction_harmonics.py`, `factorized_contraction.py`,
+  `sparse_weighted_product.py`, `reference_u_residency.py`,
+  `adjoint_requirements.py`, `operator_plans.py` and `fp32_policy.py` in
+  `mace_ictc/models/`: fixed mathematical plans, direction adjoints and
+  reference/runtime integration.
+- Newly added foundation checkpoint adapters and Ascend integration portions.
 - Newly added HP selection/layout integration portions of the existing model,
   training, checkpoint and export files, plus newly created HP usage examples.
 

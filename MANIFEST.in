@@ -2,7 +2,7 @@ include README.md LICENSE NOTICE LICENSE_SCOPE.md COMMERCIAL_LICENSE.md UPSTREAM
 recursive-include LICENSES *.txt
 recursive-include docs *.md
 recursive-include examples *.py
-recursive-include lammps_user_mfftorch *.md *.txt *.cmake *.h *.cpp *.cu *.sh *.in in.*
+recursive-include lammps_user_mfftorch *.md *.txt *.cmake *.h *.cpp *.sh *.in in.*
 include lammps_user_mfftorch/install_ascend.py
 include lammps_user_mfftorch/launch_ascend.py
 prune benchmarks
@@ -14,3 +14,5 @@ prune mace_ictc/bench
 prune mace_ictc/test
 prune .git
 recursive-exclude * __pycache__ *.pyc *.pyo *.log *.csv *.xml *.json *.png *.pdf *.svg *.whl *.pt2 *.pth
+
+recursive-include docs/figures *.svg *.png

@@ -43,13 +43,14 @@ login-node terminal.
 
 ## Checkpoints
 
-`pair_coeff` loads a trusted MACE-ICTC `.pth` training checkpoint directly. No
-TorchScript or AOTInductor export is required. The saved architecture metadata,
+`pair_coeff` loads a trusted MACE-ICTC `.pth` training checkpoint or a converted
+FP32 foundation archive directly. No compiled export is required. For ordinary
+training checkpoints, the saved architecture metadata,
 selected raw/EMA/SWA state and atomic reference energies are restored; weights
 are loaded strictly. The saved neighbor normalization, radial normalization,
 cutoff and contraction configuration are retained.
 
-Requirements:
+Requirements for ordinary training checkpoints:
 
 - FP32 `pure-cartesian-ictd-fix`, ICTC angular basis and a supported Ascend HP model.
 - Explicit `model_hyperparameters`, including channel count, angular degree,
@@ -64,6 +65,26 @@ The cutoff passed to `pair_style` must match the checkpoint. Element symbols
 passed to `pair_coeff` map LAMMPS atom types to trained elements. `NULL` mappings
 are currently rejected. The default checkpoint state selection follows the
 checkpoint's `default_state_source`, then the existing EMA/raw fallback policy.
+
+### MACE-MH-1 archives
+
+Convert the official checkpoint using
+`python -m mace_ictc.cli.convert_foundation --mace-model mace-mh-1.model --dtype float32 --out mh1.pt`.
+The archive retains all six heads and the original Agnesi transform, ZBL,
+density normalization and nonlinear residual architecture. The adapter uses
+ICTC tensor products and symmetric contractions for frozen inference.
+See [the conversion guide](../../docs/CONVERSION.md) for the complete example.
+
+Use `pair_style mff/torch 6.0 npu` and pass `mh1.pt` to `pair_coeff`, followed by
+the element symbols in LAMMPS atom-type order. Set `MFF_ASCEND_HEAD` before
+launch to override the saved head. The pair style adds that head's atomic
+reference energies exactly once and includes ZBL in energies, forces and
+global virials.
+
+Foundation models exchange projected features between interactions in
+multi-rank layerwise mode. Owned input linears and owned destination aggregation
+are intrinsic to this path. Asynchronous feature overlap is not implemented
+for foundation archives. Dynamic atom counts and neighbor graphs remain supported.
 
 ## Run
 
@@ -91,6 +112,10 @@ visible NPUs. Multi-node deployment needs a working HCCL network configuration.
 The backend uses dynamic eager execution. Atom counts, neighbor edges, species
 and owner schedules are refreshed after neighbor rebuilds and atom migration.
 It does not capture or replay a fixed-shape device program.
+Each rank subtracts a common coordinate origin in LAMMPS double precision before
+copying FP32 positions to the NPU. This preserves short displacement accuracy
+when absolute coordinates are large. Periodic shifts and edge-based virials
+retain their existing conventions.
 
 The launcher configures task dispatch before PyTorch starts and divides the
 actual near-CPU groups reported by `npu-smi` between visible devices:

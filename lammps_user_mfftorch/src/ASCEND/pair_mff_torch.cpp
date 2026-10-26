@@ -272,7 +272,12 @@ void PairMFFTorch::exchange_plan() {
   send_counts_.assign(sc.begin(),sc.end());receive_counts_.assign(rc.begin(),rc.end());
 }
 void PairMFFTorch::update_positions() {
-  for(int m=0;m<nodes_;m++)for(int axis=0;axis<3;axis++)positions_[static_cast<size_t>(m)*3+axis]=atom->x[model_to_atom_[m]][axis];
+  // Subtract a common origin in LAMMPS double precision before the FP32 copy.
+  // Relative vectors, periodic shifts and their derivatives are unchanged.
+  double origin[3]={0.,0.,0.};
+  if(nodes_)for(int axis=0;axis<3;axis++)origin[axis]=atom->x[model_to_atom_[0]][axis];
+  for(int m=0;m<nodes_;m++)for(int axis=0;axis<3;axis++)
+    positions_[static_cast<size_t>(m)*3+axis]=static_cast<float>(atom->x[model_to_atom_[m]][axis]-origin[axis]);
   const float values[]={static_cast<float>(domain->xprd),0,0,static_cast<float>(domain->xy),static_cast<float>(domain->yprd),0,
                         static_cast<float>(domain->xz),static_cast<float>(domain->yz),static_cast<float>(domain->zprd)};
   std::copy(values,values+9,cell_);

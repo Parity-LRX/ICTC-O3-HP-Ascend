@@ -23,9 +23,23 @@ def load_checkpoint(path, device):
     from mace_ictc.utils.checkpoint_metadata import get_checkpoint_e3_state_dict
     from mace_ictc.utils.config import ModelConfig
 
-    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+    from mace_ictc.interfaces.foundation_hp import FoundationHP, load_foundation_checkpoint
+    checkpoint = load_foundation_checkpoint(path)
     if not isinstance(checkpoint, dict):
         raise ValueError('Expected a MACE-ICTC checkpoint dictionary')
+    if checkpoint.get('format') == 'mace-ictc-foundation-ascend':
+        model = checkpoint.get('model')
+        if checkpoint.get('version') != 1 or not isinstance(model, FoundationHP):
+            raise ValueError('Unsupported foundation archive version or model')
+        if checkpoint.get('dtype') != 'float32' or any(p.dtype != torch.float32 for p in model.parameters()):
+            raise ValueError('Ascend LAMMPS requires an FP32 foundation archive')
+        head = os.environ.get('MFF_ASCEND_HEAD', checkpoint['head'])
+        model.select_head(head)
+        model = model.to(device=device).eval().requires_grad_(False)
+        e0 = torch.zeros(max(model.atomic_numbers)+1, device=device, dtype=torch.float32)
+        numbers = torch.tensor(model.atomic_numbers, device=device)
+        e0[numbers] = model.atomic_reference_energies(numbers)
+        return model, e0, f'foundation:{head}'
     meta = dict(checkpoint.get('model_hyperparameters', {}))
     mode = checkpoint.get('tensor_product_mode', meta.get('tensor_product_mode'))
     if mode != 'pure-cartesian-ictd-fix':
@@ -176,6 +190,7 @@ class AscendLAMMPSEngine:
         from mace_ictc.hp import configure_model
         enable(mode=os.environ.get('MFF_ASCEND_MODE', 'performance'))
         self.model, self.e0, self.state_source = load_checkpoint(checkpoint, self.device)
+        self.foundation = getattr(self.model, 'architecture', None) == 'mace-foundation-nonlinear'
         self.cutoff = float(self.model.max_radius)
         self.depth = int(self.model.num_interaction)
         self.halo_mode = os.environ.get('MFF_ASCEND_HALO',
@@ -186,6 +201,7 @@ class AscendLAMMPSEngine:
         if owner_linear not in ('0', '1'):
             raise ValueError('MFF_ASCEND_OWNER_LINEAR must be zero or one')
         self.owner_linear = owner_linear == '1'
+        if self.foundation:self.owner_linear = True
         gather = os.environ.get('MFF_ASCEND_FEATURE_GATHER', 'native')
         if gather not in ('native', 'index_select'):
             raise ValueError('MFF_ASCEND_FEATURE_GATHER must be native or index_select')
@@ -207,16 +223,21 @@ class AscendLAMMPSEngine:
             raise ValueError('Feature overlap requires MFF_ASCEND_OWNER_LINEAR=1')
         self.overlap_features = (overlap == '1' and self.halo_mode == 'layerwise'
                                  and world_size > 1 and self.depth > 1)
+        if self.foundation and self.overlap_features:
+            raise ValueError('Asynchronous feature overlap is not implemented for foundation checkpoints')
         self._feature_stream = torch.npu.Stream(device=self.device) if self.overlap_features else None
         self._feature_pending = set()
         owner_output = os.environ.get('MFF_ASCEND_OWNER_OUTPUT', '0')
         if owner_output not in ('0', '1'):
             raise ValueError('MFF_ASCEND_OWNER_OUTPUT must be zero or one')
         self.owner_output = owner_output == '1' and self.halo_mode == 'layerwise' and world_size > 1
+        if self.foundation and self.halo_mode == 'layerwise' and world_size > 1:
+            self.owner_output = True
         self.halo_depth = 1 if self.halo_mode == 'layerwise' else self.depth
         if abs(float(cutoff) - self.cutoff) > 1e-6:
             raise ValueError(f'Pair cutoff {cutoff} does not match checkpoint cutoff {self.cutoff}')
-        self.configuration = configure_model(self.model, policy='generated', training=False)
+        self.configuration = (self.model.configure_inference() if self.foundation else
+                              configure_model(self.model, policy='generated', training=False))
         self.rank, self.world_size = rank, world_size
         self.group = None
         if world_size > 1:
@@ -250,13 +271,13 @@ class AscendLAMMPSEngine:
         self._owned_methods = []
         self._owned_metadata_views = {}
         self._owned_destination_counts = []
-        if self.owner_output:
+        if self.owner_output and not self.foundation:
             for layer in self.model.interactions:
                 module = layer.tp
                 self._owned_destination_counts.append((module,
                     '_ascend_destination_nodes' in module.__dict__,
                     module.__dict__.get('_ascend_destination_nodes')))
-        if self.halo_mode == 'layerwise' and world_size > 1:
+        if self.halo_mode == 'layerwise' and world_size > 1 and not self.foundation:
             import weakref
             reference = weakref.ref(self)
             def owned_inputs(module, args, kwargs):
@@ -344,6 +365,10 @@ class AscendLAMMPSEngine:
             raise RuntimeError('Topology changed during an unfinished feature exchange')
         device = self.device
         self.nlocal, self.nodes = int(nlocal), int(nodes)
+        if self.foundation:
+            self.model._ascend_owned_nodes = (self.nlocal if self.halo_mode == 'layerwise'
+                                              and self.world_size > 1 else self.nodes)
+            self.model._ascend_compact_outputs = self.compact_outputs
         if self.owner_output:
             destination = np.frombuffer(dst, dtype=np.int64)
             if destination.size and (destination.min() < 0 or destination.max() >= nlocal):
@@ -575,7 +600,8 @@ class AscendLAMMPSEngine:
                 callback = None
                 if self.halo_mode == 'layerwise' and self.world_size > 1 and self.depth > 1:
                     self._halo_anchor = pos.sum()*0
-                    callback = self._layer_state
+                    callback = ((lambda slot, value: self._exchange_state(value, slot))
+                                if self.foundation else self._layer_state)
                 prediction = self.model(pos, self.atomic_numbers, self.batch, self.src, self.dst, self.shifts, box,
                                         precomputed_edge_vec=edge_vec, layer_state_callback=callback)
                 if self._feature_pending:
@@ -659,6 +685,8 @@ class AscendLAMMPSEngine:
             (path/f'ascend_rank{self.rank}.json').write_text(json.dumps(
                 dict(rank=self.rank, world_size=self.world_size, state_source=self.state_source,
                      execution=self.execution,
+                     model_architecture=getattr(self.model, 'architecture', 'mace-ictc'),
+                     head=getattr(self.model, 'head', None),
                      p2p_mode=getattr(self, 'p2p_mode', 'coalesced'),
                      halo_mode=self.halo_mode, halo_depth=self.halo_depth, interaction_depth=self.depth,
                      owner_linear=self.owner_linear,

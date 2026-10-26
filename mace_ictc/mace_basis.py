@@ -11,9 +11,8 @@ single right-multiply ``x @ Q`` with the block-diagonal ``Q = diag(Q_0, ..., Q_l
 
 Important: energy, forces and the virial are SO(3) invariants / physical Cartesian tensors and are
 **unchanged** by ``Q`` (it is an orthogonal change of the angular basis). ``Q`` only re-expresses
-equivariant (``l>=1``) features. These helpers let you put any equivariant tensor into the
-original-MACE convention consistently across Python, the exported model, and LAMMPS (see
-``lammps_user_mfftorch/src/USER-MFFTORCH/mff_mace_basis.h`` for the matching C++ constants).
+equivariant (``l>=1``) features. These helpers consistently re-express equivariant tensors
+in Python models and checkpoint conversion.
 """
 from __future__ import annotations
 

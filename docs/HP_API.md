@@ -184,7 +184,7 @@ NPU kernels. Correlation is currently limited to 1/2/3 by the model factory.
 training=False, policy='generated', message_chunk_edges=None)` selects the
 Ascend backend for NPU models. Policies are `auto`, `generated` and `reference`.
 The returned dictionary identifies the backend, selected route and coverage
-reasons. CUDA-specific scheduling options from upstream have no NPU semantics.
+reasons. The public runtime exposes Ascend scheduling options only.
 
 The default `message_chunk_edges=None` estimates a per-interaction chunk from
 its actual channel, angular and path widths, with a 3 GiB forward-scratch budget
@@ -289,3 +289,12 @@ and rebuild their original architecture first, move the model to NPU FP32,
 then call `configure_model`. A CPU float64 checkpoint must have its explicit
 internal compute dtype attributes updated consistently when converting to FP32;
 configuration itself does not perform that conversion.
+
+## Foundation checkpoint adapter
+
+Use `mace_ictc.cli.convert_foundation` and its `load_model` helper for the
+nonlinear MACE-MH-1 architecture. Its `configure_inference` method selects
+Ascend ICTC operators while preserving the original six heads, radial transform,
+ZBL, density normalization and readouts. This is a frozen inference adapter.
+See [CONVERSION.md](CONVERSION.md) for a complete command, user example,
+energy-offset convention and LAMMPS deployment.

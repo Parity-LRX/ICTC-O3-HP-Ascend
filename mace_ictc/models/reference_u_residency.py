@@ -18,19 +18,6 @@ def constant_key(owner,device,dtype):
     return tuple((id(value),value._version) for value in [*qs,*constants]),device,dtype
 
 
-def host_reference_unavailable(model=None):
-    """Keep conventional GPU buffers for distributed or replicated modules."""
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return 'distributed process group initialized'
-    candidate=model
-    while isinstance(candidate,torch.nn.Module):
-        if isinstance(candidate,(torch.nn.DataParallel,torch.nn.parallel.DistributedDataParallel)):
-            return 'parallel wrapper requires conventional device buffers'
-        child=getattr(candidate,'module',None)
-        if child is None:child=getattr(candidate,'model',None)
-        if child is candidate:break
-        candidate=child
-    return None
 
 
 def _move(owner,device):
@@ -65,12 +52,6 @@ def restore_model_reference_u(model):
             restore_reference_u(module)
 
 
-def offload_reference_u(owner,x):
-    if not getattr(owner,'_host_reference_u',False) or not x.is_cuda:return
-    if host_reference_unavailable() is not None:
-        restore_reference_u(owner,x.device)
-        return
-    _move(owner,torch.device('cpu'))
 
 
 def prepare_reference_u(owner,x):

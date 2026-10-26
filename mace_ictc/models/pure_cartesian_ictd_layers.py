@@ -692,11 +692,6 @@ def _irreps_elementwise_tensor_product_0e(x1: torch.Tensor, x2: torch.Tensor, ch
     return torch.cat(outs, dim=-1)
 
 
-def _run_in_stream(module: nn.Module, x: torch.Tensor, stream: torch.cuda.Stream | None) -> torch.Tensor:
-    if stream is None:
-        return module(x)
-    with torch.cuda.stream(stream):
-        return module(x)
 
 
 def _elementwise_tensor_product_0e_blocks(

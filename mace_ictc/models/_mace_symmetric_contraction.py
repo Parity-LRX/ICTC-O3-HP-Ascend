@@ -309,14 +309,6 @@ class _Contraction(torch.nn.Module):
         gradients: repeated species rows are accumulated by autograd.
         """
         idx = node_type_idx.to(device=x.device, dtype=torch.long)
-        if getattr(self,"_use_banked_contraction",False):
-            from .banked_contraction import banked_contraction
-            banked=banked_contraction(self,x,idx)
-            if banked is not None:return banked
-        if getattr(self,"_use_species_bank",False):
-            from .species_polynomial import contract_species_bank
-            fast=contract_species_bank(self,x,idx)
-            if fast is not None:return fast
 
         def selected_coefficient(
             order: int,

@@ -12,7 +12,7 @@ Goal:
 Important:
   - The basis for each l is fixed by our construction (harmonic nullspace + weighted orthonormalization).
     The CG tensors are computed consistently in the same basis, so equivariance is exact by construction.
-  - Arbitrary lmax is supported. Small lmax (<=6) is the fastest due to Triton kernel coverage;
+  - Tensor-product paths and irreducible degrees are configurable;
     higher lmax works correctly via automatic PyTorch fallback.
 """
 
@@ -34,11 +34,6 @@ from mace_ictc.models.ictd_fast import (
     _build_laplacian_matrix,
     _build_r2k_lift,
 )
-from mace_ictc.models.ictd_irreps_cuda import (
-    bucketed_tp_forward as _tp_cuda_ext_bucket_forward,
-    ensure_grouped_tp_cuda_ext_supported,
-    normalize_ictd_tp_backend,
-)
 from mace_ictc.models import ictd_disk_cache
 from mace_ictc.models.operator_plans import bond_first_projection
 
@@ -54,24 +49,16 @@ except Exception:  # pragma: no cover
     def _dynamo_disable(fn):
         return fn
 
-# Optional: FlashTP-style fused outer-product + projection (Triton); set ICTD_USE_TRITON_TP=0 to disable
-try:
-    _triton_tp = __import__(
-        "mace_ictc.models.ictd_irreps_triton",
-        fromlist=["_tp_fused_outer_proj", "_tp_fused_outer_proj_sparse", "_tp_fused_outer_proj_channel_mix"],
-    )
-    _tp_fused_outer_proj = getattr(_triton_tp, "_tp_fused_outer_proj", None)
-    _tp_fused_outer_proj_sparse = getattr(_triton_tp, "_tp_fused_outer_proj_sparse", None)
-    _tp_fused_outer_proj_channel_mix = getattr(_triton_tp, "_tp_fused_outer_proj_channel_mix", None)
-except Exception:
-    _tp_fused_outer_proj = None
-    _tp_fused_outer_proj_sparse = None
-    _tp_fused_outer_proj_channel_mix = None
+def normalize_ictd_tp_backend(backend):
+    value = str(backend or "auto").strip().lower()
+    if value not in ("auto", "pytorch"):
+        raise ValueError("The Ascend library supports auto or pytorch TP configuration")
+    return value
+
 
 # Sparse CG: use sparse projection when zero fraction >= this (0.4 = 40% zeros)
 _SPARSE_MIN_ZERO_FRAC = 0.4
 _SPARSE_ZERO_THRESHOLD = 1e-12
-# Set ICTD_USE_SPARSE_TP=0 to disable sparse path (use dense Triton or PyTorch only)
 _USE_SPARSE_TP = os.environ.get("ICTD_USE_SPARSE_TP", "1") == "1"
 # Channelwise fused TP is experimentally useful only on some workloads.
 _USE_TRITON_CHANNELWISE_TP = os.environ.get("ICTD_USE_TRITON_CHANNELWISE_TP", "0") == "1"
@@ -199,14 +186,6 @@ def apply_channel_adapter_per_l(x_l: torch.Tensor, adapter: nn.Module) -> torch.
     if getattr(adapter, "_ascend_hp", False) and x_l.device.type == "npu":
         from mace_ictc.ascend.linear import channel_linear
         return channel_linear(x_l, adapter.weight, adapter.bias)
-    if (getattr(adapter,"_shared_gemm",False) and isinstance(adapter,nn.Linear)
-            and x_l.is_cuda and x_l.dtype==torch.float32
-            and not torch.is_autocast_enabled(x_l.device.type)):
-        # One shared-weight GEMM instead of expanding a small channel matrix
-        # into a separate batched matmul for every node/angular block.
-        angular=x_l.movedim(-2,-1).contiguous()
-        flat=angular.reshape(-1,angular.shape[-1])
-        return adapter(flat).reshape(*angular.shape[:-1],adapter.out_features).movedim(-1,-2)
     y = adapter(x_l.movedim(-2, -1))
     return y.movedim(-1, -2)
 
@@ -1008,19 +987,6 @@ def _integer_power_table(x: torch.Tensor, max_power: int) -> torch.Tensor:
         powers.append(cur)
     return torch.stack(powers, dim=-1)
 
-# Optional CUDA path (Triton fused kernel). PyTorch (N,D)@(D,K) is often faster due to cuBLAS;
-# set ICTD_USE_TRITON=1 to try Triton anyway (e.g. to reduce peak memory by not materializing t).
-def _direction_harmonics_triton_optional(
-    n: torch.Tensor, l: int, exps: torch.Tensor, coefs: torch.Tensor, P: torch.Tensor
-) -> torch.Tensor | None:
-    import os
-    if os.environ.get("ICTD_USE_TRITON", "0") != "1":
-        return None
-    try:
-        from mace_ictc.models.ictd_irreps_triton import direction_harmonics_triton
-        return direction_harmonics_triton(n, l, exps, coefs, P)
-    except Exception:
-        return None
 
 
 def direction_harmonics_fast(n: torch.Tensor, l: int) -> torch.Tensor:
@@ -1832,7 +1798,6 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         self._proj_group_view_cache_by_dev_dtype: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
         # Sparse U per group when zero_frac >= _SPARSE_MIN_ZERO_FRAC: list of None or (d_idx, k_idx, vals)
         self._proj_sparse_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]] = {}
-        # Packed same-kdim buckets for the custom CUDA backend.
         self._proj_bucket_cache_by_dev_dtype: Dict[Tuple[str, str], List[List[Dict[str, object]]]] = {}
         self._proj_group_view_cache_by_dev_dtype: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
         self._scalar_identity_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Dict[str, object]]]] = {}
@@ -1896,22 +1861,7 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                 U[:, int(s): int(e)] = C.reshape(m1 * m2, int(e) - int(s))
             proj_list.append(U)
 
-            # Build sparse (d_idx, k_idx, vals) only on CUDA (Triton is CUDA-only; on CPU it adds overhead)
-            if device.type == "cuda":
-                n = U.numel()
-                nz = (U.abs() > _SPARSE_ZERO_THRESHOLD).sum().item()
-                zero_frac = 1.0 - (nz / n) if n else 0.0
-                if zero_frac >= _SPARSE_MIN_ZERO_FRAC:
-                    mask = U.abs() > _SPARSE_ZERO_THRESHOLD
-                    nz_flat = mask.nonzero(as_tuple=False)  # (nnz, 2)
-                    d_idx = nz_flat[:, 0].contiguous()
-                    k_idx = nz_flat[:, 1].contiguous()
-                    vals = U[mask].contiguous()
-                    sparse_list.append((d_idx, k_idx, vals))
-                else:
-                    sparse_list.append(None)
-            else:
-                sparse_list.append(None)
+            sparse_list.append(None)
 
         self._proj_group_cache_by_dev_dtype[key] = proj_list
         self._proj_sparse_cache_by_dev_dtype[key] = sparse_list
@@ -2053,7 +2003,6 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         if self.internal_weights and (weights is None or weights.shape[-1] == self.num_paths):
             proj_list = self._get_proj_group_list(device=device, dtype=dtype)
             bucket_list = self._get_proj_bucket_list(device=device, dtype=dtype)
-            # Only fetch sparse list on CUDA (Triton is CUDA-only; avoids extra work on CPU)
             sparse_list = self._get_proj_sparse_list(device=device, dtype=dtype) if device.type == "cuda" else None
             for g_idx, g in enumerate(self._groups):
                 l1 = int(g["l1"])  # type: ignore[arg-type]
@@ -2081,80 +2030,9 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                     B_flat *= int(s)
                 a_flat = a_comp.reshape(B_flat, self.mul_in1, m1)
                 b_flat = b_comp.reshape(B_flat, self.mul_in2, m2)
-                if a_comp.dim() >= 2:
-                    bucket_outputs: list[tuple[int, torch.Tensor]] = []
-                    cuda_supported = True
-                    for bucket in bucket_list[g_idx]:
-                        bucket_segments = bucket["segments"]  # type: ignore[assignment]
-                        bucket_path_indices = bucket["path_indices"]  # type: ignore[assignment]
-                        U_bucket = bucket["U_bucket"]  # type: ignore[assignment]
-                        kdim = int(bucket["kdim"])  # type: ignore[arg-type]
-                        W_bucket = _stack_group_weights(
-                            w_param=w_param,
-                            segments=bucket_segments,
-                            compute_dtype=compute_dtype,
-                            mul_scale=self._mul_path_scale,
-                        ).to(device=a_comp.device)
-                        gates_bucket = None
-                        if weights is not None:
-                            gates_bucket = _slice_or_index_lastdim(weights, [int(p_idx) for p_idx in bucket_path_indices])
-                            gates_bucket = gates_bucket.reshape(B_flat, len(bucket_path_indices)).to(dtype=compute_dtype)
-                        bucket_out = _tp_cuda_ext_bucket_forward(
-                            backend=self.ictd_tp_backend,
-                            a=a_flat,
-                            b=b_flat,
-                            U_bucket=U_bucket,
-                            W_stack=W_bucket,
-                            gates=gates_bucket,
-                            compute_dtype=compute_dtype,
-                        )
-                        if bucket_out is None:
-                            cuda_supported = False
-                            break
-                        bucket_out = bucket_out.reshape(*batch_shape, self.mul_out, kdim)
-                        bucket_outputs.append((int(bucket_segments[0][1]), bucket_out))
-                    if cuda_supported and bucket_outputs:
-                        for l3, bucket_out in bucket_outputs:
-                            bucket_out = bucket_out.to(dtype=dtype) if bucket_out.dtype != dtype else bucket_out
-                            out[l3] = out[l3] + bucket_out
-                        continue
                 # FlashTP-style: fused projection+channel-mix (one kernel), or sparse/dense TP then per-path mix
                 y = None
                 used_fused_mix = False
-                if a_comp.is_cuda and a_comp.dim() >= 2:
-                    # Try fused outer-product + projection + channel mixing (one kernel, no y write-back)
-                    if (
-                        _tp_fused_outer_proj_channel_mix is not None
-                        and num_paths_in_group <= 16
-                    ):
-                        W_stack = _stack_group_weights(
-                            w_param=w_param,
-                            segments=segments,
-                            compute_dtype=compute_dtype,
-                            mul_scale=self._mul_path_scale,
-                        ).to(device=a_comp.device)
-                        out_buf = _tp_fused_outer_proj_channel_mix(
-                            a_flat, b_flat, U, W_stack, segments, k_total, self.mul_out, m1, m2
-                        )
-                        if out_buf is not None:
-                            out_buf = out_buf.to(dtype=dtype) if out_buf.dtype != dtype else out_buf
-                            for seg_idx, (p_idx, l3, s, e) in enumerate(segments):  # type: ignore[misc]
-                                seg_out = out_buf[:, seg_idx, :, int(s) : int(e)]
-                                if weights is not None:
-                                    seg_out = seg_out * weights[..., int(p_idx), None, None]
-                                out[int(l3)] = out[int(l3)] + seg_out
-                            used_fused_mix = True
-                    if not used_fused_mix:
-                        sparse_repr = (sparse_list[g_idx] if _USE_SPARSE_TP else None) if sparse_list is not None else None
-                        if sparse_repr is not None and _tp_fused_outer_proj_sparse is not None:
-                            d_idx, k_idx, vals = sparse_repr
-                            y_flat = _tp_fused_outer_proj_sparse(a_flat, b_flat, d_idx, k_idx, vals, m1, m2, k_total)
-                            if y_flat is not None:
-                                y = y_flat.reshape(*batch_shape, self.mul_in1, self.mul_in2, k_total)
-                        if y is None and _tp_fused_outer_proj is not None:
-                            y_flat = _tp_fused_outer_proj(a_flat, b_flat, U, m1, m2)
-                            if y_flat is not None:
-                                y = y_flat.reshape(*batch_shape, self.mul_in1, self.mul_in2, k_total)
                 if not used_fused_mix:
                     if y is None:
                         # PyTorch fallback: outer product + matmul projection
@@ -2208,22 +2086,6 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                 b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
                 # FlashTP-style: sparse or dense fused outer-product + projection
                 y = None
-                if a_comp.is_cuda and a_comp.dim() >= 2:
-                    B_flat = 1
-                    for s in batch_shape:
-                        B_flat *= int(s)
-                    a_flat = a_comp.reshape(B_flat, self.mul_in1, m1)
-                    b_flat = b_comp.reshape(B_flat, self.mul_in2, m2)
-                    sparse_repr = (sparse_list[g_idx] if _USE_SPARSE_TP else None) if sparse_list is not None else None
-                    if sparse_repr is not None and _tp_fused_outer_proj_sparse is not None:
-                        d_idx, k_idx, vals = sparse_repr
-                        y_flat = _tp_fused_outer_proj_sparse(a_flat, b_flat, d_idx, k_idx, vals, m1, m2, k_total)
-                        if y_flat is not None:
-                            y = y_flat.reshape(*batch_shape, self.mul_in1, self.mul_in2, k_total)
-                    if y is None and _tp_fused_outer_proj is not None:
-                        y_flat = _tp_fused_outer_proj(a_flat, b_flat, U, m1, m2)
-                        if y_flat is not None:
-                            y = y_flat.reshape(*batch_shape, self.mul_in1, self.mul_in2, k_total)
                 if y is None:
                     U = proj_list[g_idx]  # (m1*m2, K_total)
                     t_mn = (a_comp.unsqueeze(-2).unsqueeze(-1) * b_comp.unsqueeze(-3).unsqueeze(-2))
@@ -2458,11 +2320,6 @@ class HarmonicPathWeightedTensorProduct(nn.Module):
         return cached
 
     def _project_group(self, a: torch.Tensor, b: torch.Tensor, u: torch.Tensor, index: int) -> torch.Tensor:
-        if (getattr(self, "_use_bond_first_projection", False)
-                and b.shape[-2] == 1 and a.dtype == torch.float32
-                and not torch.is_autocast_enabled(a.device.type)):
-            projector = self._get_bond_projectors(a.device, a.dtype)[index]
-            return bond_first_projection(a, b, projector, getattr(self, "_angular_backend", "torch"))
         pair = (a.unsqueeze(-1) * b.unsqueeze(-2)).reshape(
             *a.shape[:-2], self.channels, a.shape[-1] * b.shape[-1]
         )
@@ -3214,21 +3071,7 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
                 C = cg_list[int(p_idx)]
                 U[:, int(s): int(e)] = C.reshape(m1 * m2, int(e) - int(s))
             proj_list.append(U)
-            if device.type == "cuda":
-                n = U.numel()
-                nz = (U.abs() > _SPARSE_ZERO_THRESHOLD).sum().item()
-                zero_frac = 1.0 - (nz / n) if n else 0.0
-                if zero_frac >= _SPARSE_MIN_ZERO_FRAC:
-                    mask = U.abs() > _SPARSE_ZERO_THRESHOLD
-                    nz_flat = mask.nonzero(as_tuple=False)
-                    d_idx = nz_flat[:, 0].contiguous()
-                    k_idx = nz_flat[:, 1].contiguous()
-                    vals = U[mask].contiguous()
-                    sparse_list.append((d_idx, k_idx, vals))
-                else:
-                    sparse_list.append(None)
-            else:
-                sparse_list.append(None)
+            sparse_list.append(None)
         self._proj_group_cache_by_dev_dtype[key] = proj_list
         self._proj_sparse_cache_by_dev_dtype[key] = sparse_list
         return proj_list
@@ -3381,74 +3224,8 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
                     B_flat *= int(s)
                 a_flat = a_comp.reshape(B_flat, self.mul_in1, m1)
                 b_flat = b_comp.reshape(B_flat, self.mul_in2, m2)
-                if a_comp.dim() >= 2:
-                    bucket_outputs: list[tuple[tuple[int, int], torch.Tensor]] = []
-                    cuda_supported = True
-                    for bucket in bucket_list[g_idx]:
-                        bucket_segments = bucket["segments"]  # type: ignore[assignment]
-                        bucket_path_indices = bucket["path_indices"]  # type: ignore[assignment]
-                        U_bucket = bucket["U_bucket"]  # type: ignore[assignment]
-                        kdim = int(bucket["kdim"])  # type: ignore[arg-type]
-                        W_bucket = _stack_group_weights(
-                            w_param=w_param,
-                            segments=bucket_segments,
-                            compute_dtype=compute_dtype,
-                        ).to(device=a_comp.device)
-                        gates_bucket = None
-                        if weights is not None:
-                            gates_bucket = _slice_or_index_lastdim(weights, [int(p_idx) for p_idx in bucket_path_indices])
-                            gates_bucket = gates_bucket.reshape(B_flat, len(bucket_path_indices)).to(dtype=compute_dtype)
-                        bucket_out = _tp_cuda_ext_bucket_forward(
-                            backend=self.ictd_tp_backend,
-                            a=a_flat,
-                            b=b_flat,
-                            U_bucket=U_bucket,
-                            W_stack=W_bucket,
-                            gates=gates_bucket,
-                            compute_dtype=compute_dtype,
-                        )
-                        if bucket_out is None:
-                            cuda_supported = False
-                            break
-                        bucket_out = bucket_out.reshape(*batch_shape, self.mul_out, kdim)
-                        bucket_outputs.append(((int(bucket_segments[0][1]), int(bucket_segments[0][2])), bucket_out))
-                    if cuda_supported and bucket_outputs:
-                        for key_ir, bucket_out in bucket_outputs:
-                            bucket_out = bucket_out.to(dtype=dtype) if bucket_out.dtype != dtype else bucket_out
-                            out[key_ir] = out[key_ir] + bucket_out
-                        continue
                 y = None
                 used_fused_mix = False
-                if a_comp.is_cuda and a_comp.dim() >= 2:
-                    if _tp_fused_outer_proj_channel_mix is not None and num_paths_in_group <= 16:
-                        W_stack = _stack_group_weights(
-                            w_param=w_param,
-                            segments=segments,
-                            compute_dtype=compute_dtype,
-                        ).to(device=a_comp.device)
-                        fused_segments = [(int(p_idx), int(l3), int(s), int(e)) for p_idx, l3, _p3, s, e in segments]
-                        out_buf = _tp_fused_outer_proj_channel_mix(
-                            a_flat, b_flat, U, W_stack, fused_segments, k_total, self.mul_out, m1, m2
-                        )
-                        if out_buf is not None:
-                            out_buf = out_buf.to(dtype=dtype) if out_buf.dtype != dtype else out_buf
-                            for seg_idx, (p_idx, l3, p3, s, e) in enumerate(segments):
-                                seg_out = out_buf[:, seg_idx, :, int(s): int(e)]
-                                if weights is not None:
-                                    seg_out = seg_out * weights[..., int(p_idx), None, None]
-                                out[(int(l3), int(p3))] = out[(int(l3), int(p3))] + seg_out
-                            used_fused_mix = True
-                    if not used_fused_mix:
-                        sparse_repr = (sparse_list[g_idx] if _USE_SPARSE_TP else None) if sparse_list is not None else None
-                        if sparse_repr is not None and _tp_fused_outer_proj_sparse is not None:
-                            d_idx, k_idx, vals = sparse_repr
-                            y_flat = _tp_fused_outer_proj_sparse(a_flat, b_flat, d_idx, k_idx, vals, m1, m2, k_total)
-                            if y_flat is not None:
-                                y = y_flat.reshape(*batch_shape, self.mul_in1, self.mul_in2, k_total)
-                        if y is None and _tp_fused_outer_proj is not None:
-                            y_flat = _tp_fused_outer_proj(a_flat, b_flat, U, m1, m2)
-                            if y_flat is not None:
-                                y = y_flat.reshape(*batch_shape, self.mul_in1, self.mul_in2, k_total)
                 if not used_fused_mix:
                     if y is None:
                         U = proj_list[g_idx]  # (m1*m2, K_total)
@@ -3780,32 +3557,6 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                     B_flat *= int(s)
                 a_flat = a_comp.reshape(B_flat, self.channel_mul, 2 * l1 + 1)
                 b_flat = b_comp.reshape(B_flat, 1, 2 * l2 + 1)
-                if _USE_TRITON_CHANNELWISE_TP and _tp_fused_outer_proj_channel_mix is not None and len(segments) <= 16:
-                    W_stack = _stack_group_weights(
-                        w_param=self.weight,
-                        segments=segments,
-                        compute_dtype=compute_dtype,
-                    ).to(device=a_comp.device)
-                    fused_segments = [(int(p_idx), int(l3), int(s), int(e)) for p_idx, l3, _p3, s, e in segments]
-                    out_buf = _tp_fused_outer_proj_channel_mix(
-                        a_flat,
-                        b_flat,
-                        proj_list[g_idx],
-                        W_stack,
-                        fused_segments,
-                        k_total,
-                        self.mul_out,
-                        2 * l1 + 1,
-                        2 * l2 + 1,
-                    )
-                    if out_buf is not None:
-                        out_buf = out_buf.to(dtype=dtype) if out_buf.dtype != dtype else out_buf
-                        for seg_idx, (p_idx, l3, _p3, s, e) in enumerate(segments):
-                            seg_out = out_buf[:, seg_idx, :, int(s): int(e)].reshape(*batch_shape, self.mul_out, int(e) - int(s))
-                            if weights is not None:
-                                seg_out = seg_out * weights[..., int(p_idx), None, None]
-                            out_by_l[int(l3)] = out_by_l[int(l3)] + seg_out
-                        used_fused_mix = True
                 if used_fused_mix:
                     continue
                 gates_all = (
@@ -3813,46 +3564,6 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                     if weights is not None
                     else None
                 )
-                if ensure_grouped_tp_cuda_ext_supported(
-                    backend=self.ictd_tp_backend,
-                    sample=a_flat,
-                    compute_dtype=compute_dtype,
-                    internal_weights=True,
-                    weights=gates_all,
-                ):
-                    bucket_outputs: list[tuple[int, torch.Tensor]] = []
-                    assert bucket_list is not None
-                    for bucket in bucket_list[g_idx]:
-                        bucket_segments = bucket["segments"]  # type: ignore[assignment]
-                        bucket_path_indices = bucket["path_indices"]  # type: ignore[assignment]
-                        U_bucket = bucket["U_bucket"]  # type: ignore[assignment]
-                        kdim = int(bucket["kdim"])  # type: ignore[arg-type]
-                        W_bucket = _stack_group_weights(
-                            w_param=self.weight,
-                            segments=bucket_segments,
-                            compute_dtype=compute_dtype,
-                        ).to(device=a_comp.device)
-                        gates_bucket = None
-                        if gates_all is not None:
-                            gates_bucket = _slice_or_index_lastdim(gates_all, [int(p_idx) for p_idx in bucket_path_indices])
-                        bucket_out = _tp_cuda_ext_bucket_forward(
-                            backend=self.ictd_tp_backend,
-                            a=a_flat,
-                            b=b_flat,
-                            U_bucket=U_bucket,
-                            W_stack=W_bucket,
-                            gates=gates_bucket,
-                            compute_dtype=compute_dtype,
-                        )
-                        if bucket_out is None:
-                            bucket_outputs = []
-                            break
-                        bucket_outputs.append((int(bucket_segments[0][1]), bucket_out.reshape(*batch_shape, self.mul_out, kdim)))
-                    if bucket_outputs:
-                        for l3, bucket_out in bucket_outputs:
-                            bucket_out = bucket_out.to(dtype=dtype) if bucket_out.dtype != dtype else bucket_out
-                            out_by_l[l3] = out_by_l[l3] + bucket_out
-                        continue
 
             m1 = 2 * l1 + 1
             m2 = 2 * l2 + 1
@@ -4078,33 +3789,6 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                     B_flat *= int(s)
                 a_flat = a_comp.reshape(B_flat, self.channel_mul, 2 * l1 + 1)
                 b_flat = b_comp.reshape(B_flat, 1, 2 * l2 + 1)
-                if _USE_TRITON_CHANNELWISE_TP and _tp_fused_outer_proj_channel_mix is not None and len(segments) <= 16:
-                    W_stack = _stack_group_weights(
-                        w_param=self.weight,
-                        segments=segments,
-                        compute_dtype=compute_dtype,
-                        mul_scale=self._mul_path_scale,
-                    ).to(device=a_comp.device)
-                    fused_segments = [(int(p_idx), int(l3), int(s), int(e)) for p_idx, l3, _p3, s, e in segments]
-                    out_buf = _tp_fused_outer_proj_channel_mix(
-                        a_flat,
-                        b_flat,
-                        proj_list[g_idx],
-                        W_stack,
-                        fused_segments,
-                        k_total,
-                        self.mul_out,
-                        2 * l1 + 1,
-                        2 * l2 + 1,
-                    )
-                    if out_buf is not None:
-                        out_buf = out_buf.to(dtype=dtype) if out_buf.dtype != dtype else out_buf
-                        for seg_idx, (p_idx, l3, p3, s, e) in enumerate(segments):
-                            seg_out = out_buf[:, seg_idx, :, int(s): int(e)].reshape(*batch_shape, self.mul_out, int(e) - int(s))
-                            if weights is not None:
-                                seg_out = seg_out * weights[..., int(p_idx), None, None]
-                            out[(int(l3), int(p3))] = out[(int(l3), int(p3))] + seg_out
-                        used_fused_mix = True
                 if used_fused_mix:
                     continue
                 gates_all = (
@@ -4112,52 +3796,6 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                     if weights is not None
                     else None
                 )
-                if ensure_grouped_tp_cuda_ext_supported(
-                    backend=self.ictd_tp_backend,
-                    sample=a_flat,
-                    compute_dtype=compute_dtype,
-                    internal_weights=True,
-                    weights=gates_all,
-                ):
-                    bucket_outputs: list[tuple[tuple[int, int], torch.Tensor]] = []
-                    assert bucket_list is not None
-                    for bucket in bucket_list[g_idx]:
-                        bucket_segments = bucket["segments"]  # type: ignore[assignment]
-                        bucket_path_indices = bucket["path_indices"]  # type: ignore[assignment]
-                        U_bucket = bucket["U_bucket"]  # type: ignore[assignment]
-                        kdim = int(bucket["kdim"])  # type: ignore[arg-type]
-                        W_bucket = _stack_group_weights(
-                            w_param=self.weight,
-                            segments=bucket_segments,
-                            compute_dtype=compute_dtype,
-                            mul_scale=self._mul_path_scale,
-                        ).to(device=a_comp.device)
-                        gates_bucket = None
-                        if gates_all is not None:
-                            gates_bucket = _slice_or_index_lastdim(gates_all, [int(p_idx) for p_idx in bucket_path_indices])
-                        bucket_out = _tp_cuda_ext_bucket_forward(
-                            backend=self.ictd_tp_backend,
-                            a=a_flat,
-                            b=b_flat,
-                            U_bucket=U_bucket,
-                            W_stack=W_bucket,
-                            gates=gates_bucket,
-                            compute_dtype=compute_dtype,
-                        )
-                        if bucket_out is None:
-                            bucket_outputs = []
-                            break
-                        bucket_outputs.append(
-                            (
-                                (int(bucket_segments[0][1]), int(bucket_segments[0][2])),
-                                bucket_out.reshape(*batch_shape, self.mul_out, kdim),
-                            )
-                        )
-                    if bucket_outputs:
-                        for key_ir, bucket_out in bucket_outputs:
-                            bucket_out = bucket_out.to(dtype=dtype) if bucket_out.dtype != dtype else bucket_out
-                            out[key_ir] = out[key_ir] + bucket_out
-                        continue
             m1 = 2 * l1 + 1
             m2 = 2 * l2 + 1
             U3 = active_U.reshape(m1, m2, -1)
@@ -4419,32 +4057,6 @@ class HarmonicChannelWiseTensorProduct(HarmonicFullyConnectedTensorProduct):
                     B_flat *= int(s)
                 a_flat = a_comp.reshape(B_flat, self.channel_mul, 2 * l1 + 1)
                 b_flat = b_comp.reshape(B_flat, 1, 2 * l2 + 1)
-                if _USE_TRITON_CHANNELWISE_TP and _tp_fused_outer_proj_channel_mix is not None and len(segments) <= 16:
-                    W_stack = _stack_group_weights(
-                        w_param=self.weight,
-                        segments=segments,
-                        compute_dtype=compute_dtype,
-                    ).to(device=a_comp.device)
-                    fused_segments = [(int(p_idx), int(l3), int(s), int(e)) for p_idx, l3, s, e in segments]
-                    out_buf = _tp_fused_outer_proj_channel_mix(
-                        a_flat,
-                        b_flat,
-                        proj_list[g_idx],
-                        W_stack,
-                        fused_segments,
-                        k_total,
-                        self.mul_out,
-                        2 * l1 + 1,
-                        2 * l2 + 1,
-                    )
-                    if out_buf is not None:
-                        out_buf = out_buf.to(dtype=dtype) if out_buf.dtype != dtype else out_buf
-                        for seg_idx, (p_idx, l3, s, e) in enumerate(segments):
-                            seg_out = out_buf[:, seg_idx, :, int(s): int(e)].reshape(*batch_shape, self.mul_out, int(e) - int(s))
-                            if weights is not None:
-                                seg_out = seg_out * weights[..., int(p_idx), None, None]
-                            out[int(l3)] = out[int(l3)] + seg_out
-                        used_fused_mix = True
                 if used_fused_mix:
                     continue
                 gates_all = (
@@ -4452,48 +4064,6 @@ class HarmonicChannelWiseTensorProduct(HarmonicFullyConnectedTensorProduct):
                     if weights is not None
                     else None
                 )
-                if ensure_grouped_tp_cuda_ext_supported(
-                    backend=self.ictd_tp_backend,
-                    sample=a_flat,
-                    compute_dtype=compute_dtype,
-                    internal_weights=True,
-                    weights=gates_all,
-                ):
-                    bucket_outputs: list[tuple[int, torch.Tensor]] = []
-                    assert bucket_list is not None
-                    for bucket in bucket_list[g_idx]:
-                        bucket_segments = bucket["segments"]  # type: ignore[assignment]
-                        bucket_path_indices = bucket["path_indices"]  # type: ignore[assignment]
-                        U_bucket = bucket["U_bucket"]  # type: ignore[assignment]
-                        kdim = int(bucket["kdim"])  # type: ignore[arg-type]
-                        W_bucket = _stack_group_weights(
-                            w_param=self.weight,
-                            segments=bucket_segments,
-                            compute_dtype=compute_dtype,
-                        ).to(device=a_comp.device)
-                        gates_bucket = None
-                        if gates_all is not None:
-                            gates_bucket = _slice_or_index_lastdim(gates_all, [int(p_idx) for p_idx in bucket_path_indices])
-                        bucket_out = _tp_cuda_ext_bucket_forward(
-                            backend=self.ictd_tp_backend,
-                            a=a_flat,
-                            b=b_flat,
-                            U_bucket=U_bucket,
-                            W_stack=W_bucket,
-                            gates=gates_bucket,
-                            compute_dtype=compute_dtype,
-                        )
-                        if bucket_out is None:
-                            bucket_outputs = []
-                            break
-                        bucket_outputs.append(
-                            (int(bucket_segments[0][1]), bucket_out.reshape(*batch_shape, self.mul_out, kdim))
-                        )
-                    if bucket_outputs:
-                        for l3, bucket_out in bucket_outputs:
-                            bucket_out = bucket_out.to(dtype=dtype) if bucket_out.dtype != dtype else bucket_out
-                            out[l3] = out[l3] + bucket_out
-                        continue
             m1 = 2 * l1 + 1
             m2 = 2 * l2 + 1
             if active_segments is segments and active_U is proj_list[g_idx]:

@@ -17,7 +17,7 @@ def install(root):
     package.mkdir(exist_ok=True)
     for name in ('pair_mff_torch.cpp', 'pair_mff_torch.h'):
         shutil.copy2(source/'src/ASCEND'/name, package/name)
-    shutil.copy2(source/'src/USER-MFFTORCH/mff_periodic_table.h', package/'mff_periodic_table.h')
+    shutil.copy2(source/'src/ASCEND/mff_periodic_table.h', package/'mff_periodic_table.h')
     marker.write_text('Ascend eager plain pair style\n')
     packages = root/'cmake/Modules/Packages'
     if not packages.is_dir():

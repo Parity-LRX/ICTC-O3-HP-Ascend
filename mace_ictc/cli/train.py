@@ -1,22 +1,8 @@
-r"""Train a baseline ICTC-MACE model (energy + force) from preprocessed H5.
+"""Train a MACE-ICTC model with dynamic eager Ascend FP32 operators.
 
-Standalone training entry point so MACE-ICTC can *train*, not only deploy. Supports
-the make_fx-compiled second-order force step (``--train-makefx-compile``) and the
-size-bucketing that makes it cheap on variable-size data (``--makefx-buckets``).
-
-The model is constructed with the SAME ``ModelConfig`` -> kwarg mapping that the
-deploy-side ``LAMMPS_MLIAP_MFF.from_checkpoint`` uses, and every architecture choice
-is written into the checkpoint's ``model_hyperparameters``, so a model trained here
-reloads bit-for-bit for AOTI / LAMMPS export.
-
-Example
--------
-    python -m mace_ictc.cli.train \
-        --data-dir /path/to/data \           # holds processed_train.h5 (+ processed_val.h5)
-        --channels 64 --lmax 2 --num-interaction 2 \
-        --epochs 50 --batch-size 4 --device cuda --dtype float64 \
-        --train-makefx-compile --makefx-buckets 6 \
-        --checkpoint model.pth
+Read processed_train.h5 and optional processed_val.h5 from --data-dir.
+Single-NPU training supports energy and force losses with second derivatives.
+CPU execution is available as a reference. Multi-NPU training is not qualified.
 """
 
 from __future__ import annotations
@@ -76,9 +62,7 @@ def _setup_distributed(args):
 
     backend = args.ddp_backend
     if backend == "auto":
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-    if backend == "nccl" and not torch.cuda.is_available():
-        raise RuntimeError("DDP backend 'nccl' requires CUDA; use --ddp-backend gloo on CPU")
+        backend = "gloo"
     if not dist.is_initialized():
         dist.init_process_group(backend=backend, init_method="env://")
 
@@ -100,12 +84,8 @@ def _resolve_device(device_arg: str, ddp_info) -> torch.device:
         import torch_npu
         torch.npu.set_device(torch.device(device_arg))
     requested = torch.device(device_arg)
-    if ddp_info["enabled"] and requested.type == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("DDP requested a CUDA device but CUDA is not available")
-        device = torch.device(f"cuda:{ddp_info['local_rank']}")
-        torch.cuda.set_device(device)
-        return device
+    if requested.type not in ("cpu", "npu"):
+        raise ValueError("This library supports npu and cpu devices")
     return requested
 
 
@@ -139,10 +119,10 @@ def _apply_mace_compatible_random_init(
         raise ValueError("--mace-compatible-random-init currently requires --function-type bessel")
     if args.polynomial_cutoff_p <= 0:
         raise ValueError("--mace-compatible-random-init requires --polynomial-cutoff-p > 0")
-    if args.product_backend not in {"ictd-bridge-u", "native-mace", "cueq"}:
+    if args.product_backend not in {"ictd-bridge-u", "native-mace"}:
         raise ValueError(
             "--mace-compatible-random-init currently supports --product-backend "
-            "ictd-bridge-u, native-mace, or cueq"
+            "ictd-bridge-u or native-mace"
         )
     if args.angular_basis != "ictd":
         raise ValueError("--mace-compatible-random-init requires --angular-basis ictd")
@@ -222,8 +202,8 @@ def _set_global_seed(seed: int | None) -> torch.Generator | None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch, 'npu') and torch.npu.is_available():
+        torch.npu.manual_seed_all(seed)
     generator = torch.Generator()
     generator.manual_seed(seed)
     return generator
@@ -393,7 +373,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--product-backend", default="ictd-bridge-u")
     ap.add_argument("--angular-basis", default="ictd", choices=["ictd", "e3nn"],
                     help="Internal angular basis during training. Use e3nn only with fold-capable "
-                         "product backends such as cueq; bridge-U has no e3nn-fold path.")
+                         "the ictd-pure-u product backend; bridge-U uses the ICTC angular basis.")
     ap.add_argument("--use-reduced-cg", action="store_true",
                     help="Use reduced-CG MACE/cuEq symmetric-contraction paths where supported.")
     ap.add_argument("--first-layer-self-connection", action=argparse.BooleanOptionalAction, default=True,
@@ -404,10 +384,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Optional learnable per-l interaction/self-connection scale initialization.")
     ap.add_argument("--conv-tp-scale-init", default="none", choices=["none", "e3nn"],
                     help="Initialize ICTC convolution TP path weights to match e3nn/MACE path scales.")
-    ap.add_argument("--conv-tp-backend", default="pytorch", choices=["pytorch", "cueq"],
-                    help="Interaction conv-TP compute backend: 'pytorch' reference projector path, or "
-                         "'cueq' for the fused cuEquivariance kernel (CUDA only; numerically equivalent, "
-                         "checkpoint-compatible). Saved as ictd_tp_backend in model_hyperparameters.")
+    ap.add_argument("--conv-tp-backend", default="pytorch", choices=["pytorch", "auto"],
+                    help="Reference formula configuration; the NPU runtime selects Ascend operators.")
     ap.add_argument("--freeze-conv-tp-weight", action="store_true",
                     help="Freeze ICTC convolution TP base path weights, matching MACE's external-weight parameterization more closely.")
     ap.add_argument("--operator-plan", choices=("auto", "reference", "generated"), default="auto",
@@ -671,7 +649,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dtype", default="float32", choices=["float32", "float64"])
     ap.add_argument("--ddp", default="auto", choices=["auto", "on", "off"],
                     help="DistributedDataParallel training mode. auto enables DDP when WORLD_SIZE>1.")
-    ap.add_argument("--ddp-backend", default="auto", choices=["auto", "nccl", "gloo"],
+    ap.add_argument("--ddp-backend", default="auto", choices=["auto", "gloo"],
                     help="torch.distributed backend for DDP training.")
     ap.add_argument("--ddp-find-unused-parameters", action="store_true",
                     help="Pass find_unused_parameters=True to DistributedDataParallel.")
@@ -882,10 +860,10 @@ def main(argv=None):
         no_atomic_inter_shift=args.no_atomic_inter_shift,
         max_samples=args.scaling_max_samples,
     )
-    if args.angular_basis == "e3nn" and args.product_backend not in {"cueq", "ictd-pure-u"}:
+    if args.angular_basis == "e3nn" and args.product_backend not in {"ictd-pure-u"}:
         raise ValueError(
-            "--angular-basis e3nn requires --product-backend cueq or ictd-pure-u. "
-            "bridge-U has no e3nn-fold path; use bridge-U for canonical parity or cueq for the "
+            "--angular-basis e3nn requires --product-backend ictd-pure-u. "
+            "bridge-U has no e3nn-fold path; use bridge-U for canonical parity or ictd-pure-u for the "
             "e3nn-folded product path."
         )
     if args.long_range_mode != "none":
@@ -1197,7 +1175,7 @@ def main(argv=None):
         operator_plan=args.operator_plan,
         generated_layout=args.generated_layout,
         backward_targets=args.backward_targets,
-        require_train_makefx_compile=bool(args.train_makefx_compile and args.product_backend == "cueq"),
+        require_train_makefx_compile=False,
         makefx_max_slots=args.makefx_max_slots,
         train_sampler=sampler, checkpoint_path=args.checkpoint, log_interval=args.log_interval,
         evals_per_epoch=args.evals_per_epoch,

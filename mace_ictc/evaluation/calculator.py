@@ -1,22 +1,7 @@
-"""ASE Calculator wrapper for E3NN models.
+"""ASE calculator for loaded MACE-ICTC models.
 
-Supported tensor product modes (all modes that can be loaded via
-``build_e3trans_from_checkpoint``):
-  spherical, spherical-save, spherical-save-cue,
-  partial-cartesian, partial-cartesian-loose,
-  pure-cartesian, pure-cartesian-sparse, pure-cartesian-sparse-save,
-  pure-cartesian-ictd, pure-cartesian-ictd-save
-
-The ``MyE3NNCalculator`` also supports models with external fields / physical tensor heads:
-  * **External field** — pass ``external_tensor`` (shape ``(rank_dim,)`` or
-    ``(1, rank_dim)`` on the device) to ``__init__``.  This tensor is passed
-    through to ``model.forward(external_tensor=...)`` every ``calculate()``
-    call.  Set ``external_tensor=None`` (default) for models that were trained
-    without external fields.
-  * **Physical tensor outputs** — pass ``return_physical_tensors=True`` to
-    ``__init__`` for ICTC models trained with ``--physical-tensors``.  The
-    results are stored in ``calculator.results["physical_tensors"]`` as a
-    ``dict[str, dict[int, np.ndarray]]`` (name → l → array).
+Supports energies, forces and the model's optional physical tensor outputs.
+Use the dedicated Ascend LAMMPS engine for distributed HCCL deployment.
 """
 
 import logging
@@ -35,10 +20,10 @@ logger = logging.getLogger(__name__)
 
 
 class MyE3NNCalculator(Calculator):
-    """ASE Calculator wrapper for all FSCETP tensor product modes.
+    """ASE calculator wrapper for MACE-ICTC models.
 
     Args:
-        model: Loaded e3trans model (any supported tensor product mode).
+        model: Loaded MACE-ICTC model.
         atomic_energies_dict: Mapping from atomic number (int) to E0 (float).
         device: Torch device.
         max_radius: Neighbour-search cutoff (Å).
@@ -169,40 +154,3 @@ class MyE3NNCalculator(Calculator):
                 }
                 for name, l_dict in physical_out.items()
             }
-
-
-class DDPCalculator(Calculator):
-    """
-    ASE Calculator 的 DDP 版本：仅在 rank 0 与 ASE 交互，每次 calculate() 时通过
-    run_one_ddp_inference_from_ase_atoms 与其它 rank 协同完成推理（多卡分摊大结构）。
-    需用 torchrun 启动，且非 rank 0 进程需在别处运行 worker 循环。
-    """
-
-    implemented_properties = ["energy", "forces"]
-
-    def __init__(self, model, atomic_energies_dict, device, max_radius, **kwargs):
-        Calculator.__init__(self, **kwargs)
-        self.model = model
-        self.device = device
-        self.max_radius = max_radius
-        self.atomic_energies_dict = atomic_energies_dict or {}
-        self.model.eval()
-        for p in self.model.parameters():
-            p.requires_grad = False
-
-    def calculate(self, atoms=None, properties=("energy", "forces"), system_changes=all_changes):
-        super().calculate(atoms, properties, system_changes)
-        from mace_ictc.cli.inference_ddp import run_one_ddp_inference_from_ase_atoms
-        dtype = next(self.model.parameters()).dtype
-        energy, forces = run_one_ddp_inference_from_ase_atoms(
-            self.atoms,
-            self.model,
-            self.max_radius,
-            self.device,
-            dtype,
-            return_forces=True,
-            atomic_energies_dict=self.atomic_energies_dict,
-        )
-        if energy is not None and forces is not None:
-            self.results["energy"] = energy
-            self.results["forces"] = forces.cpu().numpy()

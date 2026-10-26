@@ -14,7 +14,8 @@ exposes standalone NPU operators. The original source checkout is unchanged.
 
 Original notices and the PolyForm Noncommercial / preserved MIT license scopes
 remain in this derivative. The unused bundled NVIDIA projection helper is
-omitted; optional cuEquivariance conversion delegates to upstream MACE instead.
-CUDA and LAMMPS files inherited from upstream are
-not evidence of Ascend deployment coverage. Private validation harnesses,
+omitted. Retired CUDA/Triton kernels, CUDA/Kokkos/ML-IAP deployment code and
+compiled-export entry points have been removed from this distribution. The
+plain Ascend LAMMPS interface is maintained separately from those old paths.
+Private validation harnesses,
 measurements and cluster credentials are maintained outside this library.
