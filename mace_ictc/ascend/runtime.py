@@ -175,6 +175,7 @@ def configure_model(model, *, training=False, policy="auto", capture=False,
             "edge_chunk_size": ("auto" if edge_chunk_size is None else edge_chunk_size) if selected else None,
             "kernel_backend": ("ascendc" if is_enabled() else "triton_gemm") if selected else "reference",
             "ascendc_mode": mode() if selected and is_enabled() else None,
-            "tensor_product_adjoint": ("automatic" if is_enabled() and mode()=="performance" else
+            "tensor_product_adjoint": ("chunk_recompute" if is_enabled() and mode()=="capacity" and not training else
+                                       "automatic" if is_enabled() and mode()=="performance" else
                                        "analytic" if native_graph_enabled() or not training else "autograd") if selected else None,
             "counts": {"interactions": len(getattr(core, "interactions", ()))}}

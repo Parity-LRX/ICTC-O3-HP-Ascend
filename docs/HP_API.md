@@ -37,7 +37,7 @@ This process-wide opt-in selects an execution mode:
 | Mode | Tensor products and graph messages | Symmetric contractions | Dense transforms |
 | --- | --- | --- | --- |
 | `performance` (default) | Channel-contiguous grouped GEMMs; Vector gate/reduction epilogues for large working sets | Ascend C vector kernels | CANN GEMMs with analytic adjoints |
-| `capacity` | Fused Ascend C gather, tensor product and atomic accumulation | Ascend C vector kernels | CANN GEMMs with analytic adjoints |
+| `capacity` | Grouped GEMMs with chunk recomputation for inference; native recursive adjoints for training | Ascend C vector kernels | CANN GEMMs with analytic adjoints |
 | `native` | Fused Ascend C graph kernels | Ascend C vector kernels | Ascend C FP32 Cube kernels |
 
 All three modes use native direction polynomials and nonlinearities. Choose a
@@ -54,6 +54,21 @@ The native Cube implementation specializes every transpose combination so that
 the Host tiling, MatmulType and runtime flags match for FP32. It also enables
 the SDK's cyclic ND-to-NZ transfer path for source row strides above 65535
 elements, and explicitly disables HF32. Bias uses a separate FP32 vector kernel.
+
+### Capacity inference
+
+Capacity mode saves the original message inputs and recomputes one edge chunk
+at a time for force gradients. Completed chunks are released before the next
+chunk is evaluated. Automatic chunk sizes use the actual channel and angular
+widths, device memory and current allocations, including the live gate-gradient
+buffer and node-layout buffers. A tight memory budget retains the native sparse
+graph map. Set `message_chunk_edges` explicitly to override automatic sizing.
+
+Model training retains the native higher-order schedule. Standalone graph
+operators retain differentiable second and third derivatives through native
+recursive adjoints. Trainable tensor-product coefficients, live masks and empty
+graphs retain their existing paths. Parameter objects, coupling coefficients,
+state dictionary names and FP32 arithmetic are unchanged.
 
 ### UB tiling
 

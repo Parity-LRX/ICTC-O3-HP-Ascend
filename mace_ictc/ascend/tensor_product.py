@@ -181,7 +181,10 @@ def graph_message(owner, features, harmonics, gates, src, dst, mask=None,
             return channel_message(owner,features,harmonics,gates,src,dst,mask,edge_chunk_size=chosen)
     if (native_graph_enabled() and getattr(owner,'_ascend_tp_preproject',True)
             and (mask is None or not mask.requires_grad)):
-        from mace_ictc.ascendc.graph import graph_message as native_graph
+        if mode()=='capacity':
+            from .capacity_message import graph_message as native_graph
+        else:
+            from mace_ictc.ascendc.graph import graph_message as native_graph
         return native_graph(owner,features,harmonics,gates,src,dst,mask,edge_chunk_size=edge_chunk_size)
     sample = next(iter(features.values()))
     if edge_chunk_size is None:

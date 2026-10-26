@@ -22,8 +22,9 @@ Python packages are installed together.
 ## Performance on Ascend
 
 All results use Ascend 910B3 and FP32 with HF32 disabled. Performance mode
-prioritizes throughput; capacity mode reduces intermediate storage.
-The figures report measurements from the v0.1.0 release.
+prioritizes throughput; capacity inference uses chunk recomputation to bound
+intermediate storage. Chunk sizes adapt to tensor widths and available device
+memory. The figures below report measurements from the v0.1.0 release.
 
 ### O(3) operators
 
