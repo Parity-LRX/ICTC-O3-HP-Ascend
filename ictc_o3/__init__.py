@@ -1,7 +1,13 @@
-"""Standalone ICTC-O3 operators optimized for Ascend NPUs.
+"""Standalone ICTC-O3 operators and native resources for Ascend NPUs.
 
-See docs/O3_API.md for operators and ictc_o3.ascendc for native activation.
+Import and execution do not depend on mace_ictc. See docs/O3_API.md.
 """
+import torch
+
+# e3nn 0.4.4 stores slice objects in its immutable coefficient archive.
+if hasattr(torch.serialization, "add_safe_globals"):
+    torch.serialization.add_safe_globals([slice])
+
 from .operators import *
 from .operators import __all__
 

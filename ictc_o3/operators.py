@@ -2,9 +2,9 @@
 import torch
 import torch.nn.functional as F
 
-from mace_ictc.ascend.linear import channel_linear, species_channel_linear
-from mace_ictc.ascend.runtime import require_npu_fp32, strict_fp32
-from mace_ictc.ascend.tensor_product import tensor_product, graph_message
+from ictc_o3.backends.ascend.linear import channel_linear, species_channel_linear
+from ictc_o3.backends.ascend.runtime import require_npu_fp32, strict_fp32
+from ictc_o3.backends.ascend.tensor_product import tensor_product, graph_message
 def _degree(value, name):
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ValueError(f"{name} must be a nonnegative integer")
@@ -24,7 +24,7 @@ class EdgeTensorProduct(torch.nn.Module):
     """
     def __init__(self, tp, *, input_lmax, edge_lmax, layout="ir_mul"):
         super().__init__()
-        from mace_ictc.models.ictd_irreps import EdgeWeightedPathPreservingTensorProduct
+        from ictc_o3.basis.ictd_irreps import EdgeWeightedPathPreservingTensorProduct
         if not isinstance(tp, EdgeWeightedPathPreservingTensorProduct):
             raise TypeError("Expected an ICTC path-preserving tensor product")
         _degree(input_lmax, "input_lmax")
@@ -50,7 +50,7 @@ class EdgeTensorProduct(torch.nn.Module):
         _degree(output_lmax, "output_lmax")
         if torch.device(device).type != "npu":
             raise ValueError("This operator factory requires an Ascend NPU")
-        from mace_ictc.models.ictd_irreps import EdgeWeightedPathPreservingTensorProduct
+        from ictc_o3.basis.ictd_irreps import EdgeWeightedPathPreservingTensorProduct
         paths = [(i, j, k) for i in range(input_lmax+1) for j in range(edge_lmax+1)
                  for k in range(output_lmax+1) if abs(i-j) <= k <= i+j and (i+j+k)%2 == 0]
         tp = EdgeWeightedPathPreservingTensorProduct(
@@ -127,11 +127,11 @@ class EdgeTensorProduct(torch.nn.Module):
         return result
 
     def forward(self, features, harmonics, gates):
-        from mace_ictc.ascendc.runtime import is_enabled, mode
+        from ictc_o3.ascendc.runtime import is_enabled, mode
         if (is_enabled() and mode() == 'performance'
                 and getattr(self.tp, '_ascend_tp_preproject', True)
                 and getattr(self.tp, '_ascend_tp_schedule', 'structured') == 'structured'):
-            from mace_ictc.ascend.packed_tensor_product import tensor_product as packed_product
+            from ictc_o3.backends.ascend.packed_tensor_product import tensor_product as packed_product
             return packed_product(self, features, harmonics, gates)
         blocks = tensor_product(self.tp, self._blocks(features),
                                 self._harmonics(harmonics, features.shape[0]), gates)
@@ -176,18 +176,18 @@ def direction_harmonics(directions, lmax, *, policy="auto"):
         raise ValueError("policy must be auto, generated or reference")
     if policy != "reference":
         require_npu_fp32(directions)
-        from mace_ictc.models.generated_direction_harmonics import generated_direction_harmonics
+        from ictc_o3.ops.generated_direction_harmonics import generated_direction_harmonics
         result = generated_direction_harmonics(directions, lmax)
         if result is not None:
             return result
         if policy == "generated":
             raise ValueError("Ascend harmonics require eager NPU FP32 and Triton-Ascend")
-    from mace_ictc.models.ictd_irreps import direction_harmonics_all
+    from ictc_o3.basis.ictd_irreps import direction_harmonics_all
     return direction_harmonics_all(directions, lmax)
 
 
 def configure_symmetric_contraction(module, *, policy="auto", training=False):
-    from mace_ictc.models.pure_cartesian_ictd_fix import ICTDBridgeUSymmetricContractionSO3
+    from ictc_o3.ops.symmetric_contraction import ICTDBridgeUSymmetricContractionSO3
     if not isinstance(module, ICTDBridgeUSymmetricContractionSO3):
         raise TypeError("Expected an ICTC bridge-U symmetric contraction")
     if policy not in ("auto", "generated", "reference"):
@@ -211,7 +211,7 @@ def create_symmetric_contraction(*, num_elements, lmax, target_lmax=None, channe
     _degree(lmax, "lmax")
     target_lmax = lmax if target_lmax is None else target_lmax
     _degree(target_lmax, "target_lmax")
-    from mace_ictc.models.pure_cartesian_ictd_fix import ICTDBridgeUSymmetricContractionSO3
+    from ictc_o3.ops.symmetric_contraction import ICTDBridgeUSymmetricContractionSO3
     module = ICTDBridgeUSymmetricContractionSO3(num_elements=num_elements, channels=channels,
         lmax=lmax, target_lmax=target_lmax, correlation=correlation).to(device=device, dtype=torch.float32)
     configure_symmetric_contraction(module, policy=policy, training=training)
@@ -222,9 +222,9 @@ def normalized_silu(features, scale=1.):
     require_npu_fp32(features)
     if not isinstance(scale, (int, float)) or isinstance(scale, bool):
         raise TypeError("scale must be a fixed numeric scalar")
-    from mace_ictc.ascendc.runtime import is_enabled
+    from ictc_o3.ascendc.runtime import is_enabled
     if is_enabled():
-        from mace_ictc.ascendc.elementwise import normalized_silu as native_silu
+        from ictc_o3.ascendc.elementwise import normalized_silu as native_silu
         return native_silu(features,scale)
     return F.silu(features)*float(scale)
 

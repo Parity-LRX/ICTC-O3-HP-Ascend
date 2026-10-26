@@ -105,8 +105,9 @@ Use these layers in your own equivariant network without constructing a MACE
 model. The [standalone O(3) API](docs/O3_API.md) covers tensor products, graph
 messages, symmetric contractions, direction harmonics, channel linear layers
 and scalar activations, with tensor layouts and gradient examples.
-Both namespaces ship in one distribution and share implementation modules and
-native kernels.
+Both namespaces ship in one distribution. `ictc_o3` owns the operator
+implementations, basis data and native kernels; standalone calls import no
+`mace_ictc` modules. The MACE-ICTC framework uses these same operators.
 
 ```python
 import torch_npu

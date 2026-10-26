@@ -11,8 +11,18 @@ mace_ictc/     # MACE-ICTC models, training, conversion and deployment
 ```
 
 Both packages are installed by the same `ictc-o3-hp-ascend` distribution.
-The operator API shares implementation modules, basis data and native kernels
-with `mace_ictc`.
+Operator implementations, fixed basis data, derivative utilities and native
+kernels are owned by `ictc_o3`. Standalone import and execution do not import
+`mace_ictc` or require the MACE model package. The model package consumes these
+operators; its former operator module paths remain compatibility aliases.
+
+```text
+ictc_o3/basis/             # Fixed bases, coupling coefficients and layouts
+ictc_o3/ops/               # Symmetric contractions and mathematical plans
+ictc_o3/autograd/          # Derivative dependency utilities
+ictc_o3/backends/ascend/   # Eager NPU execution schedules
+ictc_o3/ascendc/           # Ascend C source, builder, loader and native adjoints
+```
 
 ## 1. Install and enable the high-performance backend
 
@@ -59,7 +69,10 @@ path reuse that library even if `ICTC_ASCENDC_LIBRARY` changes. Loading another
 library explicitly in the same process raises an error.
 `hardware(device=None)` returns `(UB capacity in bytes, Vector Core count)`
 for the current NPU or a supplied NPU index, device string or `torch.device`.
-These entry points share the same backend state as `mace_ictc.ascendc`.
+The legacy `mace_ictc.ascendc` entry points alias this backend and share its
+library, execution mode and hardware cache. Former tensor-product and
+contraction class paths remain loadable for existing serialized modules;
+new standalone modules serialize with `ictc_o3` class paths.
 Importing these backend entry points does not build or load the native library.
 
 `performance` is the default mode for training and inference. It combines

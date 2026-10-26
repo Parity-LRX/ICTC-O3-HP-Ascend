@@ -9,8 +9,10 @@ This independent Ascend port starts from the original ICTC-O3-HP library:
 - Ascend distribution version: 0.1.0
 
 The original Python namespace and parameter schema are retained for checkpoint
-compatibility. `mace_ictc/ascend/` contains the new device backend; `ictc_o3/`
-exposes standalone NPU operators. The original source checkout is unchanged.
+compatibility. `ictc_o3/` owns the standalone operators, Ascend device backend,
+fixed basis data and native Ascend C sources. The old `mace_ictc` operator
+paths forward to these implementations; MACE model configuration remains in
+`mace_ictc`. The original source checkout is unchanged.
 
 Project-owned code and documentation in this Ascend distribution are offered
 under MIT by the project rights holder. Original third-party MIT notices remain
