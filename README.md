@@ -10,10 +10,10 @@ Python packages are installed together.
 
 - Weighted O(3) tensor products: 23.18× faster forward and 18.37× faster forward
   plus input gradients than MindChemistry PyNative on Ascend 910B3.
-- MACE training and inference: 2.80× faster full energy-and-force training and
-  2.15× faster inference than original PyTorch MACE at the reported C64 points.
+- MACE training and inference: up to 4.76× faster full energy-and-force training
+  and 4.48× faster inference than original PyTorch MACE/e3nn in the four-model scan.
 - Official MACE-MH-1: all six heads retained, 2.05× faster energy-and-force
-  inference; capacity mode uses 6.13 GiB versus 31.71 GiB at 4,000 atoms.
+  inference; release capacity measurements use 6.13 GiB versus 31.71 GiB at 4,000 atoms.
 - Multi-NPU LAMMPS: 6.64× speedup and 83.0% efficiency on eight NPUs,
   reaching 248,559 atom-steps/s at 32,768 atoms.
 - Dynamic execution: changing atom counts and neighbor graphs, runtime model
@@ -24,33 +24,72 @@ Python packages are installed together.
 All results use Ascend 910B3 and FP32 with HF32 disabled. Performance mode
 prioritizes throughput; capacity inference uses chunk recomputation to bound
 intermediate storage. Chunk sizes adapt to tensor widths and available device
-memory. The figures below report measurements from the v0.1.0 release.
+memory. Atom counts and neighbor graphs remain dynamic; `torch.compile` is disabled.
 
 ### O(3) operators
 
-![O(3) tensor-product throughput on Ascend](docs/figures/ascend_mindchemistry_tp.svg)
+![Standalone tensor-product throughput: current HP and e3nn on one Ascend 910B3.](docs/figures/ascend-tp-throughput.svg)
 
-At C64/lmax 2 and 65,536 edges, an isolated repeat measures 12.20 ms versus
-282.92 ms for the weighted tensor-product forward, and 45.12 ms versus
-828.93 ms for forward plus gradients of all three inputs: 23.18× and 18.37×
-speedups over MindChemistry PyNative. The curves cover C64 and C128, angular
-degrees 1–3, both HP modes and both MindSpore PyNative and Graph execution.
+At the largest shared sizes in each of four configurations, HP delivers
+1.87–3.90× e3nn's forward throughput and 2.19–3.85× its forward-plus-VJP
+throughput. C128/lmax 3 reaches 2.70 million TP instances/s at 262,144
+instances, 3.90× e3nn. VJP includes gradients of all three inputs. The
+horizontal axis counts independent TP instances.
+
+<details>
+<summary>MindChemistry comparison</summary>
+
+![O(3) tensor-product throughput against MindChemistry on Ascend.](docs/figures/ascend_mindchemistry_tp.svg)
+
+The v0.1.0 MindChemistry comparison covers C64/C128, angular degrees 1–3,
+and both MindSpore PyNative and Graph execution. At C64/lmax 2 and 65,536
+edges, an isolated repeat measures 12.20 ms versus 282.92 ms for forward,
+and 45.12 ms versus 828.93 ms for forward plus all-input gradients:
+23.18× and 18.37× speedups over MindChemistry PyNative.
+
+</details>
 
 ### MACE training, inference and memory
 
-![MACE throughput and memory on Ascend](docs/figures/ascend_pytorch_mace.svg)
+![Single-Ascend C64/lmax-2 training and energy-and-force inference throughput and peak allocated memory.](docs/figures/ascend-training-inference.svg)
 
-The same initialized MACE weights yield 2.15× faster energy-and-force inference
-at 13,824 atoms and 2.80× faster full training at 4,096 atoms. Training includes
-the energy-and-force loss, mixed second derivatives, AdamW and `zero_grad`.
+C64/lmax 2 reaches 54,823 atom-steps/s for energy-and-force inference at
+16,384 atoms, 3.62× original MACE/e3nn. Full training reaches 18,486
+atom-steps/s at 8,192 atoms, 3.67× the baseline. Training includes energy,
+forces, the energy-and-force loss, mixed second derivatives and AdamW.
 
-Official MACE-MH-1 inference reaches 7,440 atom-steps/s at 4,000 atoms in
-performance mode, a 2.05× speedup. Capacity mode reaches 4,265 atom-steps/s and
-reduces peak Torch allocation from 31.71 GiB to 6.13 GiB. Both HP modes complete
-the 6,912-atom sample; original PyTorch MACE reaches OOM there.
+Performance mode completes 32,768-atom C64/lmax-2 inference and
+16,384-atom training. Capacity mode completes 65,536-atom inference at
+27,678 atom-steps/s. Its curves use the updated chunk-recomputation implementation.
 
-Standalone factory-model sweeps also complete 65,536-atom C64/lmax-2 inference
-in capacity mode, and 16,384-atom full C64/lmax-2 training in performance mode.
+<details>
+<summary>Full model scan: throughput and memory</summary>
+
+![Training and energy-and-force inference throughput across four MACE configurations.](docs/figures/ascend-mace-throughput.svg)
+
+The scan covers C64/lmax 2, C128/lmax 2, C128/lmax 3 and C256/lmax 3,
+with two residual interactions and correlation 3. At C128/lmax 3 and
+2,048 atoms, HP performance mode is 4.48× faster for inference and
+4.76× faster for full training than original MACE/e3nn.
+
+![Peak allocated memory versus atom count across four MACE configurations.](docs/figures/ascend-mace-memory.svg)
+
+Curves connect measured sizes and end at their last successful sample.
+Crosses in the main memory panels mark observed e3nn and performance-mode
+OOM sizes. The updated capacity curves confirm successful sizes;
+capacity-mode OOM boundaries have not been remeasured.
+
+</details>
+
+### Pretrained MACE-MH-1
+
+![Pretrained MACE-MH-1 energy-and-force inference throughput and peak allocated memory.](docs/figures/ascend-mh1-throughput.svg)
+
+Official MACE-MH-1 retains all six heads. The v0.1.0 measurements reach
+7,440 atom-steps/s at 4,000 atoms in performance mode, a 2.05× speedup over
+original PyTorch MACE. The release capacity implementation reaches 4,265
+atom-steps/s and uses 6.13 GiB versus 31.71 GiB for original MACE.
+Both HP modes complete the 6,912-atom sample; original MACE reaches OOM there.
 
 ### Multi-NPU molecular dynamics
 
@@ -65,7 +104,7 @@ features, their adjoints and ghost-force contributions between NPUs.
 <details>
 <summary>Benchmark setup and numerical checks</summary>
 
-O(3) operators use unchanged MindChemistry 0.2.0 from the official
+The MindChemistry comparison uses unchanged MindChemistry 0.2.0 from the official
 [`r0.7` source](https://github.com/mindspore-ai/mindscience/tree/b233dc1ab152dfe29e0ff2cafb55c780dff34c67/MindChemistry)
 with MindSpore 2.10.0. The path-preserving `uvu` tensor products match
 natural-parity coupling paths, normalization, channel counts and live external
@@ -76,20 +115,44 @@ shape and excluded from timing. The PyNative C128/lmax-3 VJP endpoint reaches
 OOM at 65,536 edges. CPU FP64 basis/path checks and input gradients agree to
 relative errors around `1e-7`.
 
-The whole-model baseline uses original `mace-torch==0.3.14` and `e3nn==0.5.9`,
-with its usual scripted operators and no `torch.compile`. The initialized model
-uses C64, lmax 2, two interactions, correlation 3, full CG paths, eight Bessel
-functions, a 4.5 Å cutoff and 56 directed neighbors per atom. MH-1 uses the
-same official checkpoint, the `omat_pbe` head, a 6 Å cutoff and 78 neighbors per
-atom. Inference freezes parameters and computes both energy and forces.
-Each point is the median of five synchronized calls after two warmups.
-Training restores initial weights outside the timed step. Peak Torch allocation
-includes resident models, graphs, optimizer state and that fixed snapshot;
-external CANN and driver allocations are excluded. OOM markers identify the
-first failed sample. Model comparisons use one NPU per model; graph construction,
-neighbor lists, transfers and compilation are outside timing. Eight-NPU
-allocations run independent workers. Factory-model capacity samples use a
-separate initialized model and sweep.
+The broad scan uses original `mace-torch==0.3.14` and `e3nn==0.5.9`,
+with the baseline's usual scripted operators and no `torch.compile`.
+The same initialized physical models are related by an explicit checkpoint
+conversion and checked for energies, forces, coordinate second derivatives
+and mapped parameter gradients. Models use two residual interactions,
+correlation 3, full CG paths, eight Bessel functions, radial MLP widths
+`[64,64,64]`, a 4.5 Å cutoff, H/C/O species and 56 directed neighbors/atom
+(neighbor normalization 50). No long-range term or repulsion is added.
+Inference freezes parameters and computes energy and forces. Training includes
+`zero_grad`, the energy-and-force loss, backward and AdamW. Equivalent initial
+functions and gradients do not imply identical AdamW trajectories after a
+parameter rescaling.
+
+Whole-model timings are medians of five individually synchronized calls after
+at least two seconds and three calls of warmup. The largest C256/lmax-3
+capacity sample uses one warmup and three timed calls. Separate three-call-block results
+are not mixed into these curves. The broad performance/training data and
+standalone TP data retain their qualified production paths; all 21 capacity
+points use the updated implementation. Peak PyTorch allocation includes
+resident graph/model tensors and, for training, optimizer state; external CANN
+and driver allocations are excluded. Each new size
+runs in a fresh process. Graph construction, neighbor lists, transfers and
+compilation are excluded. Each measurement uses a single NPU; concurrent workers
+are independent measurements.
+
+Standalone TP curves use natural-parity, path-preserving `uvu` products,
+lmax 2/3, and live external path weights. Forward-plus-VJP includes gradients
+of features, harmonics and weights. TP inputs and basis/layout preparation
+are outside timing. Each point uses at least two seconds of warmup, followed
+by three rounds of three individually synchronized calls; the reported value
+is the median of round medians. CPU FP64 small cases and full-batch sampled
+outputs/gradients are checked. Whole-model points beyond baseline OOM retain
+small-case CPU FP64 and full-size finite checks.
+
+MACE-MH-1 measurements retain the v0.1.0 protocol: the same official checkpoint,
+the `omat_pbe` head, a 6 Å cutoff and 78 neighbors/atom; median of five
+synchronized calls after two warmups. These pretrained measurements are
+separate from the four randomly initialized models above.
 
 Multi-NPU results use complete dynamic LAMMPS runs on one eight-NPU node,
 with 1/2/4/8 active NPUs, a 4.5 Å cutoff, 0.5 Å skin and 0.125 atoms/Å³.
