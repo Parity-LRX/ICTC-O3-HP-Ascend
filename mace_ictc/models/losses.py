@@ -35,3 +35,25 @@ def weighted_mse_loss_stats(
     loss_sum = (loss * expanded_weights).sum()
     normalizer = expanded_weights.sum()
     return loss_sum / normalizer.clamp_min(1e-12), loss_sum, normalizer
+
+
+def smooth_l1_loss_stats(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    beta: float = 0.5,
+    weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return weighted SmoothL1 mean, summed loss, and summed normalizer."""
+    loss = F.smooth_l1_loss(pred, target, beta=beta, reduction="none")
+    if weights is None:
+        loss_sum = loss.sum()
+        normalizer = torch.tensor(float(loss.numel()), device=loss.device, dtype=loss.dtype)
+        return loss_sum / normalizer.clamp_min(1e-12), loss_sum, normalizer
+    weight_tensor = weights.to(device=loss.device, dtype=loss.dtype)
+    while weight_tensor.dim() < loss.dim():
+        weight_tensor = weight_tensor.unsqueeze(-1)
+    expanded_weights = torch.ones_like(loss) * weight_tensor
+    loss_sum = (loss * expanded_weights).sum()
+    normalizer = expanded_weights.sum()
+    return loss_sum / normalizer.clamp_min(1e-12), loss_sum, normalizer

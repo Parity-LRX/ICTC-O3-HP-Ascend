@@ -8,7 +8,6 @@ import logging
 from collections.abc import Mapping
 from typing import Any, Dict, Optional
 
-import numpy as np
 import torch
 from ase.calculators.calculator import Calculator, all_changes
 

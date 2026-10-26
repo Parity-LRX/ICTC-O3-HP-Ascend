@@ -9,8 +9,6 @@ import itertools
 
 import torch
 from e3nn import o3
-from torch.fx.experimental.proxy_tensor import get_proxy_mode
-from torch._subclasses.fake_tensor import is_fake
 
 from ictc_o3.basis._mace_cg import _wigner_nj
 from .sparse_weighted_product import sparse_product_plan

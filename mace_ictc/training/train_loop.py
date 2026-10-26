@@ -43,7 +43,7 @@ from torch.optim.swa_utils import SWALR
 
 from mace_ictc.utils.scatter import scatter
 from mace_ictc.utils.tensor_utils import map_tensor_values
-from mace_ictc.utils.fidelity import smooth_l1_loss_stats
+from mace_ictc.models.losses import smooth_l1_loss_stats
 
 log = logging.getLogger(__name__)
 
@@ -1477,8 +1477,6 @@ class ForceTrainer:
             "_per_graph_diagnostics": per_graph_diagnostics,
         }
 
-    def _loss_term(self, pred, target):
-        return self._loss_term_stats(pred, target)[0]
 
     def _loss_term_stats(self, pred, target):
         if self.loss_type == "mse":

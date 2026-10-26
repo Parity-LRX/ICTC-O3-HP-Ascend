@@ -22,24 +22,6 @@ def _irreps_total_dim(channels: int, lmax: int) -> int:
     return channels * (lmax + 1) ** 2
 
 
-def resolve_save_multiple_mix_channels(
-    channels: int,
-    num_interaction: int,
-    requested_mix_channels: int | None,
-) -> int:
-    channels = int(channels)
-    num_interaction = int(num_interaction)
-    if requested_mix_channels is not None:
-        return int(requested_mix_channels)
-    # Default bottleneck width scales with interaction depth while remaining
-    # narrower than the full concatenated input.
-    return max(1, math.ceil(channels * num_interaction / 2))
-
-
-
-
-
-
 class SO3BlockRMSNorm(nn.Module):
     """Per-l block RMS norm for flattened SO(3) features."""
 

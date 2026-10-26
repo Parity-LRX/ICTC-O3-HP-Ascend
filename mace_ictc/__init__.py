@@ -11,18 +11,6 @@ __version__ = "0.1.0"
 __hp_api_version__ = 1
 
 import torch
-if not hasattr(torch, "compiler"):
-    class _CompilerShim:
-        @staticmethod
-        def disable(fn=None, recursive=True):  # type: ignore[no-untyped-def]
-            if fn is None:
-                def decorator(inner):  # type: ignore[no-untyped-def]
-                    return inner
-
-                return decorator
-            return fn
-
-    torch.compiler = _CompilerShim()  # type: ignore[attr-defined]
 if hasattr(torch.serialization, 'add_safe_globals'):
     torch.serialization.add_safe_globals([slice])
 

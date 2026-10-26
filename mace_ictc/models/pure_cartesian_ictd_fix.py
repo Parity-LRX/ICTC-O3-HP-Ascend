@@ -17,7 +17,6 @@ from mace_ictc.models.ictd_irreps import (
     EdgeWeightedPathPreservingTensorProduct,
     EquivariantChannelLinearSO3,
     EquivariantChannelLinearSO3Rect,
-    HarmonicElementwiseProduct,
     HarmonicPathWeightedTensorProduct,
     direction_harmonics_all,
     ictd_u_matrix_so3,
@@ -30,10 +29,8 @@ from mace_ictc.models.pure_cartesian_ictd_layers import (
     _merge_irreps,
     _split_irreps,
     apply_channel_adapter_per_l,
-    resolve_save_multiple_mix_channels,
 )
 from mace_ictc.models._mace_symmetric_contraction import MaceSymmetricContraction
-from mace_ictc.models.mlp import MainNet
 from mace_ictc.utils.scatter import scatter
 from mace_ictc.models.long_range import build_long_range_module
 from mace_ictc.models.dispersion import build_long_range_dispersion, normalize_dispersion_mode
@@ -179,8 +176,6 @@ def _init_element_conditioned_mace_style_(module: nn.Module | None) -> None:
                 value.zero_()
 
 
-
-
 def _mace_like_conv_tp_path_scales(
     tp: EdgeWeightedPathPreservingTensorProduct,
     *,
@@ -298,29 +293,6 @@ def _mace_like_conv_tp_path_scales(
             "ICTC and e3nn path conventions do not match."
         )
     return scales
-
-
-
-
-
-
-def _so3_block_rmsnorm(
-    x: torch.Tensor,
-    channels: int,
-    lmax: int,
-    gamma: torch.Tensor,
-    eps: float = 1.0e-8,
-) -> torch.Tensor:
-    """Apply an equivariant RMS normalization independently inside each l block."""
-    blocks = _split_irreps(x, int(channels), int(lmax))
-    parts = []
-    gamma = gamma.to(dtype=x.dtype, device=x.device)
-    for l in range(int(lmax) + 1):
-        block = blocks[l]
-        rms = block.square().mean(dim=(-2, -1), keepdim=True).add(float(eps)).sqrt()
-        block = block / rms * gamma[l].view(*([1] * (block.ndim - 2)), 1, 1)
-        parts.append(block.reshape(*block.shape[:-2], block.shape[-2] * block.shape[-1]))
-    return torch.cat(parts, dim=-1)
 
 
 def _tp_allowed_paths_from_target_lmax(lmax_in1: int, lmax_in2: int, lmax_target: int) -> List[tuple[int, int, int]]:
@@ -1118,8 +1090,6 @@ class ICTDScalarProductBasisBlock(nn.Module):
         return self.output_norm(out)
 
 
-
-
 class NativeMACEProductBasisBlockSO3(nn.Module):
     """
     Hybrid product block: ICTC-SO3 interaction features are interpreted in
@@ -1170,8 +1140,6 @@ class NativeMACEProductBasisBlockSO3(nn.Module):
         if self.target_lmax > 0:
             out = self.basis_bridge.e3nn_flat_to_ictd_flat(out, self.target_lmax)
         return out
-
-
 
 
 class ICTDBridgeUProductBasisBlockSO3(nn.Module):
@@ -2788,26 +2756,6 @@ class PureCartesianICTDFix(nn.Module):
             return ref.new_zeros(()) + float(self.ictd_fix_readout_head_scale_init)
         return self.readout_head_scales[index].to(dtype=ref.dtype, device=ref.device)
 
-    def _fusion_input_scale(self, index: int, ref: torch.Tensor) -> torch.Tensor:
-        if self.fusion_input_scales is None:
-            return ref.new_zeros(()) + float(self.ictd_fix_fusion_input_scale_init)
-        return self.fusion_input_scales[index].to(dtype=ref.dtype, device=ref.device)
-
-    def _g_mix_gate(self, ref: torch.Tensor) -> torch.Tensor:
-        if self.g_mix_gate is None:
-            return ref.new_zeros(()) + float(self.ictd_fix_gmix_gate_init)
-        return self.g_mix_gate.to(dtype=ref.dtype, device=ref.device)
-
-    def _maybe_gmix_block_rmsnorm(self, g_mix: torch.Tensor) -> torch.Tensor:
-        if self.gmix_block_rmsnorm_gamma is None:
-            return g_mix
-        channels = self.save_multiple_mix_channels if self.ictd_fix_fusion_readout_mixed_channels else self.channels
-        return _so3_block_rmsnorm(
-            g_mix,
-            int(channels),
-            self.ictd_fix_gmix_output_lmax,
-            self.gmix_block_rmsnorm_gamma,
-        )
 
     def install_mace_first_layer_sc0(self, sc0_by_element: torch.Tensor | None) -> None:
         """Install the first-layer element skip term used by converted mace-torch models.

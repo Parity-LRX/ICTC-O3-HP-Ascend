@@ -2,7 +2,7 @@
 
 from e3nn import o3
 from dataclasses import dataclass
-from typing import List, Tuple, Union
+from typing import List, Union
 import torch
 import os
 import logging
