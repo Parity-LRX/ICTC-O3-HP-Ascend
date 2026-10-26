@@ -16,7 +16,7 @@ def main():
     args = parser.parse_args()
     torch.npu.set_device(0)
     if args.ascendc:
-        from mace_ictc.ascendc import enable
+        from ictc_o3.ascendc import enable
         enable(mode=args.ascendc_mode)
     op = EdgeTensorProduct.create(channels=args.channels, input_lmax=args.lmax,
                                    edge_lmax=args.lmax)

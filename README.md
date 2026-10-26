@@ -95,14 +95,38 @@ The MH-1 foundation adapter supports frozen inference.
 ## Python API
 
 ```text
-ictc_o3/       # Standalone O(3) operators
+ictc_o3/       # Standalone O(3) operators and Ascend C entry points
 mace_ictc/     # Models, training, conversion and deployment
 ```
+
+### Standalone O(3) operators
+
+Use these layers in your own equivariant network without constructing a MACE
+model. The [standalone O(3) API](docs/O3_API.md) covers tensor products, graph
+messages, symmetric contractions, direction harmonics, channel linear layers
+and scalar activations, with tensor layouts and gradient examples.
+
+```python
+import torch_npu
+from ictc_o3 import EdgeTensorProduct, PackedGraphMessage, create_symmetric_contraction
+from ictc_o3.ascendc import enable
+
+enable(mode='performance')  # Reads ICTC_ASCENDC_LIBRARY.
+tp = EdgeTensorProduct.create(channels=64, input_lmax=2, edge_lmax=2)
+# output = tp(features, harmonics, gates)
+```
+
+Build the shared native library with `python -m ictc_o3.ascendc.build` using
+the [installation options](docs/O3_API.md#1-install-and-enable-the-high-performance-backend).
+Run [`examples/operators.py`](examples/operators.py) for an edge TP, or
+[`examples/o3_layers.py`](examples/o3_layers.py) for graph messages, channel
+mixing, symmetric contraction and a mixed second derivative training step.
+
+### MACE-ICTC models
 
 ```python
 import torch_npu
 from mace_ictc.ascendc import enable
-from ictc_o3 import EdgeTensorProduct, direction_harmonics
 from mace_ictc.hp import create_model, configure_model, energy_and_forces
 
 enable(mode='performance')  # 'capacity' selects chunked frozen inference.
@@ -122,12 +146,10 @@ prediction = energy_and_forces(model, **graph)
 The model API returns interaction energies; prediction examples restore
 checkpoint atomic reference energies exactly once. Forces require autograd,
 including during frozen inference. Run [`examples/model.py`](examples/model.py)
-with `--ascendc` for a complete synthetic training step, or
-[`examples/operators.py`](examples/operators.py) for a standalone tensor product.
+with `--ascendc` for a complete synthetic training step.
 
-See the [operator and model API](docs/HP_API.md) for tensor shapes, layouts,
-graph messages, symmetric contractions, direction harmonics, dense transforms,
-first derivatives and mixed higher derivatives.
+See the [model and backend API](docs/HP_API.md) for model configuration,
+execution modes and hardware scheduling.
 
 ## LAMMPS deployment
 

@@ -2,6 +2,9 @@
 
 For complete data preparation, training, conversion, prediction and LAMMPS
 recipes, start with the [user guide](USAGE.md).
+For standalone layers in your own network, use the dedicated
+[O(3) operator API](O3_API.md), including `ictc_o3.ascendc` build and activation
+entry points and complete forward/backward examples.
 
 Import standalone operators from `ictc_o3` and model entry points from
 `mace_ictc.hp`. Import `torch_npu` before selecting an NPU device.

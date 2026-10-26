@@ -383,7 +383,7 @@ internally; do not use `torch.inference_mode()` for force prediction.
 import torch
 import torch_npu
 from ictc_o3 import EdgeTensorProduct, direction_harmonics
-from mace_ictc.ascendc import enable
+from ictc_o3.ascendc import enable
 
 torch.npu.set_device(0)
 enable(mode='performance')
@@ -403,8 +403,10 @@ sbatch --account=YOUR_ACCOUNT "$ICTC_REPO/examples/ascend_job.sbatch" \
   python "$ICTC_REPO/examples/operators.py" --ascendc
 ```
 
-The [operator API](HP_API.md) specifies tensor-product layouts, graph messages,
+The [standalone O(3) API](O3_API.md) specifies tensor-product layouts, graph messages,
 symmetric contractions, direction harmonics, dense transforms and derivatives.
+It also documents native build/activation through `ictc_o3.ascendc` and the
+composed-layer example [`examples/o3_layers.py`](../examples/o3_layers.py).
 Channels and angular degrees are runtime model choices; UB tiling includes
 tails and does not require a fixed atom count.
 
