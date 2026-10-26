@@ -1,7 +1,7 @@
-include README.md LICENSE NOTICE LICENSE_SCOPE.md COMMERCIAL_LICENSE.md UPSTREAM.md pyproject.toml
+include README.md LICENSE NOTICE LICENSE_SCOPE.md UPSTREAM.md pyproject.toml
 recursive-include LICENSES *.txt
 recursive-include docs *.md
-recursive-include examples *.py
+recursive-include examples *.py *.sh *.sbatch in.*
 recursive-include lammps_user_mfftorch *.md *.txt *.cmake *.h *.cpp *.sh *.in in.*
 include lammps_user_mfftorch/install_ascend.py
 include lammps_user_mfftorch/launch_ascend.py

@@ -1,5 +1,8 @@
 # Convert MACE checkpoints for Ascend
 
+The [user guide](USAGE.md) provides scheduled commands and connects conversion
+to standard-model fine-tuning, structure prediction and LAMMPS deployment.
+
 Install the conversion dependencies into the same environment as MACE-ICTC:
 
 ```bash
@@ -10,8 +13,10 @@ Run conversion and numerical evaluation inside a scheduled compute allocation.
 Conversion calibrates the fixed basis and path normalization in CPU FP64, then
 stores the requested weight dtype. NPU execution requires FP32. Load only trusted
 checkpoints: these files contain serialized Python modules.
-The conversion checks use MACE 0.3.14 and e3nn 0.5.9. Keep the conversion
-dependencies installed when loading the resulting foundation archive.
+The conversion extra selects MACE 0.3.14 and e3nn 0.4.4, matching the
+[upstream MACE dependency declaration](https://github.com/ACEsuit/mace/blob/v0.3.14/setup.cfg).
+Keep those dependencies installed when loading foundation archives. The README
+performance figures retain their separately recorded e3nn 0.5.9 environment.
 
 ## MACE-MH-1
 

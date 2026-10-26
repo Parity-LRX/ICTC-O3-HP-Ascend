@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Dynamic Ascend model construction, configuration and force evaluation."""
 from contextlib import nullcontext
 import torch

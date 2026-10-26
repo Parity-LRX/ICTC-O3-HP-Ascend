@@ -399,12 +399,11 @@ def main():
         save_to_h5_parallel('train', args.max_radius, args.num_workers, data_dir=args.output_dir)
         save_to_h5_parallel('val', args.max_radius, args.num_workers, data_dir=args.output_dir)
         print(f"\nDone! All preprocessed files saved in {args.output_dir}/")
-        print("You can now run distributed training with:")
-        print(f"  torchrun --nproc_per_node=2 -m mace_ictc.cli.train --distributed --data-dir {args.output_dir}")
+        print("See docs/USAGE.md for single-NPU training with explicit E0 and Ascend C.")
     else:
         print("\nSkipped neighbor list computation (--skip-h5 was set).")
         print("To complete preprocessing, run:")
-        print(f"  mff-preprocess --input-file {args.input_file} --output-dir {args.output_dir}")
+        print(f"  ictc-ascend-preprocess --input-file {args.input_file} --output-dir {args.output_dir}")
 
 
 if __name__ == '__main__':

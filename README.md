@@ -1,23 +1,154 @@
 # ICTC-O3-HP-Ascend
 
 High-performance ICTC-O3 operators optimized for Ascend NPUs, together with the
-MACE-ICTC framework for atomistic modeling, training and inference.
+MACE-ICTC framework for atomistic modeling, energy-and-force training and
+molecular dynamics.
 
-Version 0.1.0. Distribution: `ictc-o3-hp-ascend`. The `ictc_o3` and `mace_ictc`
-Python packages are installed together.
+Version 0.1.0 · [MIT License](LICENSE) · Distribution: `ictc-o3-hp-ascend`
+
+Start with the [user guide](docs/USAGE.md) for installation, training on your
+own data, MACE checkpoint conversion, structure prediction and LAMMPS deployment.
+Copyable recipes are in [`examples/`](examples/). Standalone operators and models
+are installed together as `ictc_o3` and `mace_ictc`.
 
 ## Highlights
 
-- Weighted O(3) tensor products: 23.18× faster forward and 18.37× faster forward
-  plus input gradients than MindChemistry PyNative on Ascend 910B3.
-- MACE training and inference: up to 4.76× faster full energy-and-force training
-  and 4.48× faster inference than original PyTorch MACE/e3nn in the four-model scan.
-- Official MACE-MH-1: all six heads retained, 2.05× faster energy-and-force
-  inference; release capacity measurements use 6.13 GiB versus 31.71 GiB at 4,000 atoms.
-- Multi-NPU LAMMPS: 6.64× speedup and 83.0% efficiency on eight NPUs,
-  reaching 248,559 atom-steps/s at 32,768 atoms.
-- Dynamic execution: changing atom counts and neighbor graphs, runtime model
-  hyperparameters, and hardware-derived UB tiling for Ascend C kernels.
+- Full MACE training: up to 4.76× the throughput of original PyTorch MACE/e3nn,
+  including energy, forces, force-loss second derivatives and AdamW.
+- Energy-and-force inference: up to 4.48× faster than original MACE/e3nn;
+  C64/lmax 2 reaches 54.8k atom-steps/s at 16,384 atoms.
+- Standalone O(3) tensor products: up to 3.90× forward and 3.85× forward-plus-VJP
+  throughput over e3nn. The MindChemistry PyNative comparison reaches 23.18×
+  forward and 18.37× forward plus gradients at C64/lmax 2.
+- Large systems: C64/lmax-2 capacity inference completes 65,536 atoms;
+  performance-mode training completes 16,384 atoms on one 910B3.
+- Multi-NPU MD: 6.64× speedup and 83.0% efficiency on eight NPUs,
+  reaching 248,559 atom-steps/s for a 32,768-atom complete LAMMPS step.
+- Pretrained MACE-MH-1: all six heads and nonlinear model components retained;
+  release measurements show 2.05× faster energy-and-force inference at 4,000 atoms.
+
+The native backend combines Ascend C kernels, hardware-derived Unified Buffer
+(UB) tiling and channel-contiguous CANN GEMMs. Models support changing atom
+counts and neighbor graphs, configurable channels/degrees, and correlation
+orders 1–3. Execution uses eager FP32 with HF32 disabled.
+
+![Single-Ascend C64/lmax-2 training and energy-and-force inference throughput and peak allocated memory.](docs/figures/ascend-training-inference.svg)
+
+## Installation
+
+Use a Linux ARM64 environment with matching Ascend drivers, CANN and
+PyTorch/`torch_npu`. The qualified stack is CANN 9.0.0, Python 3.10,
+PyTorch 2.7.1, `torch_npu` 2.7.1.post4 and Triton-Ascend 3.2.1.
+After sourcing the CANN environment, run inside a compute allocation:
+
+```bash
+git clone https://github.com/Parity-LRX/ICTC-O3-HP-Ascend.git
+cd ICTC-O3-HP-Ascend
+python -m pip install -e '.[hp,train,preprocess,conversion]' 'cmake>=3.16' \
+  --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
+python -m mace_ictc.ascendc.build --output /path/to/build/ictc_ascendc --jobs 4
+export ICTC_ASCENDC_LIBRARY=/path/to/build/ictc_ascendc/libictc_ascendc.so
+```
+
+Install the platform's matching PyTorch/`torch_npu` wheels first. Triton-Ascend
+supplies the `triton` namespace. Rebuild the native library after updating its
+sources or the device software stack. On Slurm clusters, use `sbatch`; the
+[user guide](docs/USAGE.md#1-install-and-build) includes a batch template.
+
+## Train, convert and predict
+
+The following commands run inside an allocation. The complete
+[training recipe](examples/train_hco.sh) reads atomic energy offsets from the
+preprocessor's `fitted_E0.csv` and explicitly enables native Ascend C operators:
+
+```bash
+ictc-ascend-preprocess \
+  --input-file data/reference.extxyz --output-dir data/hco \
+  --elements H C O --atomic-energy-keys 1 6 8 \
+  --energy-key REF_energy --force-key REF_forces --max-radius 4.5
+bash examples/train_hco.sh data/hco models/hco.pth
+python examples/predict.py \
+  --checkpoint models/hco.pth --structure data/reference.extxyz \
+  --out prediction.json --mode performance
+```
+
+Train an ordinary short-range potential on one NPU. For an existing MACE model,
+convert its checkpoint instead:
+
+```bash
+# Supported ordinary ScaleShiftMACE model.
+ictc-ascend-convert-mace \
+  --mace-model models/source.model --dtype float32 --out models/converted.pth
+
+# MACE-MH-1: all heads retained; omat_pbe selected for evaluation.
+ictc-ascend-convert-foundation \
+  --mace-model models/mace-mh-1.model --head omat_pbe \
+  --dtype float32 --out models/mh1-ictc.pt
+python examples/foundation.py \
+  --checkpoint models/mh1-ictc.pt --structure data/cu.extxyz --head omat_pbe
+```
+
+The [user guide](docs/USAGE.md) covers data labels, E0, configurable model sizes,
+restart/evaluation, standard-model fine-tuning and performance/capacity modes.
+The MH-1 foundation adapter supports frozen inference.
+
+## Python API
+
+```text
+ictc_o3/       # Standalone O(3) operators
+mace_ictc/     # Models, training, conversion and deployment
+```
+
+```python
+import torch_npu
+from mace_ictc.ascendc import enable
+from ictc_o3 import EdgeTensorProduct, direction_harmonics
+from mace_ictc.hp import create_model, configure_model, energy_and_forces
+
+enable(mode='performance')  # 'capacity' selects chunked frozen inference.
+model = create_model(channels=64, lmax=2, num_interactions=2, correlation=3)
+configure_model(model, training=True, policy='generated')
+
+# graph: positions [N,3], atomic_numbers [N], batch [N],
+# edge_src/edge_dst [E], lattice edge_shifts [E,3], cell [B,3,3].
+prediction = energy_and_forces(model, **graph, training=True)
+# Build the energy-and-force loss, backward, then update the optimizer.
+
+model.eval().requires_grad_(False)
+configure_model(model, training=False, policy='generated')
+prediction = energy_and_forces(model, **graph)
+```
+
+The model API returns interaction energies; prediction examples restore
+checkpoint atomic reference energies exactly once. Forces require autograd,
+including during frozen inference. Run [`examples/model.py`](examples/model.py)
+with `--ascendc` for a complete synthetic training step, or
+[`examples/operators.py`](examples/operators.py) for a standalone tensor product.
+
+See the [operator and model API](docs/HP_API.md) for tensor shapes, layouts,
+graph messages, symmetric contractions, direction harmonics, dense transforms,
+first derivatives and mixed higher derivatives.
+
+## LAMMPS deployment
+
+The plain `mff/torch` pair style keeps a persistent NPU model per MPI rank.
+HCCL exchanges intermediate features, their adjoints and ghost-force buffers;
+LAMMPS handles CPU integration, neighbors and atom migration.
+
+```lammps
+units metal
+atom_style atomic
+read_data system.data
+pair_style mff/torch 4.5 npu
+pair_coeff * * models/hco.pth H C O
+```
+
+Training checkpoints and converted foundation archives load directly.
+Use one MPI rank per NPU, with the checkpoint cutoff and elements in atom-type
+order. The [user guide](docs/USAGE.md#9-build-and-run-lammps) provides compilation,
+a complete input and an eight-NPU launch; the
+[deployment guide](lammps_user_mfftorch/docs/ASCEND.md) explains HCCL routing,
+global virial and diagnostics. This path uses neither Kokkos nor ML-IAP.
 
 ## Performance on Ascend
 
@@ -50,8 +181,6 @@ and 45.12 ms versus 828.93 ms for forward plus all-input gradients:
 </details>
 
 ### MACE training, inference and memory
-
-![Single-Ascend C64/lmax-2 training and energy-and-force inference throughput and peak allocated memory.](docs/figures/ascend-training-inference.svg)
 
 C64/lmax 2 reaches 54,823 atom-steps/s for energy-and-force inference at
 16,384 atoms, 3.62× original MACE/e3nn. Full training reaches 18,486
@@ -117,6 +246,8 @@ relative errors around `1e-7`.
 
 The broad scan uses original `mace-torch==0.3.14` and `e3nn==0.5.9`,
 with the baseline's usual scripted operators and no `torch.compile`.
+The installation recipe follows MACE's e3nn 0.4.4 pin; these figures retain
+their recorded e3nn 0.5.9 environment.
 The same initialized physical models are related by an explicit checkpoint
 conversion and checked for energies, forces, coordinate second derivatives
 and mapped parameter gradients. Models use two residual interactions,
@@ -174,126 +305,9 @@ uses those componentwise tolerances and the corresponding combined norm budget.
 
 </details>
 
-## Installation
-
-Use a dedicated Linux environment with matching Ascend drivers and CANN.
-The development stack is CANN 9.0.0, Python 3.10, PyTorch 2.7.1,
-`torch_npu` 2.7.1.post4 and Triton-Ascend 3.2.1. Source the CANN environment,
-then install and build on an allocated compute node:
-
-```bash
-git clone https://github.com/Parity-LRX/ICTC-O3-HP-Ascend.git
-cd ICTC-O3-HP-Ascend
-python -m pip install 'torch==2.7.1' 'torch_npu==2.7.1.post4'
-python -m pip install -e '.[train,conversion]'
-python -m pip install 'triton-ascend==3.2.1' pybind11 'cmake>=3.16' ninja \
-  --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
-python -m mace_ictc.ascendc.build --output /path/to/build/ictc_ascendc --jobs 4
-export ICTC_ASCENDC_LIBRARY=/path/to/build/ictc_ascendc/libictc_ascendc.so
-```
-
-Triton-Ascend supplies the `triton` namespace; install it after packages that
-may install community Triton. On Slurm clusters, use `sbatch` for compilation
-and numerical execution.
-
-## Python API
-
-The public packages live side by side:
-
-```text
-ictc_o3/       # Standalone O(3) operators
-mace_ictc/     # Models, training, conversion and deployment
-```
-
-### Standalone operators
-
-```python
-import torch
-import torch_npu
-from ictc_o3 import EdgeTensorProduct, direction_harmonics
-from mace_ictc.ascendc import enable
-
-enable(mode='performance')
-op = EdgeTensorProduct.create(channels=64, input_lmax=2, edge_lmax=2)
-features = torch.randn(1024, 64*9, device='npu', requires_grad=True)
-directions = torch.nn.functional.normalize(torch.randn(1024, 3, device='npu'), dim=-1)
-harmonics = torch.cat(direction_harmonics(directions, 2, policy='generated'), -1)
-gates = torch.randn(1024, op.gate_width, device='npu', requires_grad=True)
-output = op(features, harmonics, gates)
-```
-
-Ascend C covers tensor products, graph messages, symmetric contractions,
-direction harmonics, nonlinearities and channel transforms. First and mixed
-second adjoints support energy-and-force training. Native tiling accounts for
-UB queues, workspaces and coupling metadata, including odd channels and tails.
-See the [operator API](docs/HP_API.md) for shapes, derivatives and schedules.
-
-### Training and inference
-
-```python
-import torch
-import torch_npu
-from mace_ictc.ascendc import enable
-from mace_ictc.hp import create_model, configure_model, energy_and_forces
-
-enable(mode='performance')  # Use 'capacity' for smaller intermediates.
-model = create_model(
-    channels=64, lmax=2, num_interactions=2, correlation=3, device='npu',
-)
-configure_model(model, training=True, policy='generated')
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, foreach=False)
-
-# graph: positions, atomic_numbers, batch, edge_src, edge_dst,
-# lattice edge_shifts and cell [B,3,3], all on the NPU.
-prediction = energy_and_forces(model, **graph, training=True)
-loss = (prediction['energy'] - reference_energy).square().mean() \
-     + (prediction['forces'] - reference_forces).square().mean()
-loss.backward()
-optimizer.step()
-optimizer.zero_grad(set_to_none=True)
-
-model.eval().requires_grad_(False)
-configure_model(model, policy='generated')
-prediction = energy_and_forces(model, **graph)
-```
-
-Run [`examples/model.py`](examples/model.py) for a complete synthetic training
-step, adding `--ascendc --ascendc-mode performance` to select the built library.
-The [model API](docs/HP_API.md#whole-models) describes graph inputs, trainer
-configuration and checkpoint handling.
-
-## Pretrained MACE and LAMMPS
-
-Convert an official MACE-MH-1 checkpoint:
-
-```bash
-ictc-ascend-convert-foundation \
-  --mace-model /path/to/mace-mh-1.model --head omat_pbe \
-  --dtype float32 --out /path/to/mh1-ictc-ascend.pt
-```
-
-The conversion retains all six heads, Agnesi distance transforms, ZBL repulsion,
-density normalization and nonlinear residuals. The foundation adapter supports
-frozen energy-and-force inference. The [conversion guide](docs/CONVERSION.md)
-provides checkpoint download, head selection, Python prediction and standard
-MACE conversion examples.
-
-The plain `mff/torch` interface runs a persistent model per MPI rank with HCCL
-feature and force exchange. Example for a Cu model with a 6 Å cutoff:
-
-```lammps
-units metal
-atom_style atomic
-read_data cu.data
-pair_style mff/torch 6.0 npu
-pair_coeff * * /path/to/mh1-ictc-ascend.pt Cu
-```
-
-See the [Ascend LAMMPS guide](lammps_user_mfftorch/docs/ASCEND.md) for compilation,
-MPI/HCCL launch, ordinary training checkpoints and complete MD inputs.
-
 ## License
 
-The original project's PolyForm Noncommercial and preserved MIT scopes are retained.
-See [LICENSE](LICENSE), [LICENSE_SCOPE.md](LICENSE_SCOPE.md), [NOTICE](NOTICE)
-and [upstream provenance](UPSTREAM.md).
+ICTC-O3-HP-Ascend project-owned code and documentation are licensed under the
+[MIT License](LICENSE). Third-party source notices, dependencies, pretrained
+weights and datasets retain their original terms. See
+[LICENSE_SCOPE.md](LICENSE_SCOPE.md), [NOTICE](NOTICE) and [UPSTREAM.md](UPSTREAM.md).

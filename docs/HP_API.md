@@ -1,5 +1,8 @@
 # Ascend operator and model API
 
+For complete data preparation, training, conversion, prediction and LAMMPS
+recipes, start with the [user guide](USAGE.md).
+
 Import standalone operators from `ictc_o3` and model entry points from
 `mace_ictc.hp`. Import `torch_npu` before selecting an NPU device.
 All native operators require eager FP32 with autocast disabled. Configuration
@@ -199,6 +202,12 @@ species count. With Ascend C enabled, `normalized_silu(x, scale=1.)` uses its
 FP32 vector kernel and analytic first and mixed second adjoints.
 
 ## Whole models
+
+For the dataset training CLI, pass `--ascendc --ascendc-mode performance` to
+load `ICTC_ASCENDC_LIBRARY` before model construction, together with
+`--device npu:0 --dtype float32 --operator-plan generated`. The
+[user guide](USAGE.md#3-train-an-energy-and-force-potential) includes the full
+energy/force recipe with explicit atomic reference energies.
 
 `create_model(channels=64, lmax=3, edge_lmax=None, num_interactions=2,
 correlation=3, atomic_numbers=(1,6,8), cutoff=5., device='npu', dtype=torch.float32)`

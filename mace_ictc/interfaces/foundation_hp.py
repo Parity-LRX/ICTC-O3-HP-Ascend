@@ -30,9 +30,9 @@ _LOAD_LOCK = RLock()
 def load_foundation_checkpoint(path, *, map_location="cpu"):
     """Load official checkpoints containing legacy e3nn TorchScript buffers.
 
-    Older e3nn stores raw bytes in __codegen__; newer versions tag each buffer
-    with its serialization type. Normalize only that container while loading,
-    retaining its original TorchScript and every checkpoint tensor verbatim.
+    Older e3nn stores raw TorchScript bytes in __codegen__; newer versions tag
+    TorchScript and FX buffers. Restore either container independently of the
+    installed e3nn version, retaining every checkpoint tensor verbatim.
     """
     from e3nn.util.codegen import CodeGenMixin
     with _LOAD_LOCK:
@@ -40,11 +40,25 @@ def load_foundation_checkpoint(path, *, map_location="cpu"):
 
         def restore(module, state):
             codegen = state.get("__codegen__")
-            if isinstance(codegen, dict) and any(isinstance(value, bytes) for value in codegen.values()):
-                state = dict(state)
-                state["__codegen__"] = {name: ("torchscript", value) if isinstance(value, bytes)
-                    else value for name, value in codegen.items()}
-            return original(module, state)
+            if not isinstance(codegen, dict):
+                return original(module, state)
+            import io
+            import pickle
+            state = dict(state)
+            del state["__codegen__"]
+            original(module, state)
+            for name, value in codegen.items():
+                kind, buffer = ("torchscript", value) if isinstance(value, bytes) else value
+                if not isinstance(name, str) or not isinstance(buffer, bytes):
+                    raise ValueError("Invalid e3nn generated-module buffer")
+                if kind == "torchscript":
+                    child = torch.jit.load(io.BytesIO(buffer), map_location=map_location)
+                elif kind == "fx":
+                    child = pickle.loads(buffer)
+                else:
+                    raise ValueError(f"Unsupported e3nn generated-module format: {kind}")
+                module.add_module(name, child)
+            module.__codegen__ = list(codegen)
 
         CodeGenMixin.__setstate__ = restore
         try:
@@ -60,9 +74,15 @@ def load_foundation_checkpoint(path, *, map_location="cpu"):
     if not isinstance(loaded_module, nn.Module):
         raise ValueError("Expected a trusted MACE model or a converted foundation archive")
     for module in loaded_module.modules():
-        if module.__class__.__name__ == "SphericalHarmonics" and not hasattr(module, "sph_func"):
+        if module.__class__.__name__ not in ("SphericalHarmonics", "Activation"):
+            continue
+        forward_code = getattr(type(module).forward, "__code__", None)
+        forward_names = () if forward_code is None else forward_code.co_names
+        if (module.__class__.__name__ == "SphericalHarmonics" and "sph_func" in forward_names
+                and not hasattr(module, "sph_func")):
             module.sph_func = _spherical_harmonics
-        if module.__class__.__name__ == "Activation" and not hasattr(module, "paths"):
+        if (module.__class__.__name__ == "Activation" and "paths" in forward_names
+                and not hasattr(module, "paths")):
             module.paths = [(mul, (ir.l, ir.p), act)
                 for (mul, ir), act in zip(module.irreps_in, module.acts)]
     return model

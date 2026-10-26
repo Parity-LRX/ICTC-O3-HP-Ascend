@@ -388,6 +388,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Reference formula configuration; the NPU runtime selects Ascend operators.")
     ap.add_argument("--freeze-conv-tp-weight", action="store_true",
                     help="Freeze ICTC convolution TP base path weights, matching MACE's external-weight parameterization more closely.")
+    ap.add_argument("--ascendc", action="store_true",
+                    help="Load ICTC_ASCENDC_LIBRARY before model construction (requires NPU FP32).")
+    ap.add_argument("--ascendc-mode", choices=("performance", "capacity", "native"), default="performance",
+                    help="Ascend C execution mode; use performance for energy-and-force training.")
     ap.add_argument("--operator-plan", choices=("auto", "reference", "generated"), default="auto",
                     help="Default auto enables covered Ascend FP32 operators for NPU models. "
                          "Unsupported configurations keep their original route; generated requires coverage. "
@@ -775,6 +779,11 @@ def main(argv=None):
         logging.getLogger().setLevel(logging.WARNING)
     dtype = torch.float64 if args.dtype == "float64" else torch.float32
     device = _resolve_device(args.device, ddp_info)
+    if args.ascendc:
+        if device.type != "npu" or dtype != torch.float32:
+            raise ValueError("--ascendc requires --device npu and --dtype float32")
+        from mace_ictc.ascendc import enable
+        enable(mode=args.ascendc_mode)
     generator = _set_global_seed(args.seed)
     worker_init_fn = _make_worker_init_fn(args.seed)
     logging.info(
