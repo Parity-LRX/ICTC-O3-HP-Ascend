@@ -37,7 +37,7 @@ This process-wide opt-in selects an execution mode:
 | Mode | Tensor products and graph messages | Symmetric contractions | Dense transforms |
 | --- | --- | --- | --- |
 | `performance` (default) | Channel-contiguous grouped GEMMs; Vector gate/reduction epilogues for large working sets | Ascend C vector kernels | CANN GEMMs with analytic adjoints |
-| `capacity` | Grouped GEMMs with chunk recomputation for inference; native recursive adjoints for training | Ascend C vector kernels | CANN GEMMs with analytic adjoints |
+| `capacity` | Native sparse standalone TP; grouped GEMMs with chunk recomputation for graph inference | Ascend C vector kernels | CANN GEMMs with analytic adjoints |
 | `native` | Fused Ascend C graph kernels | Ascend C vector kernels | Ascend C FP32 Cube kernels |
 
 All three modes use native direction polynomials and nonlinearities. Choose a
