@@ -147,7 +147,7 @@ def configure_model(model, *, training=False, policy="auto", capture=False,
     coverage = check_model(model, training=training, capture=capture)
     if policy == "generated" and not coverage["supported"]:
         raise ValueError("Ascend HP unavailable: " + "; ".join(coverage["reasons"]))
-    # Clear inherited CUDA plans before installing device-specific schedules.
+    # Restore reference buffers before installing device-specific schedules.
     configure_mace_runtime_plan(model, policy="reference", training=training)
     selected = policy != "reference" and coverage["supported"]
     if not hasattr(core, "_ascend_original_edge_order"):

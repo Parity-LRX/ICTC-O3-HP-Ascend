@@ -1,9 +1,4 @@
-"""Model exports for the baseline-only MACE-ICTC build.
-
-Slimmed from FSCETP: only the baseline ICTC-MACE (`PureCartesianICTDFix`) and the small
-shared helpers it needs are exported. The experimental variants (SO(2)/eSCN/sparse/o3/fusion
-zoo) are not part of this build.
-"""
+"""MACE-ICTC models, readouts and losses."""
 
 from mace_ictc.models.mlp import MainNet, MainNet2, RobustScalarWeightedSum
 from mace_ictc.models.losses import RMSELoss, weighted_mse_loss_stats

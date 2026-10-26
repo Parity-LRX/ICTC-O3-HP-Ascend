@@ -23,6 +23,7 @@ Python packages are installed together.
 
 All results use Ascend 910B3 and FP32 with HF32 disabled. Performance mode
 prioritizes throughput; capacity mode reduces intermediate storage.
+The figures report measurements from the v0.1.0 release.
 
 ### O(3) operators
 

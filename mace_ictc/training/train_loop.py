@@ -1862,7 +1862,7 @@ class ForceTrainer:
     # -------------------------------------------------------------- checkpoint
     def _collect_arch_metadata(self):
         """Build the ``model_hyperparameters`` dict that the deploy-side
-        ``LAMMPS_MLIAP_MFF.from_checkpoint`` reads to rebuild the architecture.
+        The Ascend LAMMPS loader reads these fields to rebuild the architecture.
 
         Mirrors the FSCETP trainer's ``_collect_e3_arch_metadata`` for the keys that
         matter to the ictd-fix baseline: the ModelConfig snapshot plus the handful of

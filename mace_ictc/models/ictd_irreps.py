@@ -35,7 +35,6 @@ from mace_ictc.models.ictd_fast import (
     _build_r2k_lift,
 )
 from mace_ictc.models import ictd_disk_cache
-from mace_ictc.models.operator_plans import bond_first_projection
 
 # ---------------------------------------------------------------------------
 # torch.compile (Dynamo) integration helpers
@@ -57,11 +56,6 @@ def normalize_ictd_tp_backend(backend):
 
 
 # Sparse CG: use sparse projection when zero fraction >= this (0.4 = 40% zeros)
-_SPARSE_MIN_ZERO_FRAC = 0.4
-_SPARSE_ZERO_THRESHOLD = 1e-12
-_USE_SPARSE_TP = os.environ.get("ICTD_USE_SPARSE_TP", "1") == "1"
-# Channelwise fused TP is experimentally useful only on some workloads.
-_USE_TRITON_CHANNELWISE_TP = os.environ.get("ICTD_USE_TRITON_CHANNELWISE_TP", "0") == "1"
 # Experimental pure PyTorch batching for channelwise per-path mixing by same-kdim buckets.
 _USE_BUCKETED_CHANNELWISE_MIX = os.environ.get("ICTD_USE_BUCKETED_CHANNELWISE_MIX", "0") == "1"
 # MACE interactions commonly multiply scalar node features (l=0) by edge
@@ -418,12 +412,6 @@ class EquivariantChannelLinearO3Rect(nn.Module):
                 self.adapters[f"{key[0]}{parity_sign_to_letter(key[1])}"],
             )
         return merge_flat_irreps_o3(blocks, self.out_channels, self.active_irreps)
-
-
-def _segment_offsets_from_segments(segments: List[Tuple[int, ...]]) -> torch.Tensor:
-    offsets = [int(seg[-2]) for seg in segments]
-    offsets.append(int(segments[-1][-1]) if segments else 0)
-    return torch.tensor(offsets, dtype=torch.long)
 
 
 def _stack_group_weights(
@@ -986,7 +974,6 @@ def _integer_power_table(x: torch.Tensor, max_power: int) -> torch.Tensor:
         cur = cur * x
         powers.append(cur)
     return torch.stack(powers, dim=-1)
-
 
 
 def direction_harmonics_fast(n: torch.Tensor, l: int) -> torch.Tensor:
@@ -1796,8 +1783,6 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         #   U_g: (m1*m2, K_total), where K_total = sum_{paths in group} (2*l3+1)
         self._proj_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
         self._proj_group_view_cache_by_dev_dtype: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
-        # Sparse U per group when zero_frac >= _SPARSE_MIN_ZERO_FRAC: list of None or (d_idx, k_idx, vals)
-        self._proj_sparse_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]] = {}
         self._proj_bucket_cache_by_dev_dtype: Dict[Tuple[str, str], List[List[Dict[str, object]]]] = {}
         self._proj_group_view_cache_by_dev_dtype: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
         self._scalar_identity_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Dict[str, object]]]] = {}
@@ -1846,7 +1831,6 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
 
         cg_list = self._get_cg_list(device=device, dtype=dtype)
         proj_list: List[torch.Tensor] = []
-        sparse_list: List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = []
         for g in self._groups:
             l1 = int(g["l1"])  # type: ignore[arg-type]
             l2 = int(g["l2"])  # type: ignore[arg-type]
@@ -1861,19 +1845,10 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                 U[:, int(s): int(e)] = C.reshape(m1 * m2, int(e) - int(s))
             proj_list.append(U)
 
-            sparse_list.append(None)
 
         self._proj_group_cache_by_dev_dtype[key] = proj_list
-        self._proj_sparse_cache_by_dev_dtype[key] = sparse_list
         return proj_list
 
-    @_dynamo_disable
-    def _get_proj_sparse_list(self, device: torch.device, dtype: torch.dtype) -> List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
-        """Return sparse (d_idx, k_idx, vals) per group; None where dense is used. Call _get_proj_group_list first."""
-        self._get_proj_group_list(device=device, dtype=dtype)
-        compute_dtype = self.internal_compute_dtype
-        key = (str(device), str(compute_dtype))
-        return self._proj_sparse_cache_by_dev_dtype[key]
 
     @_dynamo_disable
     def _get_proj_bucket_list(self, device: torch.device, dtype: torch.dtype) -> List[List[Dict[str, object]]]:
@@ -1964,7 +1939,6 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         """
         _ = self._get_cg_list(device=device, dtype=dtype)
         _ = self._get_proj_group_list(device=device, dtype=dtype)
-        _ = self._get_proj_sparse_list(device=device, dtype=dtype)
         _ = self._get_proj_bucket_list(device=device, dtype=dtype)
 
     def forward(
@@ -2002,8 +1976,6 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         # Fast path: internal_weights + per-path scalar gates (this is what our models use).
         if self.internal_weights and (weights is None or weights.shape[-1] == self.num_paths):
             proj_list = self._get_proj_group_list(device=device, dtype=dtype)
-            bucket_list = self._get_proj_bucket_list(device=device, dtype=dtype)
-            sparse_list = self._get_proj_sparse_list(device=device, dtype=dtype) if device.type == "cuda" else None
             for g_idx, g in enumerate(self._groups):
                 l1 = int(g["l1"])  # type: ignore[arg-type]
                 l2 = int(g["l2"])  # type: ignore[arg-type]
@@ -2025,45 +1997,33 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                 # Convert inputs to compute_dtype for numerical stability
                 a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
                 b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
-                B_flat = 1
-                for s in batch_shape:
-                    B_flat *= int(s)
-                a_flat = a_comp.reshape(B_flat, self.mul_in1, m1)
-                b_flat = b_comp.reshape(B_flat, self.mul_in2, m2)
-                # FlashTP-style: fused projection+channel-mix (one kernel), or sparse/dense TP then per-path mix
-                y = None
-                used_fused_mix = False
-                if not used_fused_mix:
-                    if y is None:
-                        # PyTorch fallback: outer product + matmul projection
-                        U = proj_list[g_idx]  # (m1*m2, K_total)
-                        t_mn = (a_comp.unsqueeze(-2).unsqueeze(-1) * b_comp.unsqueeze(-3).unsqueeze(-2))
-                        t_flat = t_mn.reshape(*batch_shape, self.mul_in1, self.mul_in2, m1 * m2)
-                        if not t_flat.is_contiguous():
-                            t_flat = t_flat.contiguous()
-                        y = torch.matmul(t_flat, U)
+                U = proj_list[g_idx]  # (m1*m2, K_total)
+                t_mn = (a_comp.unsqueeze(-2).unsqueeze(-1) * b_comp.unsqueeze(-3).unsqueeze(-2))
+                t_flat = t_mn.reshape(*batch_shape, self.mul_in1, self.mul_in2, m1 * m2)
+                if not t_flat.is_contiguous():
+                    t_flat = t_flat.contiguous()
+                y = torch.matmul(t_flat, U)
 
-                    # Per-path channel mixing
-                    i, j = self.mul_in1, self.mul_in2
-                    ij = i * j
-                    for p_idx, l3, s, e in segments:  # type: ignore[misc]
-                        Wp = w_param[int(p_idx)]  # (o,i,j)
-                        Wp_comp = self._weight_to_compute(Wp, compute_dtype)
-                        y_seg = y[..., :, :, int(s): int(e)]  # (..., i, j, kdim)
-                        kdim = int(e) - int(s)
-                        y2 = y_seg.movedim(-1, -3).contiguous().view(*y_seg.shape[:-3], kdim, ij)  # (..., k, ij)
-                        W2 = Wp_comp.contiguous().view(Wp_comp.shape[0], ij)  # (o, ij)
-                        out_seg = torch.matmul(y2, W2.transpose(0, 1)).movedim(-1, -2)  # (..., o, k)
-                        out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
-                        if weights is not None:
-                            gate = weights[..., int(p_idx)]
-                            out_seg = out_seg * gate[..., None, None]
-                        out[int(l3)] = out[int(l3)] + out_seg
+                # Per-path channel mixing
+                i, j = self.mul_in1, self.mul_in2
+                ij = i * j
+                for p_idx, l3, s, e in segments:  # type: ignore[misc]
+                    Wp = w_param[int(p_idx)]  # (o,i,j)
+                    Wp_comp = self._weight_to_compute(Wp, compute_dtype)
+                    y_seg = y[..., :, :, int(s): int(e)]  # (..., i, j, kdim)
+                    kdim = int(e) - int(s)
+                    y2 = y_seg.movedim(-1, -3).contiguous().view(*y_seg.shape[:-3], kdim, ij)  # (..., k, ij)
+                    W2 = Wp_comp.contiguous().view(Wp_comp.shape[0], ij)  # (o, ij)
+                    out_seg = torch.matmul(y2, W2.transpose(0, 1)).movedim(-1, -2)  # (..., o, k)
+                    out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
+                    if weights is not None:
+                        gate = weights[..., int(p_idx)]
+                        out_seg = out_seg * gate[..., None, None]
+                    out[int(l3)] = out[int(l3)] + out_seg
         # Fast path: external full per-example weights (..., weight_numel).
         # Still uses the e3nn-like factorization (projection first, then channel mixing).
         elif weights is not None and weights.shape[-1] == self.weight_numel:
             proj_list = self._get_proj_group_list(device=device, dtype=dtype)
-            sparse_list = self._get_proj_sparse_list(device=device, dtype=dtype) if device.type == "cuda" else None
             # Reshape once:
             #   weights_full: (..., P, o, i, j)
             weights_full = weights.view(*batch_shape, self.num_paths, self.mul_out, self.mul_in1, self.mul_in2)
@@ -2084,15 +2044,12 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                 # Convert inputs to compute_dtype for numerical stability
                 a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
                 b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
-                # FlashTP-style: sparse or dense fused outer-product + projection
-                y = None
-                if y is None:
-                    U = proj_list[g_idx]  # (m1*m2, K_total)
-                    t_mn = (a_comp.unsqueeze(-2).unsqueeze(-1) * b_comp.unsqueeze(-3).unsqueeze(-2))
-                    t_flat = t_mn.reshape(*batch_shape, self.mul_in1, self.mul_in2, m1 * m2)
-                    if not t_flat.is_contiguous():
-                        t_flat = t_flat.contiguous()
-                    y = torch.matmul(t_flat, U)
+                U = proj_list[g_idx]  # (m1*m2, K_total)
+                t_mn = (a_comp.unsqueeze(-2).unsqueeze(-1) * b_comp.unsqueeze(-3).unsqueeze(-2))
+                t_flat = t_mn.reshape(*batch_shape, self.mul_in1, self.mul_in2, m1 * m2)
+                if not t_flat.is_contiguous():
+                    t_flat = t_flat.contiguous()
+                y = torch.matmul(t_flat, U)
                 if y.shape[-1] != k_total:
                     raise RuntimeError("ICTC TP projection produced wrong K_total")
 
@@ -2256,7 +2213,6 @@ class HarmonicPathWeightedTensorProduct(nn.Module):
 
         self._proj_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
         self._proj_group_view_cache_by_dev_dtype: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
-        self._use_bond_first_projection = False
         self._bond_projector_cache: Dict[Tuple[str, str], List[torch.Tensor]] = {}
 
     @_dynamo_disable
@@ -3019,7 +2975,6 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
                 }
             )
         self._proj_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
-        self._proj_sparse_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]] = {}
         self._proj_bucket_cache_by_dev_dtype: Dict[Tuple[str, str], List[List[Dict[str, object]]]] = {}
         self._proj_group_view_cache_by_dev_dtype: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
         self._scalar_identity_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Dict[str, object]]]] = {}
@@ -3058,7 +3013,6 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
             return cached
         cg_list = self._get_cg_list(device=device, dtype=dtype)
         proj_list: List[torch.Tensor] = []
-        sparse_list: List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = []
         for g in self._groups:
             l1 = int(g["l1"])
             l2 = int(g["l2"])
@@ -3071,16 +3025,9 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
                 C = cg_list[int(p_idx)]
                 U[:, int(s): int(e)] = C.reshape(m1 * m2, int(e) - int(s))
             proj_list.append(U)
-            sparse_list.append(None)
         self._proj_group_cache_by_dev_dtype[key] = proj_list
-        self._proj_sparse_cache_by_dev_dtype[key] = sparse_list
         return proj_list
 
-    @_dynamo_disable
-    def _get_proj_sparse_list(self, device: torch.device, dtype: torch.dtype) -> List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
-        self._get_proj_group_list(device=device, dtype=dtype)
-        key = (str(device), str(self.internal_compute_dtype))
-        return self._proj_sparse_cache_by_dev_dtype[key]
 
     @_dynamo_disable
     def _get_proj_bucket_list(self, device: torch.device, dtype: torch.dtype) -> List[List[Dict[str, object]]]:
@@ -3166,7 +3113,6 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
     def prewarm_caches(self, device: torch.device, dtype: torch.dtype) -> None:
         _ = self._get_cg_list(device=device, dtype=dtype)
         _ = self._get_proj_group_list(device=device, dtype=dtype)
-        _ = self._get_proj_sparse_list(device=device, dtype=dtype)
         _ = self._get_proj_bucket_list(device=device, dtype=dtype)
         _ = self._get_proj_group_view_list(device=device, dtype=dtype)
         _ = self._get_scalar_identity_group_list(device=device, dtype=dtype)
@@ -3200,8 +3146,6 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
 
         if self.internal_weights and (weights is None or weights.shape[-1] == self.num_paths):
             proj_list = self._get_proj_group_list(device=device, dtype=dtype)
-            bucket_list = self._get_proj_bucket_list(device=device, dtype=dtype)
-            sparse_list = self._get_proj_sparse_list(device=device, dtype=dtype) if device.type == "cuda" else None
             for g_idx, g in enumerate(self._groups):
                 l1 = int(g["l1"])
                 p1 = int(g["p1"])
@@ -3219,34 +3163,25 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
                 num_paths_in_group = len(segments)
                 a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
                 b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
-                B_flat = 1
-                for s in batch_shape:
-                    B_flat *= int(s)
-                a_flat = a_comp.reshape(B_flat, self.mul_in1, m1)
-                b_flat = b_comp.reshape(B_flat, self.mul_in2, m2)
-                y = None
-                used_fused_mix = False
-                if not used_fused_mix:
-                    if y is None:
-                        U = proj_list[g_idx]  # (m1*m2, K_total)
-                        t_mn = (a_comp.unsqueeze(-2).unsqueeze(-1) * b_comp.unsqueeze(-3).unsqueeze(-2))
-                        t_flat = t_mn.reshape(*batch_shape, self.mul_in1, self.mul_in2, m1 * m2)
-                        if not t_flat.is_contiguous():
-                            t_flat = t_flat.contiguous()
-                        y = torch.matmul(t_flat, U)
-                    ij = self.mul_in1 * self.mul_in2
-                    for p_idx, l3, p3, s, e in segments:
-                        Wp = w_param[int(p_idx)]
-                        Wp_comp = self._weight_to_compute(Wp, compute_dtype)
-                        y_seg = y[..., :, :, int(s): int(e)]
-                        kdim = int(e) - int(s)
-                        y2 = y_seg.movedim(-1, -3).contiguous().view(*y_seg.shape[:-3], kdim, ij)
-                        W2 = Wp_comp.contiguous().view(Wp_comp.shape[0], ij)
-                        out_seg = torch.matmul(y2, W2.transpose(0, 1)).movedim(-1, -2)
-                        out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
-                        if weights is not None:
-                            out_seg = out_seg * weights[..., int(p_idx), None, None]
-                        out[(int(l3), int(p3))] = out[(int(l3), int(p3))] + out_seg
+                U = proj_list[g_idx]  # (m1*m2, K_total)
+                t_mn = (a_comp.unsqueeze(-2).unsqueeze(-1) * b_comp.unsqueeze(-3).unsqueeze(-2))
+                t_flat = t_mn.reshape(*batch_shape, self.mul_in1, self.mul_in2, m1 * m2)
+                if not t_flat.is_contiguous():
+                    t_flat = t_flat.contiguous()
+                y = torch.matmul(t_flat, U)
+                ij = self.mul_in1 * self.mul_in2
+                for p_idx, l3, p3, s, e in segments:
+                    Wp = w_param[int(p_idx)]
+                    Wp_comp = self._weight_to_compute(Wp, compute_dtype)
+                    y_seg = y[..., :, :, int(s): int(e)]
+                    kdim = int(e) - int(s)
+                    y2 = y_seg.movedim(-1, -3).contiguous().view(*y_seg.shape[:-3], kdim, ij)
+                    W2 = Wp_comp.contiguous().view(Wp_comp.shape[0], ij)
+                    out_seg = torch.matmul(y2, W2.transpose(0, 1)).movedim(-1, -2)
+                    out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
+                    if weights is not None:
+                        out_seg = out_seg * weights[..., int(p_idx), None, None]
+                    out[(int(l3), int(p3))] = out[(int(l3), int(p3))] + out_seg
         else:
             # Fallback path: supports external full per-example weights
             # (..., weight_numel) as well as the internal-weight case.
@@ -3550,20 +3485,6 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                 if active_U is None:
                     continue
 
-            used_fused_mix = False
-            if self.channel_mode == "broadcast_rhs" and a_comp.dim() >= 2:
-                B_flat = 1
-                for s in batch_shape:
-                    B_flat *= int(s)
-                a_flat = a_comp.reshape(B_flat, self.channel_mul, 2 * l1 + 1)
-                b_flat = b_comp.reshape(B_flat, 1, 2 * l2 + 1)
-                if used_fused_mix:
-                    continue
-                gates_all = (
-                    weights.reshape(B_flat, weights.shape[-1]).to(dtype=compute_dtype)
-                    if weights is not None
-                    else None
-                )
 
             m1 = 2 * l1 + 1
             m2 = 2 * l2 + 1
@@ -3782,20 +3703,6 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                 active_U = scalar_split_meta["U_rem"]  # type: ignore[assignment]
                 if active_U is None:
                     continue
-            used_fused_mix = False
-            if self.channel_mode == "broadcast_rhs" and a_comp.dim() >= 2:
-                B_flat = 1
-                for s in batch_shape:
-                    B_flat *= int(s)
-                a_flat = a_comp.reshape(B_flat, self.channel_mul, 2 * l1 + 1)
-                b_flat = b_comp.reshape(B_flat, 1, 2 * l2 + 1)
-                if used_fused_mix:
-                    continue
-                gates_all = (
-                    weights.reshape(B_flat, weights.shape[-1]).to(dtype=compute_dtype)
-                    if weights is not None
-                    else None
-                )
             m1 = 2 * l1 + 1
             m2 = 2 * l2 + 1
             U3 = active_U.reshape(m1, m2, -1)
@@ -4050,20 +3957,6 @@ class HarmonicChannelWiseTensorProduct(HarmonicFullyConnectedTensorProduct):
                 active_U = scalar_split_meta["U_rem"]  # type: ignore[assignment]
                 if active_U is None:
                     continue
-            used_fused_mix = False
-            if self.channel_mode == "broadcast_rhs" and a_comp.dim() >= 2:
-                B_flat = 1
-                for s in batch_shape:
-                    B_flat *= int(s)
-                a_flat = a_comp.reshape(B_flat, self.channel_mul, 2 * l1 + 1)
-                b_flat = b_comp.reshape(B_flat, 1, 2 * l2 + 1)
-                if used_fused_mix:
-                    continue
-                gates_all = (
-                    weights.reshape(B_flat, weights.shape[-1]).to(dtype=compute_dtype)
-                    if weights is not None
-                    else None
-                )
             m1 = 2 * l1 + 1
             m2 = 2 * l2 + 1
             if active_segments is segments and active_U is proj_list[g_idx]:

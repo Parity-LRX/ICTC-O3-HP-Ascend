@@ -15,7 +15,6 @@ def mace_backbone_core(model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
-
 def configure_mace_runtime_plan(model, *, policy="auto", training=False,
                                 capture=False, generated_layout="packed"):
     if policy not in ("auto", "reference", "generated"):
@@ -33,12 +32,3 @@ def configure_mace_runtime_plan(model, *, policy="auto", training=False,
     core._fused_direction_harmonics = False
     return {"requested": policy, "selected": "reference", "backend": "reference",
             "reasons": [], "counts": {"interactions": len(getattr(core, "interactions", ()))}}
-
-
-def bond_first_projection(a, b, projector, angular_backend="torch"):
-    """Apply a shared geometry matrix without broadcasting it over channels."""
-    if angular_backend != "torch":
-        raise ValueError("The Ascend library has no CUDA angular backend")
-    magnetic = torch.matmul(b.squeeze(-2), projector).reshape(
-        *b.shape[:-2], a.shape[-1], projector.shape[-1] // a.shape[-1])
-    return torch.matmul(a, magnetic)

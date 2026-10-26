@@ -1023,20 +1023,11 @@ def main(argv=None):
                  type(model).__name__, args.route, args.channels, args.lmax, args.num_interaction, n_params)
 
     if ddp_info["enabled"]:
-        if device.type != "cuda":
-            model = DistributedDataParallel(
-                model,
-                broadcast_buffers=False,
-                find_unused_parameters=bool(args.ddp_find_unused_parameters),
-            )
-        else:
-            model = DistributedDataParallel(
-                model,
-                device_ids=[device.index],
-                output_device=device.index,
-                broadcast_buffers=False,
-                find_unused_parameters=bool(args.ddp_find_unused_parameters),
-            )
+        model = DistributedDataParallel(
+            model,
+            broadcast_buffers=False,
+            find_unused_parameters=bool(args.ddp_find_unused_parameters),
+        )
 
     # dataloaders
     if makefx_buckets is not None:

@@ -307,25 +307,6 @@ def _merge_blocks_subset(blocks: Dict[int, torch.Tensor], channels: int, lmax: i
     return torch.cat([blocks[l].reshape(blocks[l].shape[0], int(channels) * (2 * l + 1)) for l in range(int(lmax) + 1)], dim=-1)
 
 
-def _concat_so3_states_by_l(states: List[torch.Tensor], channels: int, lmax: int) -> torch.Tensor:
-    """
-    Concatenate multiple SO3-flat states by channel within each l-block.
-
-    Each state is laid out as [l0 | l1 | ...]. Directly concatenating states
-    along the flat dimension would produce [s0_l0 | s0_l1 | ... | s1_l0 | ...],
-    which is not a valid SO3-flat layout for a larger channel count. Equivariant
-    operators expect [all_l0_channels | all_l1_channels | ...].
-    """
-    if len(states) == 0:
-        raise ValueError("states must contain at least one SO3-flat tensor")
-    split_states = [_split_irreps(state, int(channels), int(lmax)) for state in states]
-    parts = []
-    for l in range(int(lmax) + 1):
-        block = torch.cat([split_state[l] for split_state in split_states], dim=-2)
-        parts.append(block.reshape(*block.shape[:-2], block.shape[-2] * block.shape[-1]))
-    return torch.cat(parts, dim=-1)
-
-
 def _so3_block_rmsnorm(
     x: torch.Tensor,
     channels: int,
@@ -1260,14 +1241,6 @@ class NativeMACEProductBasisBlockSO3(nn.Module):
         return out
 
 
-
-
-
-
-
-
-
-
 class ICTDBridgeUSymmetricContractionSO3(nn.Module):
     """
     Bridge-U symmetric contraction expressed directly in the ICTC basis.
@@ -1692,8 +1665,6 @@ class MACEStyleScalarReadoutSO3(nn.Module):
         return self.linear_2(self.activation(self.linear_1(scalar_feats)))
 
 
-
-
 class ICTDResidualInteractionBlock(nn.Module):
     """
     ICTC-SO3 interaction block with MACE-like interface.
@@ -2028,26 +1999,22 @@ class ICTDResidualInteractionBlock(nn.Module):
         node_feats_for_sc = node_feats
         node_feats = self.linear_up(node_feats)
         x1 = _split_irreps(node_feats, self.channels, self.input_lmax)
+        gates = self.fc(edge_feats)
         fused_message_blocks = None
-        if fused_message_blocks is None:
-            from .radial_checkpoint import radial_apply
-            gates = radial_apply(self.fc,edge_feats,checkpoint=getattr(self.tp,'_radial_checkpoint',False))
-        else:
-            gates = None
         if (getattr(self, "_ascend_hp", False) and node_feats.device.type == "npu"
-                and self.interaction_attn_heads == 0 and edge_block_callback is None
-                and fused_message_blocks is None):
+                and self.interaction_attn_heads == 0 and edge_block_callback is None):
             from mace_ictc.ascend.tensor_product import graph_message
             fused_message_blocks = graph_message(self.tp, x1, edge_attrs, gates,
                 edge_src, edge_dst, edge_mask,
                 edge_chunk_size=getattr(self, "_ascend_edge_chunk_size", 16384))
-        if fused_message_blocks is not None:
+        if fused_message_blocks is None:
+            x1e = {l: x1[l][edge_src] for l in range(self.input_lmax + 1)}
+            edge_blocks = self.tp(x1e, edge_attrs, gates)
+            if edge_mask is not None:
+                mask = edge_mask.to(dtype=node_feats.dtype)
+                edge_blocks = {l: block * mask.unsqueeze(-1) for l, block in edge_blocks.items()}
+        else:
             edge_blocks = {}
-        x1e = {l: x1[l][edge_src] for l in range(self.input_lmax + 1)}
-        edge_blocks = self.tp(x1e, edge_attrs, gates)
-        if edge_mask is not None and fused_message_blocks is None:
-            mask = edge_mask.to(dtype=node_feats.dtype)
-            edge_blocks = {l: block * mask.unsqueeze(-1) for l, block in edge_blocks.items()}
         selector_message_fused = False
         if self.interaction_attn_heads > 0:
             if edge_env is None:
@@ -2452,7 +2419,7 @@ class PureCartesianICTDFix(nn.Module):
         if main_hidden_sizes3 is None:
             main_hidden_sizes3 = [64]
         if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.device = torch.device("cpu")
         else:
             self.device = device
         if int(num_interaction) < 1:

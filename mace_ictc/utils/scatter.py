@@ -2,7 +2,7 @@
 Compatibility scatter utilities.
 
 This project historically depended on `torch_scatter.scatter`. However, binary wheels for
-`torch_scatter` are tightly coupled to specific PyTorch + CUDA versions, and importing a
+`torch_scatter` are tightly coupled to specific PyTorch and device builds, and importing a
 mismatched build raises an `OSError` at import time (undefined symbols).
 
 To make the codebase more robust:
@@ -56,7 +56,7 @@ def require_torch_scatter(*, reason: str = "") -> None:
         msg = "torch_scatter is required but is not available/importable."
         if reason:
             msg += f" Reason: {reason}"
-        msg += " Install a torch_scatter wheel matching your PyTorch/CUDA."
+        msg += " Install a torch_scatter build matching your PyTorch and device backend."
         raise ImportError(msg)
 
 
@@ -82,8 +82,7 @@ def scatter(
         _WARNED_FALLBACK = True
         warnings.warn(
             "torch_scatter is not available/importable; falling back to a pure-PyTorch scatter (index_add). "
-            "This is correct but can be significantly slower. "
-            "To speed up, install a torch_scatter wheel matching your PyTorch/CUDA.",
+            "The native Ascend graph-message path is selected through configure_model.",
             stacklevel=2,
         )
 
