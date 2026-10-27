@@ -49,13 +49,16 @@ success-to-OOM brackets are shown in the overview above.
 
 ## Multi-NPU scaling
 
-![Complete LAMMPS step scaling on 1, 2, 4 and 8 Ascend NPUs.](docs/figures/ascend_lammps_scaling.svg)
+![Speedup and throughput for complete 32,768-atom LAMMPS steps on 1, 2, 4 and 8 Ascend NPUs.](docs/figures/ascend_lammps_scaling.svg)
 
 Strong scaling fixes 32,768 atoms and uses 1/2/4/8 NPUs on one node.
 The C64/lmax-2/two-interaction/correlation-3 model reaches 6.64× speedup
 and 83.0% efficiency on eight NPUs: 131.83 ms per step and
 248,559 atom-steps/s. Timing includes integration, neighbors, transfers,
 energy, forces and HCCL communication.
+
+The dashed line marks ideal speedup. [Full scaling results](lammps_user_mfftorch/docs/ASCEND.md#strong-scaling-and-memory)
+also cover 4,096 and 13,824 atoms.
 
 ## Standalone O(3) operators
 
