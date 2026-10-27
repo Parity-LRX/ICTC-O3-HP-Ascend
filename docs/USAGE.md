@@ -14,6 +14,8 @@ start with `ictc-ascend-`; the Python packages are `ictc_o3` and `mace_ictc`.
 | A trained or converted standard ICTC checkpoint | [Predict a structure](#7-predict-with-a-standard-ictc-checkpoint) |
 | A potential ready for MD | [Build and run LAMMPS](#9-build-and-run-lammps) |
 | Standalone equivariant layers | [Use the O(3) API](#8-call-standalone-o3-operators) |
+| Custom model integration | [Model and backend API](HP_API.md) |
+| Recorded performance and accuracy checks | [Benchmark protocols and validation](#benchmark-protocols-and-numerical-validation) |
 
 The production workflow uses eager FP32, HF32 disabled, dynamic atom counts and
 dynamic neighbor graphs. Ascend C kernels use hardware-derived UB tiling;
@@ -59,6 +61,19 @@ sbatch --account=YOUR_ACCOUNT examples/ascend_job.sbatch \
   python -m pip install -e '.[hp,train,preprocess,conversion]' \
     --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
 ```
+
+For standalone O(3) operators, install only the `hp` extra instead of the
+full workflow dependencies shown above:
+
+```bash
+sbatch --account=YOUR_ACCOUNT examples/ascend_job.sbatch \
+  python -m pip install -e '.[hp]' \
+    --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
+```
+
+The `hp` extra supplies CMake and Triton-Ascend, which provides the `triton`
+namespace. Native compilation also needs a host C++ compiler and the CANN
+compiler development package. Continue with the same native library build below.
 
 After installation completes successfully:
 
@@ -502,6 +517,83 @@ empty ranks and both Newton settings are covered by deployment checks.
 Per-atom stress is not implemented. See the
 [Ascend deployment guide](../lammps_user_mfftorch/docs/ASCEND.md) for build details,
 HCCL routing, diagnostics and measured complete MD steps.
+
+## Benchmark protocols and numerical validation
+
+<details>
+<summary>Measurement setup and validation coverage</summary>
+
+The MindChemistry comparison uses unchanged MindChemistry 0.2.0 from the official
+[`r0.7` source](https://github.com/mindspore-ai/mindscience/tree/b233dc1ab152dfe29e0ff2cafb55c780dff34c67/MindChemistry)
+with MindSpore 2.10.0. The path-preserving `uvu` tensor products match
+natural-parity coupling paths, normalization, channel counts and live external
+path weights. Forward + VJP includes gradients of features, direction harmonics
+and path weights. Each point is the median of five synchronized calls after
+three warmups. Graph compilation is performed separately for each measured
+shape and excluded from timing. The PyNative C128/lmax-3 VJP endpoint reaches
+OOM at 65,536 edges. CPU FP64 basis/path checks and input gradients agree to
+relative errors around `1e-7`.
+
+The broad scan uses original `mace-torch==0.3.14` and `e3nn==0.5.9`,
+with the baseline's usual scripted operators and no `torch.compile`.
+The installation recipe follows MACE's e3nn 0.4.4 pin; these figures retain
+their recorded e3nn 0.5.9 environment.
+The same initialized physical models are related by an explicit checkpoint
+conversion and checked for energies, forces, coordinate second derivatives
+and mapped parameter gradients. Models use two residual interactions,
+correlation 3, full CG paths, eight Bessel functions, radial MLP widths
+`[64,64,64]`, a 4.5 Å cutoff, H/C/O species and 56 directed neighbors/atom
+(neighbor normalization 50). No long-range term or repulsion is added.
+Inference freezes parameters and computes energy and forces. Training includes
+`zero_grad`, the energy-and-force loss, backward and AdamW. Equivalent initial
+functions and gradients do not imply identical AdamW trajectories after a
+parameter rescaling.
+
+Whole-model timings are medians of five individually synchronized calls after
+at least two seconds and three calls of warmup. The largest C256/lmax-3
+capacity sample uses one warmup and three timed calls. Separate three-call-block results
+are not mixed into these curves. The broad performance/training data and
+standalone TP data retain their qualified production paths; all 21 capacity
+points use the updated implementation. Peak PyTorch allocation includes
+resident graph/model tensors and, for training, optimizer state; external CANN
+and driver allocations are excluded. Each new size
+runs in a fresh process. Graph construction, neighbor lists, transfers and
+compilation are excluded. Each measurement uses a single NPU; concurrent workers
+are independent measurements.
+
+Standalone TP curves use natural-parity, path-preserving `uvu` products,
+lmax 2/3, and live external path weights. Forward-plus-VJP includes gradients
+of features, harmonics and weights. TP inputs and basis/layout preparation
+are outside timing. Each point uses at least two seconds of warmup, followed
+by three rounds of three individually synchronized calls; the reported value
+is the median of round medians. CPU FP64 small cases and full-batch sampled
+outputs/gradients are checked. Whole-model points beyond baseline OOM retain
+small-case CPU FP64 and full-size finite checks.
+
+MACE-MH-1 measurements retain the v0.1.0 protocol: the same official checkpoint,
+the `omat_pbe` head, a 6 Å cutoff and 78 neighbors/atom; median of five
+synchronized calls after two warmups. These pretrained measurements are
+separate from the four randomly initialized models above.
+
+Multi-NPU results use complete dynamic LAMMPS runs on one eight-NPU node,
+with 1/2/4/8 active NPUs, a 4.5 Å cutoff, 0.5 Å skin and 0.125 atoms/Å³.
+There are initially 56 physical neighbors and 80 cached skin edges per atom.
+Points are median complete loop times from three ten-step runs after five
+warmup steps. Compact owned outputs and native gathers are enabled. The
+[deployment guide](../lammps_user_mfftorch/docs/ASCEND.md#measured-md-performance)
+provides the complete latency, throughput and memory measurements.
+
+Validation covers energies, forces, force-loss parameter gradients and position
+gradients against CPU FP64 for four model configurations, as well as partial
+inputs, empty graphs, channel tails and derivatives through third order.
+Full-model checks compare energies, forces and parameters after 70 AdamW updates.
+MH-1 conversion is checked for all six heads on periodic Cu and mixed H/C/O.
+LAMMPS checks cover global virial, both Newton settings, changing ownership,
+empty ranks, triclinic cells and large coordinate offsets. Core model checks use
+relative L2 `1e-4` and componentwise `atol=2e-5`, `rtol=1e-4`; MH-1 deployment
+uses those componentwise tolerances and the corresponding combined norm budget.
+
+</details>
 
 ## License
 
