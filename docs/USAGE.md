@@ -525,12 +525,13 @@ HCCL routing, diagnostics and measured complete MD steps.
 
 ### C64 overview: refined OOM sampling
 
-The C64 overview uses 25 successful measurements from the 2026-10-27
-refinement, with fresh processes for every size and backend. It retains the
-matched checkpoints, two interactions, correlation 3, 4.5 Å cutoff, 2 Å lattice
+The C64 overview combines the 2026-10-27 refined sampling with the current
+capacity-mode measurements, with fresh processes for every size and backend.
+It retains the matched checkpoints, two interactions, correlation 3, 4.5 Å cutoff, 2 Å lattice
 spacing and 56 directed neighbors per atom. Balanced periodic integer boxes
-provide intermediate atom counts. The separate four-model sweep retains its
-original measurements.
+provide intermediate atom counts. The four-model sweep uses the same C64
+data and freshly measured capacity curves; the other training and performance
+inference curves retain their recorded measurements.
 
 The bars above the C64 panels connect the last successful size to the first
 observed OOM. Each bracket spans 16.7–20% of its last successful atom count:
@@ -541,7 +542,7 @@ observed OOM. Each bracket spans 16.7–20% of its last successful atom count:
 | Energy-and-force training | HP | 20,480 | 24,576 |
 | Energy-and-force inference | Original MACE/e3nn | 24,576 | 28,672 |
 | Energy-and-force inference | HP performance | 40,960 | 49,152 |
-| Energy-and-force inference | HP capacity | 98,304 | 114,688 |
+| Energy-and-force inference | HP capacity | 196,608 | 229,376 |
 
 Training measures the ordinary energy-and-force loss, parameter backward and
 AdamW. Each process passes the CPU FP64 small-case derivative gate; shared
@@ -579,16 +580,29 @@ functions and gradients do not imply identical AdamW trajectories after a
 parameter rescaling.
 
 Whole-model timings are medians of five individually synchronized calls after
-at least two seconds and three calls of warmup. The largest C256/lmax-3
-capacity sample uses one warmup and three timed calls. Separate three-call-block results
+at least two seconds and three calls of warmup. Separate three-call-block results
 are not mixed into these curves. The broad performance/training data and
-standalone TP data retain their qualified production paths; all 21 capacity
-points use the updated implementation. Peak PyTorch allocation includes
+standalone TP data retain their qualified production paths; all 27 successful
+capacity points use the updated implementation. Peak PyTorch allocation includes
 resident graph/model tensors and, for training, optimizer state; external CANN
 and driver allocations are excluded. Each new size
 runs in a fresh process. Graph construction, neighbor lists, transfers and
 compilation are excluded. Each measurement uses a single NPU; concurrent workers
 are independent measurements.
+
+Capacity inference streams the original frozen radial output Linear inside
+message chunks when full gate and gate-gradient tensors would exhaust the
+working-memory budget. Chunk sizes follow the current graph, operator widths
+and available memory. The original weights, FP32 arithmetic and dynamic graph
+are retained. Twenty-three old/new capacity pairs across the four model
+configurations pass full-size energy and force comparisons. Every new size
+passes small-case original-MACE CPU FP64 checks for energy, forces, coordinate
+second derivatives and mapped parameter gradients. Larger C64 points beyond
+the old OOM limit retain these small-case checks and full-size finite-output
+checks. Eighteen external-gate and eighteen projected operator cases cover
+derivatives through third order, channel tails, masks, empty inputs, shared
+inputs and coefficient mutation/replacement guards. See the
+[capacity API](HP_API.md#capacity-inference) for execution details.
 
 Standalone TP curves use natural-parity, path-preserving `uvu` products,
 lmax 2/3, and live external path weights. Forward-plus-VJP includes gradients
