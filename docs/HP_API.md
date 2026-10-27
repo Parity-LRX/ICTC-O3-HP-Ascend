@@ -70,8 +70,12 @@ Capacity mode saves the original message inputs and recomputes one edge chunk
 at a time for force gradients. Completed chunks are released before the next
 chunk is evaluated. Automatic chunk sizes use the actual channel and angular
 widths, device memory and current allocations, including the live gate-gradient
-buffer and node-layout buffers. A tight memory budget retains the native sparse
-graph map. Set `message_chunk_edges` explicitly to override automatic sizing.
+buffer and node-layout buffers. When a frozen final radial Linear would exhaust
+that budget, it is evaluated inside the message chunks. The adjoint accumulates
+gradients into the smaller radial hidden features, avoiding full-edge gate and
+gate-gradient storage. This evaluates the original Linear with its original
+weights. Other execution paths retain their established schedules.
+Set `message_chunk_edges` explicitly to override automatic sizing.
 
 Model training retains the native higher-order schedule. Standalone graph
 operators retain differentiable second and third derivatives through native

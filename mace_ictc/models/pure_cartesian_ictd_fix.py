@@ -1783,14 +1783,21 @@ class ICTDResidualInteractionBlock(nn.Module):
         node_feats_for_sc = node_feats
         node_feats = self.linear_up(node_feats)
         x1 = _split_irreps(node_feats, self.channels, self.input_lmax)
-        gates = self.fc(edge_feats)
         fused_message_blocks = None
-        if (getattr(self, "_ascend_hp", False) and node_feats.device.type == "npu"
-                and self.interaction_attn_heads == 0 and edge_block_callback is None):
-            from mace_ictc.ascend.tensor_product import graph_message
-            fused_message_blocks = graph_message(self.tp, x1, edge_attrs, gates,
-                edge_src, edge_dst, edge_mask,
+        ascend_message = (getattr(self, "_ascend_hp", False) and node_feats.device.type == "npu"
+                          and self.interaction_attn_heads == 0 and edge_block_callback is None)
+        if ascend_message:
+            from ictc_o3.backends.ascend.capacity_message import radial_graph_message
+            fused_message_blocks = radial_graph_message(self.tp, x1, edge_attrs,
+                self.fc, edge_feats, edge_src, edge_dst, edge_mask,
                 edge_chunk_size=getattr(self, "_ascend_edge_chunk_size", 16384))
+        if fused_message_blocks is None:
+            gates = self.fc(edge_feats)
+            if ascend_message:
+                from mace_ictc.ascend.tensor_product import graph_message
+                fused_message_blocks = graph_message(self.tp, x1, edge_attrs, gates,
+                    edge_src, edge_dst, edge_mask,
+                    edge_chunk_size=getattr(self, "_ascend_edge_chunk_size", 16384))
         if fused_message_blocks is None:
             x1e = {l: x1[l][edge_src] for l in range(self.input_lmax + 1)}
             edge_blocks = self.tp(x1e, edge_attrs, gates)
