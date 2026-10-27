@@ -6,10 +6,14 @@ molecular dynamics.
 
 Version 0.1.0 · [MIT License](LICENSE) · Distribution: `ictc-o3-hp-ascend`
 
-Start with the [user guide](docs/USAGE.md) for installation, training on your
-own data, MACE checkpoint conversion, structure prediction and LAMMPS deployment.
-Copyable recipes are in [`examples/`](examples/). Standalone operators and models
-are installed together as `ictc_o3` and `mace_ictc`.
+Use `ictc_o3` to build your own equivariant networks, or `mace_ictc` to train,
+convert and deploy MACE potentials. Both packages share the native Ascend C
+backend and ship in one distribution.
+
+[Installation](#installation) · [O(3) API](docs/O3_API.md) ·
+[Training and conversion](docs/USAGE.md) ·
+[LAMMPS](lammps_user_mfftorch/docs/ASCEND.md) ·
+[Native development](docs/DEVELOPMENT.md)
 
 ## Highlights
 
@@ -39,27 +43,58 @@ orders 1–3. Execution uses eager FP32 with HF32 disabled.
 Use a Linux ARM64 environment with matching Ascend drivers, CANN and
 PyTorch/`torch_npu`. The qualified stack is CANN 9.0.0, Python 3.10,
 PyTorch 2.7.1, `torch_npu` 2.7.1.post4 and Triton-Ascend 3.2.1.
-After sourcing the CANN environment, run inside a compute allocation:
+Install the platform's matching PyTorch/`torch_npu` wheels first. Run the
+following inside a compute allocation, using your site's CANN environment:
+
+### Install the operator backend
 
 ```bash
 git clone https://github.com/Parity-LRX/ICTC-O3-HP-Ascend.git
 cd ICTC-O3-HP-Ascend
-python -m pip install -e '.[hp,train,preprocess,conversion]' \
+source /path/to/cann/set_env.sh
+python -m pip install -e '.[hp]' \
   --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
-python -m ictc_o3.ascendc.build --output /path/to/build/ictc_ascendc --jobs 4
-export ICTC_ASCENDC_LIBRARY=/path/to/build/ictc_ascendc/libictc_ascendc.so
 ```
 
-Install the platform's matching PyTorch/`torch_npu` wheels first. Triton-Ascend
-supplies the `triton` namespace. Rebuild the native library after updating its
-sources or the device software stack. On Slurm clusters, use `sbatch`; the
-[user guide](docs/USAGE.md#1-install-and-build) includes a batch template.
-Native sources use CANN's ASC CMake interface, with separate Host bindings,
-device kernels and shared tiling headers. The [development guide](docs/DEVELOPMENT.md)
-describes the layout, build options and runtime installation.
+The `hp` extra includes CMake 3.20 or later and Triton-Ascend, which supplies
+the `triton` namespace. Native compilation also requires a host C++ compiler
+and the CANN compiler development package.
+
+### Build and install the native library
+
+```bash
+python -m ictc_o3.ascendc.build \
+  --output /path/to/build/ictc_ascendc \
+  --soc Ascend910B3 --install-prefix /path/to/ictc-native --jobs 4
+export ICTC_ASCENDC_LIBRARY=/path/to/ictc-native/lib/libictc_ascendc.so
+```
+
+Use the library path printed by the builder in subsequent jobs. The adjacent
+`ictc_ascendc_build.json` records the target, framework versions and C++ ABI.
+Rebuild after native source, target or software-stack changes. Compilation uses
+CANN's ASC CMake interface; imports load Python code without starting a build.
+
+Run a standalone tensor-product example with feature and gate gradients:
+
+```bash
+python examples/operators.py --ascendc
+```
+
+On Slurm clusters, submit installation, compilation and examples through
+`sbatch`; the [user guide](docs/USAGE.md#1-install-and-build) provides an
+allocation template. The [development guide](docs/DEVELOPMENT.md) documents
+toolkit selection, build options and the Host/kernel source layout.
 
 ## Train, convert and predict
 
+Add the dependencies for dataset preparation, training and MACE conversion:
+
+```bash
+python -m pip install -e '.[hp,train,preprocess,conversion]' \
+  --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
+```
+
+The `conversion` extra installs MACE 0.3.14 and its e3nn 0.4.4 dependency.
 The following commands run inside an allocation. The complete
 [training recipe](examples/train_hco.sh) reads atomic energy offsets from the
 preprocessor's `fitted_E0.csv` and explicitly enables native Ascend C operators:
@@ -92,14 +127,17 @@ python examples/foundation.py \
 ```
 
 The [user guide](docs/USAGE.md) covers data labels, E0, configurable model sizes,
-restart/evaluation, standard-model fine-tuning and performance/capacity modes.
+restart/evaluation, standard-model fine-tuning and inference modes. The Ascend
+training and LAMMPS recipes use short-range potentials; see
+[long-range terms](docs/USAGE.md#long-range-terms) for their scope.
 The MH-1 foundation adapter supports frozen inference.
 
 ## Python API
 
 ```text
-ictc_o3/       # Standalone O(3) operators and Ascend C entry points
-mace_ictc/     # Models, training, conversion and deployment
+ictc_o3/               # Standalone O(3) operators and Ascend C entry points
+mace_ictc/             # Models, training, conversion and deployment
+lammps_user_mfftorch/  # Plain LAMMPS interface and HCCL integration
 ```
 
 ### Standalone O(3) operators
@@ -113,29 +151,43 @@ implementations, basis data and native kernels; standalone calls import no
 `mace_ictc` modules. The MACE-ICTC framework uses these same operators.
 
 ```python
+import torch
 import torch_npu
-from ictc_o3 import EdgeTensorProduct, PackedGraphMessage, create_symmetric_contraction
+from ictc_o3 import EdgeTensorProduct, direction_harmonics
 from ictc_o3.ascendc import enable
 
-enable(mode='performance')  # Reads ICTC_ASCENDC_LIBRARY.
-tp = EdgeTensorProduct.create(channels=64, input_lmax=2, edge_lmax=2)
-# output = tp(features, harmonics, gates)
+torch.npu.set_device(0)
+enable(mode="performance")  # Reads ICTC_ASCENDC_LIBRARY.
+edges, channels, lmax = 1024, 64, 2
+tp = EdgeTensorProduct.create(channels=channels, input_lmax=lmax, edge_lmax=lmax)
+features = torch.randn(edges, channels * (lmax + 1)**2,
+                       device="npu", requires_grad=True)
+directions = torch.nn.functional.normalize(torch.randn(edges, 3, device="npu"), dim=-1)
+harmonics = torch.cat(direction_harmonics(directions, lmax, policy="generated"), dim=-1)
+gates = torch.randn(edges, tp.gate_width, device="npu", requires_grad=True)
+output = tp(features, harmonics, gates)
+output.square().mean().backward()
 ```
 
-Build the shared native library with `python -m ictc_o3.ascendc.build` using
-the [installation options](docs/O3_API.md#1-install-and-enable-the-high-performance-backend).
-Run [`examples/operators.py`](examples/operators.py) for an edge TP, or
+The input features contain `channels * (lmax + 1)**2` components per edge;
+`tp.gate_width` supplies the required external gate width. See
+[`examples/operators.py`](examples/operators.py) for the complete edge TP example, or
 [`examples/o3_layers.py`](examples/o3_layers.py) for graph messages, channel
 mixing, symmetric contraction and a mixed second derivative training step.
 
 ### MACE-ICTC models
 
+Given an NPU FP32 neighbor graph with the tensor fields below, create an
+initialized model and evaluate energy and forces:
+
 ```python
+import torch
 import torch_npu
 from mace_ictc.ascendc import enable
 from mace_ictc.hp import create_model, configure_model, energy_and_forces
 
-enable(mode='performance')  # 'capacity' selects chunked frozen inference.
+torch.npu.set_device(0)
+enable(mode="performance")
 model = create_model(channels=64, lmax=2, num_interactions=2, correlation=3)
 configure_model(model, training=True, policy='generated')
 
@@ -148,6 +200,10 @@ model.eval().requires_grad_(False)
 configure_model(model, training=False, policy='generated')
 prediction = energy_and_forces(model, **graph)
 ```
+
+Use `performance` for training and inference. For chunked frozen inference,
+freeze the model parameters and select `enable(mode="capacity")`; see
+[inference modes](docs/USAGE.md#performance-and-capacity-modes).
 
 The model API returns interaction energies; prediction examples restore
 checkpoint atomic reference energies exactly once. Forces require autograd,
