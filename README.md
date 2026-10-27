@@ -13,7 +13,7 @@ LAMMPS deployment, see the [Usage guide](docs/USAGE.md).
 - MACE energy-and-force training: up to 4.76× the throughput of original
   PyTorch MACE/e3nn, including force-loss backward and AdamW.
 - Energy-and-force inference: up to 4.48× faster than original MACE/e3nn;
-  C64/lmax 2 reaches 54.8k atom-steps/s.
+  C64/lmax 2 reaches 54.9k atom-steps/s.
 - Standalone O(3) tensor products: up to 3.90× forward and 3.85×
   forward-plus-gradient throughput over e3nn; 23.18× and 18.37× over
   MindChemistry PyNative at C64/lmax 2.
@@ -26,9 +26,9 @@ Results use Ascend 910B3, eager FP32 and HF32 disabled, without `torch.compile`.
 
 ![Single-Ascend C64/lmax-2 training and energy-and-force inference throughput and peak allocated memory.](docs/figures/ascend-training-inference.svg)
 
-At C64/lmax 2, inference reaches 54,823 atom-steps/s at 16,384 atoms,
-3.62× original MACE/e3nn. Full training reaches 18,486 atom-steps/s at
-8,192 atoms, a 3.67× speedup. Capacity inference completes 65,536 atoms.
+At C64/lmax 2, inference reaches 54,873 atom-steps/s at 16,384 atoms,
+3.63× original MACE/e3nn. Full training reaches 18,434 atom-steps/s at
+8,192 atoms, a 3.66× speedup. Capacity inference completes 98,304 atoms.
 
 <details>
 <summary>Throughput and memory across four model configurations</summary>
@@ -42,8 +42,8 @@ over original MACE/e3nn.
 
 ![Peak allocated memory versus atom count across four MACE configurations.](docs/figures/ascend-mace-memory.svg)
 
-Curves connect measured sizes. Crosses mark observed e3nn and performance-mode
-OOM sizes; capacity curves end at their last successful sample.
+Curves connect measured sizes from the four-model sweep. The refined C64
+success-to-OOM brackets are shown in the overview above.
 
 </details>
 

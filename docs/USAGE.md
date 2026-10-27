@@ -523,6 +523,35 @@ HCCL routing, diagnostics and measured complete MD steps.
 <details>
 <summary>Measurement setup and validation coverage</summary>
 
+### C64 overview: refined OOM sampling
+
+The C64 overview uses 25 successful measurements from the 2026-10-27
+refinement, with fresh processes for every size and backend. It retains the
+matched checkpoints, two interactions, correlation 3, 4.5 Å cutoff, 2 Å lattice
+spacing and 56 directed neighbors per atom. Balanced periodic integer boxes
+provide intermediate atom counts. The separate four-model sweep retains its
+original measurements.
+
+The bars above the C64 panels connect the last successful size to the first
+observed OOM. Each bracket spans 16.7–20% of its last successful atom count:
+
+| Workload | Backend | Last success (atoms) | First OOM (atoms) |
+| --- | --- | ---: | ---: |
+| Energy-and-force training | Original MACE/e3nn | 12,288 | 14,336 |
+| Energy-and-force training | HP | 20,480 | 24,576 |
+| Energy-and-force inference | Original MACE/e3nn | 24,576 | 28,672 |
+| Energy-and-force inference | HP performance | 40,960 | 49,152 |
+| Energy-and-force inference | HP capacity | 98,304 | 114,688 |
+
+Training measures the ordinary energy-and-force loss, parameter backward and
+AdamW. Each process passes the CPU FP64 small-case derivative gate; shared
+sizes also pass full energy/force comparisons and mapped training-gradient
+checks. Timings are medians of five synchronized calls after at least three
+warmup calls and two seconds. The memory reference line uses the allocator's
+reported device capacity of 60.96 GiB; curves show peak PyTorch allocations.
+
+### Recorded operator and model sweeps
+
 The MindChemistry comparison uses unchanged MindChemistry 0.2.0 from the official
 [`r0.7` source](https://github.com/mindspore-ai/mindscience/tree/b233dc1ab152dfe29e0ff2cafb55c780dff34c67/MindChemistry)
 with MindSpore 2.10.0. The path-preserving `uvu` tensor products match
