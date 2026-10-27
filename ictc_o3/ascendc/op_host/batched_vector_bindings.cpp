@@ -1,3 +1,4 @@
+#include "kernel_launch.h"
 #include <ATen/ATen.h>
 #include <torch/library.h>
 #include <algorithm>
@@ -5,7 +6,6 @@
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 #include "tiling/platform/platform_ascendc.h"
-#include "aclrtlaunch_ictc_batched_vector.h"
 namespace {
 uint64_t A8(uint64_t n) {return (n+7)/8*8;}
 at::Tensor batched_vector(const at::Tensor& a,const at::Tensor& b,const at::Tensor& ix,at::IntArrayRef s) {
@@ -35,7 +35,7 @@ at::Tensor batched_vector(const at::Tensor& a,const at::Tensor& b,const at::Tens
     const uint32_t blocks=std::min<uint64_t>(platform->GetCoreNumAiv(),((n+rows-1)/rows)*((c+bc-1)/bc));
     const uint64_t as=a.stride(0),bs=b.stride(0);
     auto launch=[a,b,ix,out,stream,n,as,bs,q,i,c,mode,rows,bc,blocks]() -> int {
-        ACLRT_LAUNCH_KERNEL(ictc_batched_vector)(blocks,stream,
+        ictc_ascendc::launch_batched_vector(blocks,stream,
             reinterpret_cast<uint8_t*>(a.data_ptr()),reinterpret_cast<uint8_t*>(b.data_ptr()),
             reinterpret_cast<uint8_t*>(out.data_ptr()),reinterpret_cast<uint8_t*>(ix.data_ptr()),n,as,bs,q,i,c,mode,rows,bc);return 0;
     };

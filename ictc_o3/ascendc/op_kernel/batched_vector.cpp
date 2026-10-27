@@ -1,4 +1,5 @@
 #include "kernel_operator.h"
+#include "kernel_launch.h"
 using namespace AscendC;
 namespace {
 __aicore__ inline uint32_t A8(uint32_t n) {return (n+7)/8*8;}
@@ -83,3 +84,14 @@ extern "C" __global__ __aicore__ void ictc_batched_vector(GM_ADDR a,GM_ADDR b,GM
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     BatchedVector kernel;kernel.Init(a,b,out,ix,n,as,bs,q,i,c,mode,rows,bc);kernel.Process();
 }
+
+// Host launcher; compiled by the ASC toolchain.
+
+namespace ictc_ascendc {
+void launch_batched_vector(uint32_t blocks, aclrtStream stream,
+    uint8_t* a, uint8_t* b, uint8_t* out, uint8_t* ix, uint64_t n, uint64_t as, uint64_t bs,
+    uint32_t q, uint32_t i, uint32_t c, uint32_t mode, uint32_t rows, uint32_t bc) {
+    ictc_batched_vector<<<blocks, nullptr, stream>>>(
+        a, b, out, ix, n, as, bs, q, i, c, mode, rows, bc);
+}
+} // namespace ictc_ascendc

@@ -1,3 +1,4 @@
+#include "kernel_launch.h"
 #include <ATen/ATen.h>
 #include <torch/library.h>
 #include <algorithm>
@@ -5,7 +6,6 @@
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 #include "tiling/platform/platform_ascendc.h"
-#include "aclrtlaunch_ictc_epilogue.h"
 namespace {
 uint64_t align8(uint64_t x) { return (x+7)/8*8; }
 at::Tensor epilogue_impl(const at::Tensor& l,const at::Tensor& r,const at::Tensor& g,
@@ -60,7 +60,7 @@ at::Tensor epilogue_impl(const at::Tensor& l,const at::Tensor& r,const at::Tenso
     const uint64_t ls=l.stride(0),rs=r.stride(0);
     const auto stream=c10_npu::getCurrentNPUStream().stream(false);
     auto launch=[l,r,g,dst,mask,meta,ix,out,stream,n,ls,rs,c,q,p,m,paths,mode,rows,bc,masked,dense,hoist,blocks]() -> int {
-        ACLRT_LAUNCH_KERNEL(ictc_epilogue)(blocks,stream,
+        ictc_ascendc::launch_epilogue(blocks,stream,
             reinterpret_cast<uint8_t*>(l.data_ptr()),reinterpret_cast<uint8_t*>(r.data_ptr()),
             reinterpret_cast<uint8_t*>(g.data_ptr()),reinterpret_cast<uint8_t*>(dst.data_ptr()),
             reinterpret_cast<uint8_t*>(mask.data_ptr()),reinterpret_cast<uint8_t*>(meta.data_ptr()),

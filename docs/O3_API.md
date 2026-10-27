@@ -30,7 +30,7 @@ Use the PyTorch/torch_npu versions supplied for your CANN environment. Install
 the operator dependencies from the repository root:
 
 ```bash
-pip install -e '.[hp]' 'cmake>=3.16' \
+pip install -e '.[hp]' \
   --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
 ```
 
@@ -46,6 +46,8 @@ Use the library path printed by the builder. Rebuild when CANN, PyTorch,
 torch_npu, the C++ ABI, the target SoC or native kernel sources change.
 On a Slurm cluster, submit builds and examples through `sbatch`; the
 [user guide](USAGE.md#1-install-and-build) provides the allocation template.
+For native source organization, explicit `--soc` / `--cann-path` selection and
+`--install-prefix`, see the [development guide](DEVELOPMENT.md).
 
 ```python
 import torch

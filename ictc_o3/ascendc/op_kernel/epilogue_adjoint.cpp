@@ -1,4 +1,5 @@
 #include "kernel_operator.h"
+#include "kernel_launch.h"
 using namespace AscendC;
 namespace {
 __aicore__ inline uint32_t A8(uint32_t x) { return (x+7)/8*8; }
@@ -191,3 +192,17 @@ extern "C" __global__ __aicore__ void ictc_epilogue_adjoint(
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     Adjoint kernel;kernel.Init(l,r,g,hl,hr,dst,mask,meta,ix,dl,dr,dg,n,ls,rs,hls,hrs,c,q,p,m,second,rows,bc,masked,flags,hoist);kernel.Process();
 }
+
+// Host launcher; compiled by the ASC toolchain.
+
+namespace ictc_ascendc {
+void launch_epilogue_adjoint(uint32_t blocks, aclrtStream stream,
+    uint8_t* l, uint8_t* r, uint8_t* g, uint8_t* hl, uint8_t* hr, uint8_t* dst, uint8_t* mask,
+    uint8_t* meta, uint8_t* ix, uint8_t* dl, uint8_t* dr, uint8_t* dg, uint64_t n, uint64_t ls,
+    uint64_t rs, uint64_t hls, uint64_t hrs, uint32_t c, uint32_t q, uint32_t p, uint32_t m,
+    uint32_t second, uint32_t rows, uint32_t bc, uint32_t masked, uint32_t flags, uint32_t hoist) {
+    ictc_epilogue_adjoint<<<blocks, nullptr, stream>>>(
+        l, r, g, hl, hr, dst, mask, meta, ix, dl, dr, dg, n, ls, rs, hls, hrs, c, q, p, m, second,
+        rows, bc, masked, flags, hoist);
+}
+} // namespace ictc_ascendc

@@ -1,4 +1,5 @@
 #include "kernel_operator.h"
+#include "kernel_launch.h"
 #include "map_params.h"
 using namespace AscendC;
 
@@ -273,3 +274,20 @@ extern "C" __global__ __aicore__ void ictc_weighted_map(
         {n,c,rc,a,b,paths,m,o,mode,bank,indexed,rows,channels,terms,head,globalStride,localStride,outputNodes,graph,masked});
     kernel.Process();
 }
+
+// Host launcher; compiled by the ASC toolchain.
+
+namespace ictc_ascendc {
+void launch_weighted_map(uint32_t blocks, aclrtStream stream,
+    uint8_t* l, uint8_t* r, uint8_t* w, uint8_t* g, uint8_t* species, uint8_t* meta, uint8_t* ix0,
+    uint8_t* ix1, uint8_t* source, uint8_t* destination, uint8_t* mask, uint8_t* out, uint64_t n,
+    uint32_t c, uint32_t rc, uint32_t a, uint32_t b, uint32_t paths, uint32_t m, uint32_t o,
+    uint32_t mode, uint32_t bank, uint32_t indexed, uint32_t rows, uint32_t channels,
+    uint32_t terms, uint32_t head, uint32_t globalStride, uint32_t localStride,
+    uint64_t outputNodes, uint32_t graph, uint32_t masked) {
+    ictc_weighted_map<<<blocks, nullptr, stream>>>(
+        l, r, w, g, species, meta, ix0, ix1, source, destination, mask, out, n, c, rc, a, b, paths,
+        m, o, mode, bank, indexed, rows, channels, terms, head, globalStride, localStride,
+        outputNodes, graph, masked);
+}
+} // namespace ictc_ascendc

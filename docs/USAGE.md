@@ -57,7 +57,6 @@ Install and build from the repository directory:
 cd "$ICTC_REPO"
 sbatch --account=YOUR_ACCOUNT examples/ascend_job.sbatch \
   python -m pip install -e '.[hp,train,preprocess,conversion]' \
-    'cmake>=3.16' \
     --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
 ```
 
@@ -65,7 +64,7 @@ After installation completes successfully:
 
 ```bash
 sbatch --account=YOUR_ACCOUNT examples/ascend_job.sbatch \
-  python -m mace_ictc.ascendc.build \
+  python -m ictc_o3.ascendc.build \
     --output /absolute/path/to/build/ictc_ascendc --jobs 4
 ```
 
@@ -82,6 +81,24 @@ CANN, PyTorch or `torch_npu`. Imports never start compilation. Keep the
 conversion dependencies installed when loading foundation archives. The
 `conversion` extra pins MACE 0.3.14 and e3nn 0.4.4 to match the
 [upstream requirements](https://github.com/ACEsuit/mace/blob/v0.3.14/setup.cfg).
+
+The `hp` extra includes CMake 3.20 or later. Native compilation uses the
+installed CANN ASC toolchain. To choose the target explicitly and install a
+runtime library outside the build tree:
+
+```bash
+sbatch --account=YOUR_ACCOUNT "$ICTC_REPO/examples/ascend_job.sbatch" \
+  python -m ictc_o3.ascendc.build \
+    --output /absolute/path/to/build/ictc_ascendc \
+    --soc Ascend910B3 --install-prefix /absolute/path/to/ictc-native --jobs 4
+```
+
+After that job succeeds, set `ICTC_ASCENDC_LIBRARY` to
+`/absolute/path/to/ictc-native/lib/libictc_ascendc.so`. The adjacent
+`ictc_ascendc_build.json` records the toolkit path, target, framework versions
+and C++ ABI. Build and install options are described in the
+[development guide](DEVELOPMENT.md). The old `mace_ictc.ascendc.build` command
+remains a compatibility alias.
 
 The batch template sources `ICTC_SITE_ENV`, selects `ICTC_ENV/bin`, bounds CPU
 threads and keeps caches in `.cache/ictc/`. It does not invent an NPU visibility

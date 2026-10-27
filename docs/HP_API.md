@@ -18,13 +18,16 @@ Build inside an NPU compute allocation, with the CANN environment sourced and
 a host C++ compiler and CMake available:
 
 ```bash
-python -m mace_ictc.ascendc.build --output /path/to/build/ictc_ascendc --jobs 4
+python -m ictc_o3.ascendc.build --output /path/to/build/ictc_ascendc --jobs 4
 export ICTC_ASCENDC_LIBRARY=/path/to/build/ictc_ascendc/libictc_ascendc.so
 ```
 
 Use the exact library path printed by the builder. The binary depends on the
 local CANN, PyTorch, torch_npu, C++ ABI and target SoC; rebuild when these change.
 Importing the package never starts compilation.
+The [development guide](DEVELOPMENT.md) covers the official CANN ASC build
+interface, explicit target selection and installation. The former
+`mace_ictc.ascendc.build` entry point remains an alias.
 
 ```python
 import torch_npu

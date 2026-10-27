@@ -1,3 +1,4 @@
+#include "kernel_launch.h"
 #include <ATen/ATen.h>
 #include <torch/library.h>
 #include <algorithm>
@@ -12,8 +13,6 @@
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 #include "tiling/platform/platform_ascendc.h"
-#include "aclrtlaunch_ictc_binary.h"
-#include "aclrtlaunch_ictc_weighted_map.h"
 #include "map_params.h"
 
 namespace {
@@ -76,7 +75,7 @@ at::Tensor binary(const at::Tensor& x, const at::Tensor& y, int64_t mode, int64_
     const uint32_t blocks = std::min<uint64_t>(info[1],tasks);
     const auto stream = c10_npu::getCurrentNPUStream().stream(false);
     auto launch = [x,y,out,indices,stream,blocks,tile,mode,alpha,beta,columns]() -> int {
-        ACLRT_LAUNCH_KERNEL(ictc_binary)(blocks, stream,
+        ictc_ascendc::launch_binary(blocks, stream,
             reinterpret_cast<uint8_t*>(x.data_ptr()), reinterpret_cast<uint8_t*>(y.data_ptr()),
             reinterpret_cast<uint8_t*>(out.data_ptr()), static_cast<uint64_t>(x.numel()),
             static_cast<uint32_t>(tile), static_cast<uint32_t>(mode),
@@ -144,7 +143,7 @@ at::Tensor weighted_map(const at::Tensor& l,const at::Tensor& r,const at::Tensor
     const uint32_t blocks=std::min<uint64_t>(info[1],tasks);
     const auto stream=c10_npu::getCurrentNPUStream().stream(false);
     auto launch=[l,r,w,g,species,meta,ix0,ix1,source,destination,mask,out,stream,p,blocks]() -> int {
-        ACLRT_LAUNCH_KERNEL(ictc_weighted_map)(blocks,stream,
+        ictc_ascendc::launch_weighted_map(blocks,stream,
             reinterpret_cast<uint8_t*>(l.data_ptr()),reinterpret_cast<uint8_t*>(r.data_ptr()),
             reinterpret_cast<uint8_t*>(w.data_ptr()),reinterpret_cast<uint8_t*>(g.data_ptr()),
             reinterpret_cast<uint8_t*>(species.data_ptr()),reinterpret_cast<uint8_t*>(meta.data_ptr()),

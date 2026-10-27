@@ -1,3 +1,4 @@
+#include "kernel_launch.h"
 #include <ATen/ATen.h>
 #include <torch/library.h>
 #include <climits>
@@ -11,7 +12,6 @@
 #include "torch_npu/csrc/framework/OpCommand.h"
 #include "tiling/tiling_api.h"
 #include "tiling/platform/platform_ascendc.h"
-#include "aclrtlaunch_ictc_matmul.h"
 
 at::Tensor ictc_ascendc_add_bias(const at::Tensor&,const at::Tensor&);
 
@@ -76,7 +76,7 @@ at::Tensor mm(const at::Tensor& a,const at::Tensor& b,bool ta,bool tb,
     auto biasTensor=bias ? *bias : a;
     const auto stream=c10_npu::getCurrentNPUStream().stream(false);
     auto launch=[a,b,biasTensor,out,scratch,schedule,stream,ta,tb]() -> int {
-        ACLRT_LAUNCH_KERNEL(ictc_matmul)(schedule.cores,stream,
+        ictc_ascendc::launch_matmul(schedule.cores,stream,
             reinterpret_cast<uint8_t*>(a.data_ptr()),reinterpret_cast<uint8_t*>(b.data_ptr()),
             reinterpret_cast<uint8_t*>(biasTensor.data_ptr()),reinterpret_cast<uint8_t*>(out.data_ptr()),
             reinterpret_cast<uint8_t*>(scratch.data_ptr()),reinterpret_cast<uint8_t*>(schedule.data.data_ptr()),

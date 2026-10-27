@@ -12,7 +12,7 @@ license = { text = "MIT" }
 dependencies = ["torch>=2.7", "numpy>=1.24,<2", "e3nn>=0.4.4,<0.6", "ase>=3.22", "opt-einsum-fx>=0.1.4"]
 
 [project.optional-dependencies]
-hp = ["triton-ascend==3.2.1; platform_system=='Linux'", "pybind11", "ninja"]
+hp = ["triton-ascend==3.2.1; platform_system=='Linux'", "cmake>=3.20", "ninja"]
 train = ["h5py", "pandas", "scipy", "matscipy==1.1.1", "tqdm"]
 preprocess = ["h5py", "pandas", "tables", "matscipy==1.1.1", "tqdm"]
 conversion = ["mace-torch==0.3.14", "e3nn==0.4.4"]
@@ -31,4 +31,8 @@ include = ["ictc_o3", "ictc_o3.*", "mace_ictc", "mace_ictc.*"]
 exclude = ["mace_ictc.bench", "mace_ictc.bench.*", "mace_ictc.test", "mace_ictc.test.*"]
 
 [tool.setuptools.package-data]
-ictc_o3 = ["basis/_ictd_basis/v1/*.pt", "ascendc/CMakeLists.txt", "ascendc/csrc/*"]
+ictc_o3 = [
+    "basis/_ictd_basis/v1/*.pt",
+    "ascendc/CMakeLists.txt", "ascendc/cmake/*.cmake",
+    "ascendc/include/*.h", "ascendc/op_host/*.cpp", "ascendc/op_kernel/*.cpp",
+]

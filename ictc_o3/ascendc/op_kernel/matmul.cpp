@@ -1,5 +1,6 @@
 #define ASCENDC_CUBE_ONLY
 #include "kernel_operator.h"
+#include "kernel_launch.h"
 #include "lib/matmul_intf.h"
 
 using namespace AscendC;
@@ -57,3 +58,14 @@ extern "C" __global__ __aicore__ void ictc_matmul(
         else Calculate<false,false>(a,b,bias,c,workspace,tiling,hasBias);
     }
 }
+
+// Host launcher; compiled by the ASC toolchain.
+
+namespace ictc_ascendc {
+void launch_matmul(uint32_t blocks, aclrtStream stream,
+    uint8_t* a, uint8_t* b, uint8_t* bias, uint8_t* c, uint8_t* workspace, uint8_t* metadata,
+    uint32_t transposeA, uint32_t transposeB, uint32_t hasBias) {
+    ictc_matmul<<<blocks, nullptr, stream>>>(
+        a, b, bias, c, workspace, metadata, transposeA, transposeB, hasBias);
+}
+} // namespace ictc_ascendc

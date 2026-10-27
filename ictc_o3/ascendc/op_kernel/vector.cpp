@@ -1,4 +1,5 @@
 #include "kernel_operator.h"
+#include "kernel_launch.h"
 
 using namespace AscendC;
 
@@ -122,3 +123,14 @@ extern "C" __global__ __aicore__ void ictc_binary(
     kernel.Init(x, y, z, size, tile, mode,alpha,beta,indices,columns);
     kernel.Process();
 }
+
+// Host launcher; compiled by the ASC toolchain.
+
+namespace ictc_ascendc {
+void launch_binary(uint32_t blocks, aclrtStream stream,
+    uint8_t* x, uint8_t* y, uint8_t* z, uint64_t size, uint32_t tile, uint32_t mode, float alpha,
+    float beta, uint8_t* indices, uint64_t columns) {
+    ictc_binary<<<blocks, nullptr, stream>>>(
+        x, y, z, size, tile, mode, alpha, beta, indices, columns);
+}
+} // namespace ictc_ascendc

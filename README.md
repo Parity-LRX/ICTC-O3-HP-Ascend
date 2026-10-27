@@ -44,9 +44,9 @@ After sourcing the CANN environment, run inside a compute allocation:
 ```bash
 git clone https://github.com/Parity-LRX/ICTC-O3-HP-Ascend.git
 cd ICTC-O3-HP-Ascend
-python -m pip install -e '.[hp,train,preprocess,conversion]' 'cmake>=3.16' \
+python -m pip install -e '.[hp,train,preprocess,conversion]' \
   --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
-python -m mace_ictc.ascendc.build --output /path/to/build/ictc_ascendc --jobs 4
+python -m ictc_o3.ascendc.build --output /path/to/build/ictc_ascendc --jobs 4
 export ICTC_ASCENDC_LIBRARY=/path/to/build/ictc_ascendc/libictc_ascendc.so
 ```
 
@@ -54,6 +54,9 @@ Install the platform's matching PyTorch/`torch_npu` wheels first. Triton-Ascend
 supplies the `triton` namespace. Rebuild the native library after updating its
 sources or the device software stack. On Slurm clusters, use `sbatch`; the
 [user guide](docs/USAGE.md#1-install-and-build) includes a batch template.
+Native sources use CANN's ASC CMake interface, with separate Host bindings,
+device kernels and shared tiling headers. The [development guide](docs/DEVELOPMENT.md)
+describes the layout, build options and runtime installation.
 
 ## Train, convert and predict
 

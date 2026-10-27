@@ -1,4 +1,5 @@
 #include "kernel_operator.h"
+#include "kernel_launch.h"
 using namespace AscendC;
 namespace {
 __aicore__ inline uint32_t A8(uint32_t x) { return (x+7)/8*8; }
@@ -195,3 +196,17 @@ extern "C" __global__ __aicore__ void ictc_epilogue(
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     Epilogue kernel;kernel.Init(l,r,g,dst,mask,meta,ix,out,n,ls,rs,c,q,p,m,paths,mode,rows,bc,masked,dense,hoist);kernel.Process();
 }
+
+// Host launcher; compiled by the ASC toolchain.
+
+namespace ictc_ascendc {
+void launch_epilogue(uint32_t blocks, aclrtStream stream,
+    uint8_t* l, uint8_t* r, uint8_t* g, uint8_t* dst, uint8_t* mask, uint8_t* meta, uint8_t* ix,
+    uint8_t* out, uint64_t n, uint64_t ls, uint64_t rs, uint32_t c, uint32_t q, uint32_t p,
+    uint32_t m, uint32_t paths, uint32_t mode, uint32_t rows, uint32_t bc, uint32_t masked,
+    uint32_t dense, uint32_t hoist) {
+    ictc_epilogue<<<blocks, nullptr, stream>>>(
+        l, r, g, dst, mask, meta, ix, out, n, ls, rs, c, q, p, m, paths, mode, rows, bc, masked,
+        dense, hoist);
+}
+} // namespace ictc_ascendc
