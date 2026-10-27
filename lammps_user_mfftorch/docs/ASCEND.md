@@ -278,9 +278,9 @@ periodic-coordinate and moving-edge cases against NPU cutoff decisions.
 
 ## Measured MD performance
 
-The initialized H/C/O model has 64 channels, angular degree 2, two interactions
-and correlation order 3. Each MPI rank uses one Ascend 910B3. All rank counts
-and sizes use the same checkpoint, strict FP32 with HF32 disabled, dynamic eager
+The C64 results use an initialized H/C/O model with 64 channels, angular degree 2,
+two interactions and correlation order 3. Each MPI rank uses one Ascend 910B3.
+All C64 rank counts and sizes use the same checkpoint, strict FP32 with HF32 disabled, dynamic eager
 execution, a 4.5 Angstrom cutoff, 0.5 Angstrom skin, density 0.125 atoms/Angstrom^3
 and a 0.5 fs NVE timestep. There are initially 56 physical neighbors and 80
 cached skin edges per atom. Skin pruning and feature overlap are disabled;
@@ -346,6 +346,58 @@ rounds of ten synchronized calls per route; each round has nine energy/force
 calls and one energy/force/virial call. Numerical comparisons pass for all three
 sizes. The complete MD timings above use evolving coordinates and CPU integration;
 small differences from the stationary control are expected.
+
+### MACE-MH-1 scaling
+
+These pretrained measurements retain all six MACE-MH-1 heads and select
+`omat_pbe`. The periodic FCC Cu lattice constant is 3.615 Angstrom, with small
+initial displacements, a 6 Angstrom cutoff and a 0.5 Angstrom skin. The initial
+graphs have 78 physical neighbors and 86 cached skin edges per atom.
+Execution uses performance mode, eager FP32 with HF32 disabled, native feature
+gathers, compact owned outputs and layerwise HCCL exchange.
+
+Strong scaling fixes 10,976 atoms. Weak scaling periodically replicates a
+4,000-atom base cell, keeping 4,000 owned atoms per NPU. Each MPI rank uses one
+NPU on the same Ascend 910B3 node, with an exclusive eight-NPU allocation.
+The 1/2/4/8-rank process grids are 1x1x1, 1x1x2, 1x2x2 and 2x2x2.
+
+Values are medians of three ten-step complete LAMMPS loops after five warmup
+steps, with a 0.5 fs NVE timestep and initial temperature 30 K. CPU integration,
+neighbor displacement checks, transfers, energy, forces, thermodynamic global
+virials and HCCL communication are included. Neighbor rebuilding follows the
+0.5 Angstrom skin criterion. Dispatch uses `TASK_QUEUE_ENABLE=2` and no custom
+CPU affinity. The table reports the largest allocator peak across active ranks.
+
+| Scaling | Atoms | NPUs | ms/step | atom-steps/s | Speedup | Efficiency | Allocated GiB/NPU | Reserved GiB/NPU |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Strong | 10,976 | 1 | 1595.33 | 6,880 | 1.00x | 100.0% | 46.49 | 53.36 |
+| Strong | 10,976 | 2 | 828.32 | 13,251 | 1.93x | 96.3% | 26.06 | 28.94 |
+| Strong | 10,976 | 4 | 420.04 | 26,131 | 3.80x | 95.0% | 14.90 | 16.57 |
+| Strong | 10,976 | 8 | 222.43 | 49,345 | 7.17x | 89.7% | 9.11 | 10.08 |
+| Weak | 4,000 | 1 | 580.11 | 6,895 | 1.00x | 100.0% | 16.65 | 17.18 |
+| Weak | 8,000 | 2 | 587.39 | 13,620 | 1.98x | 98.8% | 19.73 | 22.64 |
+| Weak | 16,000 | 4 | 605.96 | 26,404 | 3.83x | 95.7% | 20.82 | 25.72 |
+| Weak | 32,000 | 8 | 609.52 | 52,501 | 7.61x | 95.2% | 19.77 | 23.42 |
+
+Strong-scaling efficiency is `T1 / (ranks * Tranks)` at fixed total atoms.
+Weak-scaling efficiency is `T1 / Tranks` at fixed atoms per NPU; its speedup
+column is the total-throughput ratio to one NPU. Eight NPUs reach 7.17x strong
+speedup with 89.7% efficiency, and 95.2% weak efficiency at 32,000 atoms.
+
+Independent original-MACE CPU FP64 checks cover energies, forces and global
+virials on 1/2/4/8 NPUs, including translated and evolved structures and owner
+migration. These small-system checks use `atol=2e-5`, `rtol=1e-4` and the
+corresponding combined norm budget. Full-size strong-scaling results are paired
+with the one-NPU result; weak-scaling results are paired with the periodically
+replicated one-NPU base cell. Energies and virials are compared per atom.
+Both componentwise and norm consistency checks compose the two FP32 reference
+budgets: the componentwise bound is `(2*a + r*(abs(A)+abs(B))) / (1-r)`, with
+`a=2e-5` and `r=1e-4`. Maximum cross-rank force differences are
+`3.43e-5` eV/Angstrom for strong scaling and `1.57e-5` for weak scaling.
+The components with the largest absolute and tolerance-normalized force
+differences at 10,976 atoms are additionally checked against full-system
+original-MACE FP64 energy central differences at steps of `1e-4` and `5e-5`
+Angstrom; both NPU predictions satisfy the original single-reference budgets.
 
 ## Diagnostics
 

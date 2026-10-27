@@ -599,18 +599,25 @@ is the median of round medians. CPU FP64 small cases and full-batch sampled
 outputs/gradients are checked. Whole-model points beyond baseline OOM retain
 small-case CPU FP64 and full-size finite checks.
 
-MACE-MH-1 measurements retain the v0.1.0 protocol: the same official checkpoint,
+Single-NPU MACE-MH-1 measurements retain the v0.1.0 protocol: the same official checkpoint,
 the `omat_pbe` head, a 6 Å cutoff and 78 neighbors/atom; median of five
 synchronized calls after two warmups. These pretrained measurements are
 separate from the four randomly initialized models above.
 
-Multi-NPU results use complete dynamic LAMMPS runs on one eight-NPU node,
+C64 multi-NPU results use complete dynamic LAMMPS runs on one eight-NPU node,
 with 1/2/4/8 active NPUs, a 4.5 Å cutoff, 0.5 Å skin and 0.125 atoms/Å³.
 There are initially 56 physical neighbors and 80 cached skin edges per atom.
 Points are median complete loop times from three ten-step runs after five
 warmup steps. Compact owned outputs and native gathers are enabled. The
 [deployment guide](../lammps_user_mfftorch/docs/ASCEND.md#measured-md-performance)
 provides the complete latency, throughput and memory measurements.
+
+Pretrained MACE-MH-1 multi-NPU runs retain all six heads and select `omat_pbe`,
+using periodic FCC Cu, a 6 Å cutoff and a 0.5 Å skin in performance mode.
+Strong scaling fixes 10,976 atoms; weak scaling uses 4,000 atoms/NPU, reaching
+32,000 atoms on eight NPUs. The same five-warmup/three-ten-step complete-loop
+timing includes CPU integration, neighbor checks, transfers, energy, forces,
+global virials and HCCL. See the [MH-1 scaling results](../lammps_user_mfftorch/docs/ASCEND.md#mace-mh-1-scaling).
 
 Validation covers energies, forces, force-loss parameter gradients and position
 gradients against CPU FP64 for four model configurations, as well as partial
@@ -619,8 +626,12 @@ Full-model checks compare energies, forces and parameters after 70 AdamW updates
 MH-1 conversion is checked for all six heads on periodic Cu and mixed H/C/O.
 LAMMPS checks cover global virial, both Newton settings, changing ownership,
 empty ranks, triclinic cells and large coordinate offsets. Core model checks use
-relative L2 `1e-4` and componentwise `atol=2e-5`, `rtol=1e-4`; MH-1 deployment
-uses those componentwise tolerances and the corresponding combined norm budget.
+relative L2 `1e-4` and componentwise `atol=2e-5`, `rtol=1e-4`; small-system
+MH-1 deployment uses those componentwise tolerances and the corresponding
+combined norm budget against original MACE in CPU FP64. Full-size MD consistency
+checks compare energy and virial per atom and compose the two FP32 reference
+budgets for both componentwise and norm checks. Selected large-system force
+components are also checked with original-MACE FP64 central differences.
 
 </details>
 

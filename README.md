@@ -19,6 +19,8 @@ LAMMPS deployment, see the [Usage guide](docs/USAGE.md).
   MindChemistry PyNative at C64/lmax 2.
 - Eight-NPU MD: 6.64× speedup, 83.0% efficiency and 248,559 atom-steps/s
   for a complete 32,768-atom LAMMPS step.
+- Pretrained MACE-MH-1 on eight NPUs: 89.7% strong-scaling efficiency and
+  95.2% weak-scaling efficiency, reaching 52,501 atom-steps/s.
 
 Results use Ascend 910B3, eager FP32 and HF32 disabled, without `torch.compile`.
 
@@ -59,6 +61,13 @@ energy, forces and HCCL communication.
 
 The dashed line marks ideal speedup. [Full scaling results](lammps_user_mfftorch/docs/ASCEND.md#strong-scaling-and-memory)
 also cover 4,096 and 13,824 atoms.
+
+![Pretrained MACE-MH-1 complete LAMMPS steps: strong-scaling speedup and weak-scaling throughput on 1, 2, 4 and 8 NPUs.](docs/figures/ascend_mh1_scaling.svg)
+
+MACE-MH-1 (`omat_pbe`) reaches 7.17× speedup and 89.7% efficiency at
+10,976 atoms on eight NPUs. Weak scaling uses 4,000 atoms/NPU and reaches
+95.2% efficiency: 52,501 atom-steps/s at 32,000 atoms.
+See the [full measurements and protocol](lammps_user_mfftorch/docs/ASCEND.md#mace-mh-1-scaling).
 
 ## Standalone O(3) operators
 
