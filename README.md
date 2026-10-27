@@ -1,28 +1,35 @@
 # ICTC-O3-HP-Ascend
 
-High-performance ICTC-O3 operators and the MACE-ICTC framework, optimized for
-Ascend NPUs with native Ascend C kernels.
+High-performance ICTC-O3 operators and the MACE-ICTC framework for Ascend NPUs:
+native Ascend C kernels, energy-and-force training, and multi-NPU molecular dynamics.
 
 Version 0.1.0 · [MIT License](LICENSE)
 
-For installation, O(3) and model APIs, training, checkpoint conversion and
-LAMMPS deployment, see the [Usage guide](docs/USAGE.md).
+Use `ictc_o3` independently in your own equivariant networks, or `mace_ictc`
+to train, convert and deploy MACE potentials.
+
+[Usage guide](docs/USAGE.md) · [Standalone O(3) API](docs/O3_API.md) ·
+[LAMMPS deployment](lammps_user_mfftorch/docs/ASCEND.md)
 
 ## Highlights
 
-- MACE energy-and-force training: up to 4.76× the throughput of original
-  PyTorch MACE/e3nn, including force-loss backward and AdamW.
-- Energy-and-force inference: up to 4.48× faster than original MACE/e3nn;
-  C64/lmax 2 reaches 54.9k atom-steps/s.
+- MACE training and inference: up to 4.76× training and 4.48×
+  energy-and-force inference throughput over original PyTorch MACE/e3nn.
+  Training includes force-loss backward and AdamW.
 - Standalone O(3) tensor products: up to 3.90× forward and 3.85×
-  forward-plus-gradient throughput over e3nn; 23.18× and 18.37× over
-  MindChemistry PyNative at C64/lmax 2.
-- Eight-NPU MD: 6.64× speedup, 83.0% efficiency and 248,559 atom-steps/s
-  for a complete 32,768-atom LAMMPS step.
+  forward-plus-gradient throughput over e3nn.
 - Pretrained MACE-MH-1 on eight NPUs: 89.7% strong-scaling efficiency and
-  95.2% weak-scaling efficiency, reaching 52,501 atom-steps/s.
+  95.2% weak-scaling efficiency, reaching 52.5k atom-steps/s in LAMMPS.
+- C64 molecular dynamics on eight NPUs: 248.6k atom-steps/s at 32,768 atoms,
+  including the complete LAMMPS step and HCCL communication.
+
+![MACE training and energy-and-force inference throughput on one Ascend NPU, and pretrained MACE-MH-1 strong and weak scaling across 1, 2, 4 and 8 NPUs.](docs/figures/ascend-performance-overview.svg)
+
+[Download the overview PNG](docs/figures/ascend-performance-overview.png).
 
 Results use Ascend 910B3, eager FP32 and HF32 disabled, without `torch.compile`.
+The training and inference maxima are measured at C128/lmax 3 and 2,048 atoms.
+See the [measurement protocols](docs/USAGE.md#benchmark-protocols-and-numerical-validation).
 
 ## Training and inference
 
@@ -56,8 +63,7 @@ success-to-OOM brackets are shown in the overview above.
 Strong scaling fixes 32,768 atoms and uses 1/2/4/8 NPUs on one node.
 The C64/lmax-2/two-interaction/correlation-3 model reaches 6.64× speedup
 and 83.0% efficiency on eight NPUs: 131.83 ms per step and
-248,559 atom-steps/s. Timing includes integration, neighbors, transfers,
-energy, forces and HCCL communication.
+248,559 atom-steps/s.
 
 The dashed line marks ideal speedup. [Full scaling results](lammps_user_mfftorch/docs/ASCEND.md#strong-scaling-and-memory)
 also cover 4,096 and 13,824 atoms.
@@ -68,6 +74,9 @@ MACE-MH-1 (`omat_pbe`) reaches 7.17× speedup and 89.7% efficiency at
 10,976 atoms on eight NPUs. Weak scaling uses 4,000 atoms/NPU and reaches
 95.2% efficiency: 52,501 atom-steps/s at 32,000 atoms.
 See the [full measurements and protocol](lammps_user_mfftorch/docs/ASCEND.md#mace-mh-1-scaling).
+
+Both scaling studies time complete MD steps, including integration, dynamic
+neighbors, host/device transfers, energy, forces, virial and HCCL communication.
 
 ## Standalone O(3) operators
 
