@@ -61,7 +61,8 @@ def geometry(kernel,cell,positive,negative,interior,deconv,*,exclude_k0):
     from .runtime import _vector_grid
     blocks=triton.cdiv(frequencies,256)
     grid=_vector_grid(blocks,cell.device)
-    _geometry[(grid,)](cell.contiguous(),positive,negative,deconv,kp,kn,sp,sn,volume,
+    from .jit_launch import launch
+    launch(_geometry,(grid,),cell.contiguous(),positive,negative,deconv,kp,kn,sp,sn,volume,
         graphs,frequencies,kernel.slab_padding_factor if kernel.boundary=='slab' else 1,
         *positive.stride(),*negative.stride(),
         alpha,kernel.k_norm_floor,kernel.green_kernel.k_norm_floor,exclude_k0,256,

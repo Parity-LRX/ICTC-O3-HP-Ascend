@@ -29,7 +29,37 @@ def prefer_native_assignment(frac, channels):
     # Short channel vectors underfill per-particle DMA/vector work. Large
     # particle arrays can instead use the vectorized CANN index-add schedule.
     # Capacity and native modes keep bounded-UB assignment at every size.
-    return mode() in ('capacity', 'native') or frac.shape[0] < 32768 or channels > 4
+    if mode() in ('capacity', 'native') or frac.shape[0] < 32768 or channels > 4:
+        return True
+    # The single-field particle tile also avoids the large stencil tensors
+    # of the previous vectorized schedule. Explicit assignment policies above
+    # retain their existing meaning.
+    particle = os.environ.get('ICTC_ASCEND_MESH_PARTICLE', 'auto')
+    if particle not in ('0', '1', 'auto'):
+        raise ValueError('ICTC_ASCEND_MESH_PARTICLE must be auto, zero or one')
+    if channels == 1 and particle != '0':
+        # The bounded schedule wins for the qualified intermediate sizes.
+        # Large force-training fields favor the existing CANN schedule.
+        if particle == 'auto' and frac.shape[0] > 65536:
+            return False
+        from .runtime import has_triton_ascend
+        return has_triton_ascend()
+    return False
+
+
+def _particle_assignment(source, mode, needed):
+    policy = os.environ.get('ICTC_ASCEND_MESH_PARTICLE', 'auto')
+    if policy not in ('0', '1', 'auto'):
+        raise ValueError('ICTC_ASCEND_MESH_PARTICLE must be auto, zero or one')
+    if policy == '0' or source.shape[1] != 1 or mode == 3 and needed[0]:
+        return False
+    # Small first adjoints are dominated by vector-kernel dispatch. Source and
+    # mesh mixed adjoints retain their separate measured crossover.
+    if policy == 'auto' and source.shape[0] < 8192 and mode != 3:
+        return False
+    from ictc_o3.ascendc.runtime import mode as execution_mode
+    from .runtime import has_triton_ascend
+    return execution_mode() != 'native' and has_triton_ascend()
 
 
 def _run(frac, batch, source, mesh, config, mode, direction=None, needed=(True, True, True)):
@@ -39,10 +69,16 @@ def _run(frac, batch, source, mesh, config, mode, direction=None, needed=(True, 
         raise RuntimeError('Rebuild the Ascend C library to include electrostatic mesh assignment')
     shape, graphs, order, slab = config
     empty = frac.new_empty(0)
+    particle = _particle_assignment(source, mode, needed)
     ds = torch.empty_like(source) if mode == 1 or mode == 3 and needed[1] else empty
     dm = source.new_zeros((graphs, *shape, source.shape[1])) if mode == 0 or mode == 3 and needed[2] else empty
-    df = torch.zeros_like(frac) if mode == 2 or mode == 3 and needed[0] else empty
+    df = (torch.empty_like(frac) if particle else torch.zeros_like(frac)) if mode == 2 or mode == 3 and needed[0] else empty
     flags = sum(int(v) << i for i, v in enumerate(needed))
+    if particle:
+        from .scalar_assignment import run
+        run(frac, batch, source, mesh, empty if direction is None else direction.contiguous(),
+            ds, dm, df, config, mode, flags)
+        return df, ds, dm
     ops.electrostatic_assignment(frac, batch, source, mesh,
         empty if direction is None else direction.contiguous(), ds, dm, df,
         [*shape, graphs, order, mode, int(slab), flags])

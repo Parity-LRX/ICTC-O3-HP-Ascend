@@ -23,9 +23,9 @@ to train, convert and deploy MACE potentials.
   original PyTorch MACE/e3nn throughput at C128/lmax 3 and 2,048 atoms.
 - Eight-NPU LAMMPS strong-scaling efficiency reaches 83.0% for C64 and 89.7%
   for pretrained MACE-MH-1. MH-1 weak-scaling efficiency reaches 95.2%.
-- Native reciprocal monopole/dipole/quadrupole electrostatics: Ascend C mesh
+- Native reciprocal monopole/dipole/quadrupole electrostatics: bounded mesh
   assignment, real FFTs, mixed force-loss adjoints and owned-source HCCL sums.
-  At 16,384 atoms, q+μ+Q adds 6.8% to training and 10.7% to energy-and-force
+  At 16,384 atoms, scalar q adds 5.2% to training and 6.2% to energy-and-force
   inference. [Long-range results](#native-long-range-electrostatics).
 
 All results use Ascend 910B3, eager FP32 and HF32 disabled, without `torch.compile`.
@@ -85,15 +85,15 @@ Gaussian-screened reciprocal correction to MACE-ICTC. The standalone
 `ictc_o3.MeshElectrostatics` API supports configurable source channels,
 position and cell gradients, and the mixed derivatives needed for force training.
 
-At 16,384 atoms, q+μ+Q adds 6.8% to full training and 10.7% to energy-and-force
-inference. At 4,096 atoms, the complete calls take 251.54 ms and 94.40 ms,
-respectively, versus 227.20 ms and 79.50 ms without electrostatics. The latest
-source and spectral optimizations reduce the q+μ+Q increment by 38–43%
-across these two sizes and phases.
+At 16,384 atoms, scalar q adds 5.2% to full training and 6.2% to energy-and-force
+inference. Particle assignment reduces its extra training time by 40.6% and its
+extra inference time by 51.2%. The retained q+μ+Q source/spectral sweep adds
+6.8% and 10.7%, respectively.
 
 These paired initialized-model measurements preserve the C64/lmax-2 backbone,
 with two interactions, correlation 3, one source channel, PCS assignment,
-approximately 1 Å mesh spacing and Gaussian width 1 Å. See the
+approximately 1 Å mesh spacing and Gaussian width 1 Å. The figure combines the
+scalar-q/short-range rerun with the retained q+μ+Q sweep. See the
 [measurement protocol](docs/USAGE.md#long-range-training-and-inference).
 
 Native `mff/torch` deployment partitions physical source atoms across ranks;

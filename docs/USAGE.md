@@ -698,14 +698,20 @@ three-call blocks, divided by three, after at least two seconds of warmup.
 Neighbor construction and input transfers are excluded. The separate individually
 synchronized sweep elsewhere in this guide retains its own timing protocol.
 
-| Atoms | Sources | Training (ms/step) | Extra training time | E/F inference (ms/step) | Extra inference time |
-| ---: | --- | ---: | ---: | ---: | ---: |
-| 4,096 | Short range | 227.20 | — | 79.50 | — |
-| 4,096 | q | 252.16 | 11.0% | 91.73 | 15.4% |
-| 4,096 | q+μ+Q | 251.54 | 10.7% | 94.40 | 18.7% |
-| 16,384 | Short range | 893.80 | — | 298.35 | — |
-| 16,384 | q | 972.72 | 8.8% | 335.93 | 12.6% |
-| 16,384 | q+μ+Q | 954.94 | 6.8% | 330.22 | 10.7% |
+The scalar-q particle rerun includes fresh short-range controls. The figure
+retains the earlier q+μ+Q source/spectral measurements; their percentages use
+that sweep's own controls. Both sweeps use the same saved backbone and protocol.
+
+| Sweep | Atoms | Sources | Training (ms/step) | Extra training time | E/F inference (ms/step) | Extra inference time |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| Particle | 4,096 | Short range | 227.25 | — | 80.21 | — |
+| Particle | 4,096 | q | 250.81 | 10.4% | 92.33 | 15.1% |
+| Particle | 16,384 | Short range | 892.92 | — | 298.34 | — |
+| Particle | 16,384 | q | 939.50 | 5.2% | 316.76 | 6.2% |
+| Source/spectral | 4,096 | Short range | 227.20 | — | 79.50 | — |
+| Source/spectral | 4,096 | q+μ+Q | 251.54 | 10.7% | 94.40 | 18.7% |
+| Source/spectral | 16,384 | Short range | 893.80 | — | 298.35 | — |
+| Source/spectral | 16,384 | q+μ+Q | 954.94 | 6.8% | 330.22 | 10.7% |
 
 Extra time is measured relative to the matching short-range call. These
 initialized-model timings measure execution cost. CPU FP64 functional checks,
@@ -713,7 +719,9 @@ before/after full-model energy/force and mixed-gradient comparisons, training
 checkpoint reload, HCCL and actual LAMMPS checks are documented in
 [numerical and deployment checks](ELECTROSTATICS.md#numerical-and-deployment-checks).
 The [matched cost report](ELECTROSTATICS.md#measured-cost-relative-to-short-range-evaluation)
-also records the source/spectral optimization and the corresponding K100 costs.
+also records particle scheduling, the earlier source/spectral optimization and
+the corresponding K100 costs. The scalar schedule is selected automatically;
+ordinary training and prediction commands are unchanged.
 
 ### C64 overview: refined OOM sampling
 

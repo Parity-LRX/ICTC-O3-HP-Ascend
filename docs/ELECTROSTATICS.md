@@ -1,8 +1,8 @@
 # High-performance reciprocal electrostatics on Ascend
 
-The standalone `ictc_o3` API and MACE-ICTC share the same Ascend C mesh
-assignment, analytic adjoints, NPU real FFT and fused Cartesian multipole
-contraction. Native execution uses eager FP32 with HF32 disabled. Mesh dimensions,
+The standalone `ictc_o3` API and MACE-ICTC share bounded mesh assignment,
+analytic adjoints, NPU real FFT and fused Cartesian multipole contraction.
+Ascend C and Triton-Ascend schedules use eager FP32 with HF32 disabled. Mesh dimensions,
 atom counts, source channels and neighbor graphs are runtime inputs; no graph
 capture or fixed atom capacity is required.
 
@@ -182,6 +182,10 @@ are separate implementations.
 - Ascend C CIC/TSC/PCS spread/gather avoid `[N,stencil,S]` intermediates and
   tile channel vectors to the device UB capacity.
 - Analytic coordinate VJPs and their mixed adjoints support force training.
+- Single-source-channel meshes use particle/stencil vector tiles for eligible
+  spread, gather, coordinate VJPs and source/mesh mixed adjoints. Coordinate
+  Hessians retain the original native sequential reduction. The tiles use
+  bounded workspace and accept live atom counts and rectangular meshes.
 - Paired real-FFT adjoints use CANN transforms and retain second derivatives.
 - Fixed Cartesian recovery matrices replace repeated component expansion in
   the learned dipole and quadrupole heads. Trainable source maps and gates
@@ -193,12 +197,25 @@ are separate implementations.
 - Direct positive/negative amplitude maps read the FFT channel planes without
   Cartesian repacking. Paired linear adjoints preserve force-loss derivatives;
   live reciprocal-vector derivatives retain the general contraction path.
-- Performance mode uses vectorized CANN assignment for large fields with few
-  source channels; other shapes use native UB tiling. Capacity and native modes
-  retain bounded native assignment. `ICTC_ASCEND_MESH_ASSIGNMENT=auto` is the
-  default; `native` and `vectorized` select explicit schedules for profiling.
+- Performance mode uses particle tiles for eligible single-channel fields up
+  to 65,536 atoms. Large fields with two to four channels use vectorized CANN
+  assignment; wider fields use native UB tiling. Capacity mode retains bounded
+  assignment; native mode uses Ascend C. Larger single-channel performance-mode
+  fields retain CANN assignment to preserve large force-training performance.
+  `ICTC_ASCEND_MESH_ASSIGNMENT=auto` is the default; `native` and `vectorized`
+  select explicit schedules for profiling.
   The vectorized schedule uses more temporary memory. Low-level
-  `mesh_spread(..., backend="ascend")` always uses the bounded native kernel.
+  `mesh_spread(..., backend="ascend")` always uses bounded assignment.
+- `ICTC_ASCEND_MESH_PARTICLE=auto` selects the scalar schedule by atom count
+  and adjoint target. Small spread/gather and coordinate-VJP calls retain native
+  dispatch; eligible source/mesh mixed adjoints use particle tiles. `0` restores
+  the earlier assignment schedule; `1` forces eligible scalar tiles for
+  profiling. Wider source fields retain their existing paths. Without
+  Triton-Ascend, scalar assignment uses
+  Ascend C automatically.
+- Scalar and geometry kernels serialize a cold compilation with the same JIT
+  signature when processes share a filesystem cache. Cached launches use the
+  existing per-device compiled kernel without filesystem locking.
 - Caches hold mesh indices and fixed execution metadata. Live coordinates,
   cells, source tensors and learned Green weights are recomputed each call.
 
@@ -235,6 +252,38 @@ Three calls are timed per synchronized block, then divided by three; values
 are medians of five blocks after at least two seconds of warmup. Neighbor
 graph construction and input transfers are excluded.
 
+### Scalar q particle scheduling
+
+The scalar-only sweep retimes a matching short-range control in each run.
+The model, initial parameters, precision and timing protocol are unchanged.
+These results use the default particle policy, including native first-order
+assignment below 8,192 atoms.
+
+| Atoms | Phase | Complete before → after, ms | Extra before → after, ms | Final extra time | Increment reduced |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 4,096 | E/F inference | 93.57 → 92.33 | 13.33 → 12.12 | 15.1% | 9.0% |
+| 4,096 | Training | 254.26 → 250.81 | 26.25 → 23.56 | 10.4% | 10.3% |
+| 16,384 | E/F inference | 336.14 → 316.76 | 37.78 → 18.43 | 6.2% | 51.2% |
+| 16,384 | Training | 973.46 → 939.50 | 78.38 → 46.58 | 5.2% | 40.6% |
+
+At 16,384 atoms the corresponding K100 increments are 17.51 ms for E/F
+inference and 20.55 ms for training (13.3% and 5.2% of its own short-range
+times). The current Ascend short-range controls are 298.34 and 892.92 ms;
+the complete-model and additional electrostatic costs are distinct quantities.
+
+At 32,768 atoms, complete C64 E/F inference takes 638.95 ms versus 660.14 ms
+before particle scheduling. Standalone single-channel mesh electrostatics at
+65,536 atoms takes 60.64 ms versus 96.11 ms for E/F inference, and 144.75 ms
+versus 169.63 ms for an energy/force loss, source-gradient backward and AdamW.
+Its inference peak allocated memory drops from approximately 395 to 41 MB.
+The performance auto policy retains CANN assignment above 65,536 atoms;
+bounded assignment remains available in capacity mode and for explicit profiling.
+
+### Earlier source and spectral optimizations
+
+The following paired measurements precede scalar particle scheduling. They
+retain the q+mu+Q comparison and the matched K100 reference.
+
 | Atoms | Sources | Phase | Ascend before, ms (+%) | Ascend after, ms (+%) | K100, ms (+%) | Increment reduced |
 | ---: | --- | --- | ---: | ---: | ---: | ---: |
 | 4,096 | q | E/F inference | 14.20 (17.5%) | 12.23 (15.4%) | 14.65 (36.1%) | 13.9% |
@@ -253,9 +302,7 @@ and forces and 227.20 ms for training. With q+mu+Q, the complete calls take
 complete-model costs are distinct measurements.
 
 The q+mu+Q increment falls by 38-43% across these two sizes and phases.
-Scalar-only training remains more expensive on Ascend: at 16,384 atoms it
-adds 78.92 ms, compared with 20.55 ms on K100. These are initialized-model
-compute measurements; they do not establish fitted-potential accuracy or
+These are initialized-model compute measurements; they do not establish fitted-potential accuracy or
 long-trajectory MD behavior.
 
 The original approximately 79-ms result uses the three-call format above.
@@ -272,6 +319,11 @@ Ascend short-range/q+mu+Q inference takes 86.29/101.18 ms, and training takes
   CPU FP64 functional: monopoles, dipoles and quadrupoles, odd/even rectangular
   meshes, triclinic cells, multiple source channels and empty graphs. Legacy
   cubic meshes with box-dependent screening are also checked.
+- Single-source-channel particle assignment is checked against the original
+  native schedule at 4,097 and 65,536 atoms, including every selective mixed
+  adjoint target. Independent single-channel CPU FP64 checks, strict checkpoint
+  reload, AdamW and four-rank HCCL/LAMMPS checks also pass. Four ranks share a
+  fresh filesystem JIT cache, including a two-atom case with empty ranks.
 - Learned Green filters with nonzero parameters, parameter-only force-loss
   backward, and batch-validation cache invalidation after an in-place update.
 - Exact recovery matrices across channel tails, source-channel counts and
