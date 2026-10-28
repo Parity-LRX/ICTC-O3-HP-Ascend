@@ -13,16 +13,9 @@ class _Message(torch.autograd.Function):
         constants=() if projection is None else (projection.weight,projection.bias)
         ctx.meta=(owner,fkeys,hkeys,chunk,projection)
         ctx.save_for_backward(owner.weight,*constants,*tensors);ctx.set_materialize_grads(False)
-        result=None
-        for begin in range(0,src.numel(),chunk):
-            end=min(src.numel(),begin+chunk)
-            part=gates[begin:end] if projection is None else projection(gates[begin:end])
-            parts=fast_graph(owner,features,{k:v[begin:end] for k,v in harmonics.items()},part,src[begin:end],dst[begin:end],None if mask is None else mask[begin:end],edge_chunk_size=chunk)
-            if result is None:result=parts
-            else:
-                for key,value in parts.items():result[key].add_(value)
-            torch.npu.current_stream(gates.device).synchronize()
-            del parts,part
+        result=fast_graph(owner,features,harmonics,gates,src,dst,mask,
+                          edge_chunk_size=chunk,radial_projection=projection,capacity_stream=src.numel()>chunk)
+        torch.npu.current_stream(gates.device).synchronize()
         ctx.keys=tuple(result)
         return tuple(result[k] for k in ctx.keys)
     @staticmethod
@@ -47,6 +40,9 @@ class _Message(torch.autograd.Function):
                 grads=torch.autograd.grad(tuple(v for v,g in pairs),tuple(aliases[i] for i in selected),tuple(g for v,g in pairs),create_graph=True,allow_unused=True)
                 for i,g in zip(selected,grads):result[i]=g
             return (None,None,None,None,None,*result)
+        from .capacity_adjoint import first_order_backward
+        values=first_order_backward(ctx,outputs)
+        if values is not None:return values
         for i in range(ng+1):
             if needed[i]:result[i]=torch.zeros_like(tensors[i]) if i<nf else torch.empty_like(tensors[i])
         for begin in range(0,src.numel(),chunk):
@@ -164,7 +160,7 @@ def radial_graph_message(owner,features,harmonics,radial,edge_features,src,dst,m
     gate_gradient=gate_bytes if grad_enabled and hidden.requires_grad else 0
     # Predict the existing selector after materializing the full projection.
     ordinary_budget=min(total//8,max(0,total-allocated-gate_bytes-gate_gradient-6*node_bytes)//2)
-    if ordinary_budget>=max(per_edge,2*node_bytes):
+    if ordinary_budget>=max(per_edge,2*node_bytes) and gate_bytes<=total//32:
         gates=projection(hidden)
         del hidden
         return graph_message(owner,features,harmonics,gates,src,dst,mask,edge_chunk_size=edge_chunk_size)

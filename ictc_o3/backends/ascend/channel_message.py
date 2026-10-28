@@ -32,7 +32,8 @@ class _BatchedMatrix(torch.autograd.Function):
         return da,db,None,None
 
 
-def graph_message(owner,features,harmonics,gates,src,dst,mask=None,*,edge_chunk_size=None):
+def graph_message(owner,features,harmonics,gates,src,dst,mask=None,*,edge_chunk_size=None,
+                  radial_projection=None,capacity_stream=False):
     from .tensor_product import _plan,_automatic_edge_chunk,_edge_working_bytes,_destination_nodes
     from .runtime import require_npu_fp32,bound_graph_queue
     sample=next(iter(features.values()))
@@ -41,8 +42,14 @@ def graph_message(owner,features,harmonics,gates,src,dst,mask=None,*,edge_chunk_
     require_npu_fp32(owner.weight,gates,*features.values(),*harmonics.values())
     edges=src.numel()
     bound_graph_queue(sample.device,edges*_edge_working_bytes(owner,sample,features,harmonics))
-    if gates.shape not in ((edges,owner.num_paths*channels),(edges,owner.num_paths,channels)):
+    if radial_projection is None and gates.shape not in ((edges,owner.num_paths*channels),(edges,owner.num_paths,channels)):
         raise ValueError('External graph gates must have shape [E,P*C] or [E,P,C]')
+    if radial_projection is not None:
+        require_npu_fp32(radial_projection.weight,sample)
+        if radial_projection.bias is not None:require_npu_fp32(radial_projection.bias,sample)
+        if (gates.shape!=(edges,radial_projection.in_features)
+                or radial_projection.out_features!=owner.num_paths*channels):
+            raise ValueError('Radial hidden and output widths must match the graph message')
     if mask is not None and (mask.shape not in ((edges,),(edges,1)) or mask.device!=sample.device):
         raise ValueError('Expected an edge mask [E] or [E,1] on the feature device')
     if edge_chunk_size is None:
@@ -141,6 +148,7 @@ def graph_message(owner,features,harmonics,gates,src,dst,mask=None,*,edge_chunk_
         rows=end-begin
         edge={l:value.index_select(0,src[begin:end]) for l,value in angular.items()}
         part=gate_parts[chunk] if split else gates[begin:end]
+        if radial_projection is not None:part=radial_projection(part)
         weighted=part.reshape(rows,owner.num_paths,channels)*owner.weight[None]
         blocks={l:[None]*owner.path_counts_by_l.get(l,0) for l in output}
         bond=_FixedLinear.apply(sh_parts[chunk] if split else sh[begin:end],projection)
@@ -167,6 +175,7 @@ def graph_message(owner,features,harmonics,gates,src,dst,mask=None,*,edge_chunk_
                 # disjoint edge chunks have contributed to the node tensor.
                 compact_sums=(node_parts if compact_sums is None or node_accumulate else
                               [old+value for old,value in zip(compact_sums,node_parts)])
+                if capacity_stream:torch.npu.current_stream(sample.device).synchronize()
                 continue
             if compact:
                 restore,missing=plan['_ascendc_compact_order']
@@ -178,6 +187,7 @@ def graph_message(owner,features,harmonics,gates,src,dst,mask=None,*,edge_chunk_
                     accumulated=restore_output(packed,restore,plan)
             for (l,old),block in zip(output.items(),accumulated.split(plan['_ascendc_output_widths'],1)):
                 output[l]=old+block
+            if capacity_stream:torch.npu.current_stream(sample.device).synchronize()
             continue
         weights=weighted.unbind(1)
         for (i,ni,width,widths,items),matrix in zip(groups,matrices):
@@ -190,6 +200,7 @@ def graph_message(owner,features,harmonics,gates,src,dst,mask=None,*,edge_chunk_
             block=torch.cat(values,1) if values else sample.new_empty(rows,0,channels)
             if mask is not None:block=block*mask[begin:end].reshape(-1,1,1)
             output[l]=output[l].index_add(0,dst[begin:end],block)
+        if capacity_stream:torch.npu.current_stream(sample.device).synchronize()
     if late_restore:
         restore,missing=plan['_ascendc_compact_order']
         if missing:compact_sums.append(sample.new_zeros(nodes,1,channels))

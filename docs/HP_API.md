@@ -67,14 +67,19 @@ elements, and explicitly disables HF32. Bias uses a separate FP32 vector kernel.
 ### Capacity inference
 
 Capacity mode saves the original message inputs and recomputes one edge chunk
-at a time for force gradients. Completed chunks are released before the next
-chunk is evaluated. Automatic chunk sizes use the actual channel and angular
-widths, device memory and current allocations, including the live gate-gradient
-buffer and node-layout buffers. When a frozen final radial Linear would exhaust
-that budget, it is evaluated inside the message chunks. The adjoint accumulates
-gradients into the smaller radial hidden features, avoiding full-edge gate and
-gate-gradient storage. This evaluates the original Linear with its original
-weights. Other execution paths retain their established schedules.
+at a time for force gradients. The forward accumulates compact node outputs
+across chunks and restores path order once per message. With radial streaming,
+the first adjoint converts node cotangents once, computes edge-local derivatives
+and accumulates feature gradients into one node buffer. Completed edge buffers are released
+before the next chunk is evaluated.
+
+Automatic chunk sizes use the actual channel and angular widths, device memory
+and current allocations. Large frozen radial output projections are evaluated
+inside message chunks before full-edge gate storage consumes the working
+budget. Their adjoints accumulate into the smaller radial hidden features,
+with coupling groups processed separately. These calls evaluate the original
+Linear layers and weights in FP32. Atom counts, edge counts and neighbor sets
+remain dynamic.
 Set `message_chunk_edges` explicitly to override automatic sizing.
 
 Model training retains the native higher-order schedule. Standalone graph

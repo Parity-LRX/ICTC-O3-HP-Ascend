@@ -9,8 +9,9 @@ _CACHE={}
 def _align(n):return (n+7)//8*8
 
 
-def try_apply(a,b,ta,tb):
-    if a.device.type!='npu' or not runtime.is_enabled() or runtime.mode()!='performance':return None
+def try_apply(a,b,ta,tb,*,capacity=False):
+    if (a.device.type!='npu' or not runtime.is_enabled()
+            or runtime.mode()!='performance' and not (capacity and runtime.mode()=='capacity')):return None
     policy=os.environ.get('ICTC_ASCEND_VECTOR_BMM','auto')
     if policy not in ('0','1','auto','forward','channel','both','feature','adjoints'):
         raise ValueError('Invalid Vector BMM policy')
