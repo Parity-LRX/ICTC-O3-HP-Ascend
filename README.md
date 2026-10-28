@@ -43,13 +43,20 @@ MindChemistry PyNative at C64/lmax 2 and 65,536 instances; Graph results are als
 
 ### Training and inference
 
-![C64/lmax-2 MACE training and energy-and-force inference: throughput and peak allocated memory versus atom count.](docs/figures/ascend-training-inference.svg)
+![MACE training and energy-and-force inference throughput for C64/lmax 2, C128/lmax 2, C128/lmax 3 and C256/lmax 3.](docs/figures/ascend-mace-throughput.svg)
 
-C64/lmax 2 with two interactions and correlation 3 reaches 18.4k atom-steps/s
-in full training and 54.9k in energy-and-force inference: 3.66× and 3.63×
-original MACE/e3nn at 8,192 and 16,384 atoms, respectively. Capacity inference
-completes 196,608 atoms. Bars above the panels show the measured success-to-OOM
-brackets. See [all four models](docs/PERFORMANCE.md#mace-model-sweep).
+Columns show C64/lmax 2, C128/lmax 2, C128/lmax 3 and C256/lmax 3, each with
+two interactions and correlation 3. Training is above; energy-and-force inference
+is below, with separate performance and capacity modes.
+
+At C256/lmax 3 and 16,384 atoms, the capacity update reduces latency from
+18.61 to 4.55 s per call (4.09× over the previous HP capacity implementation),
+reaching 3.60k atom-steps/s. Peak allocated memory falls from 54.73 to 39.58 GiB.
+
+C64/lmax 2 reaches 18.4k atom-steps/s in full training and 54.9k in inference;
+capacity inference completes 196,608 atoms. See the
+[four-model memory curves](docs/PERFORMANCE.md#memory) and
+[C64 throughput, memory and OOM brackets](docs/PERFORMANCE.md#c64-capacity-and-oom).
 
 ### Pretrained MACE-MH-1
 

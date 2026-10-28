@@ -62,10 +62,21 @@ peak PyTorch allocations, including optimizer state for training. External
 CANN and driver allocations are excluded. Under memory pressure, capacity mode
 streams the frozen radial output projection inside message chunks; switching
 to this schedule can reduce peak memory at a larger atom count. The C64 data
-match the [README overview](../README.md#training-and-inference), which also
-shows the measured success-to-OOM brackets.
+match the detailed overview below.
 
 [Download PNG](figures/ascend-mace-memory.png).
+
+### C64 capacity and OOM
+
+![C64/lmax-2 MACE training and energy-and-force inference throughput, peak allocated memory and measured OOM brackets.](figures/ascend-training-inference.svg)
+
+C64/lmax 2 reaches 18.4k atom-steps/s in full training and 54.9k in
+energy-and-force inference: 3.66× and 3.63× original MACE/e3nn at 8,192 and
+16,384 atoms, respectively. Capacity inference completes 196,608 atoms;
+the first observed capacity-mode OOM is 229,376 atoms. Bars above the panels
+connect each backend's last successful size to its first measured OOM.
+
+[Download PNG](figures/ascend-training-inference.png).
 
 ## Pretrained MACE-MH-1
 
