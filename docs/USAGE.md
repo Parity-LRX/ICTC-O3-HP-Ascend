@@ -9,6 +9,7 @@ start with `ictc-ascend-`; the Python packages are `ictc_o3` and `mace_ictc`.
 | Starting point | Recipe |
 | --- | --- |
 | Structures with reference energies and forces | [Prepare data](#2-prepare-training-data), then [train a potential](#3-train-an-energy-and-force-potential) |
+| A potential with learned long-range moments | [Train reciprocal q / q+μ / q+μ+Q heads](#train-with-long-range-electrostatics) |
 | A supported ordinary MACE model | [Convert to ICTC](#5-convert-an-ordinary-mace-model) |
 | Official MACE-MH-1 weights | [Convert and select a head](#6-use-mace-mh-1) |
 | A trained or converted standard ICTC checkpoint | [Predict a structure](#7-predict-with-a-standard-ictc-checkpoint) |
@@ -218,18 +219,107 @@ when memory is insufficient. `--gradient-accumulation-steps 4` accumulates four
 microbatches per update. This release supports single-NPU training; the CLI
 rejects multi-NPU DDP on NPU. HCCL multi-NPU LAMMPS is a separate deployment path.
 
-### Long-range terms
+### Train with long-range electrostatics
 
-The supplied Ascend recipe explicitly sets:
+The base recipe disables electrostatics and dispersion. Use
+[`train_hco_long_range.sh`](../examples/train_hco_long_range.sh) to train learned
+reciprocal sources together with the backbone, using native Ascend execution:
+
+| Learned sources | `--long-range-max-multipole-l` | Required backbone degree |
+| --- | ---: | --- |
+| Monopoles (`q`) | `0` | lmax ≥ 0 |
+| Monopoles and dipoles (`q+μ`) | `1` | lmax ≥ 1 |
+| Monopoles, dipoles and quadrupoles (`q+μ+Q`) | `2` (recipe default) | lmax ≥ 2 |
+
+For example, submit one of these jobs after preprocessing periodic structures:
 
 ```bash
---long-range-mode none --long-range-dispersion-mode none
+# Monopoles.
+sbatch --account=YOUR_ACCOUNT "$ICTC_REPO/examples/ascend_job.sbatch" \
+  bash "$ICTC_REPO/examples/train_hco_long_range.sh" data/hco models/hco-q.pth \
+    --long-range-max-multipole-l 0
+
+# Monopoles and dipoles.
+sbatch --account=YOUR_ACCOUNT "$ICTC_REPO/examples/ascend_job.sbatch" \
+  bash "$ICTC_REPO/examples/train_hco_long_range.sh" data/hco models/hco-qmu.pth \
+    --long-range-max-multipole-l 1
+
+# Monopoles, dipoles and quadrupoles.
+sbatch --account=YOUR_ACCOUNT "$ICTC_REPO/examples/ascend_job.sbatch" \
+  bash "$ICTC_REPO/examples/train_hco_long_range.sh" data/hco models/hco-lr.pth \
+    --long-range-max-multipole-l 2 --batch-size 2 --epochs 200
 ```
 
-To add reciprocal monopole/dipole/quadrupole electrostatics, use
-`examples/train_hco_long_range.sh`. The [electrostatics guide](ELECTROSTATICS.md)
-provides the native Ascend C API, complete training flags, fixed Gaussian
-screening convention and owned-source HCCL LAMMPS deployment.
+The wrapper keeps the short-range C64/lmax-2 configuration and adds:
+
+```bash
+--long-range-mode reciprocal-spectral-v1 --long-range-boundary periodic \
+--long-range-reciprocal-backend mesh_fft --long-range-assignment pcs \
+--long-range-mesh-size 32 --long-range-source-channels 1 \
+--long-range-max-multipole-l 2 --long-range-green-mode poisson \
+--long-range-mesh-fft-full-ewald --long-range-mesh-fft-reciprocal-only \
+--long-range-smearing-sigma 1.0 --electrostatics-backend ascend
+```
+
+`source-channels=1` and `green-mode=poisson` are CLI defaults. Extra arguments
+override the wrapper's settings. For a rectangular grid and two source channels:
+
+```bash
+sbatch --account=YOUR_ACCOUNT "$ICTC_REPO/examples/ascend_job.sbatch" \
+  bash "$ICTC_REPO/examples/train_hco_long_range.sh" data/hco models/hco-lr-rect.pth \
+    --long-range-mesh-size 24,32,40 --long-range-source-channels 2
+```
+
+This functional is a Gaussian-screened reciprocal correction. The two mesh flags
+do not add the real-space, self or background terms of a complete Ewald sum.
+Scalar sources are neutralized per graph and the zero mode is removed. Moments
+are latent learned outputs trained through energy/force labels; they are not
+prescribed oxidation states. Dispersion remains disabled.
+
+The periodic recipe requires nonsingular cells and matching periodic neighbor
+graphs. A `32³` grid is an example; choose resolution for the physical cell sizes
+and check convergence. Sigma is a fixed length in position units (Å here).
+Mesh shape, assignment, sigma, source-channel count, boundary and multipole rank
+are part of the trained potential. Keep them consistent on restart and deployment.
+The [electrostatics guide](ELECTROSTATICS.md#functional-and-compatibility)
+also covers rectangular cells, grid selection and padded-slab boundaries.
+
+#### Warm-start, restart and evaluate a long-range model
+
+To add a new head to a compatible short-range checkpoint, keep the same data and
+E0 convention and start a fresh optimizer:
+
+```bash
+sbatch --account=YOUR_ACCOUNT "$ICTC_REPO/examples/ascend_job.sbatch" \
+  bash "$ICTC_REPO/examples/train_hco_long_range.sh" data/hco models/hco-lr.pth \
+    --resume-checkpoint models/hco.pth --finetune --lr 1e-4 \
+    --checkpoint-interval-steps 1000
+```
+
+`--finetune` permits the new head's missing parameter keys. Check the loading
+report against the intended extension, then train and validate the new moments.
+Adding a head during inference does not produce a trained long-range potential.
+The current MACE-MH-1 foundation adapter remains a frozen-weight inference path;
+use a standard trainable ICTC checkpoint for this warm-start recipe.
+
+Resume an existing recovery checkpoint strictly, retaining its long-range options:
+
+```bash
+sbatch --account=YOUR_ACCOUNT "$ICTC_REPO/examples/ascend_job.sbatch" \
+  bash "$ICTC_REPO/examples/train_hco_long_range.sh" data/hco models/hco-lr.pth \
+    --resume-checkpoint models/hco-lr.recovery.pth --resume-training-state \
+    --checkpoint-interval-steps 1000 --epochs 300
+```
+
+These examples use the wrapper's default grid, channels, sigma and rank.
+Repeat any custom long-range flags on restart; the CLI aligns backbone
+architecture with stored metadata but leaves long-range settings as supplied.
+For a validation pass, use the same wrapper and long-range options with
+`--resume-checkpoint models/hco-lr.pth --eval-only`.
+
+Long-range training includes the energy-and-force loss, mixed parameter
+derivatives and AdamW on one NPU. Atom and edge counts remain dynamic.
+For multi-NPU deployment, use the [HCCL LAMMPS recipe](#long-range-lammps-with-hccl).
 
 ## 4. Restart, warm-start and evaluate
 
@@ -382,6 +472,22 @@ Supply a nonsingular cell even for nonperiodic molecules, and use PBC flags
 appropriate to the structure. Coordinates are shifted by a common origin before
 casting to FP32, preserving short displacements at large absolute positions.
 
+### Predict with a trained long-range checkpoint
+
+The same loader restores the source heads, mesh, sigma and reciprocal convention:
+
+```bash
+sbatch --account=YOUR_ACCOUNT "$ICTC_REPO/examples/ascend_job.sbatch" \
+  python "$ICTC_REPO/examples/predict.py" \
+    --checkpoint models/hco-lr.pth --structure data/periodic.extxyz \
+    --index 0 --out prediction-lr.json --mode performance
+```
+
+Use periodic structures consistent with the training configuration. Both the
+short-range and reciprocal contributions are included in total energy and forces;
+do not append a second electrostatic correction. No conversion or tracing step
+is needed for a standard trained ICTC checkpoint.
+
 ### Performance and capacity modes
 
 | Setting | Intended use |
@@ -439,6 +545,11 @@ It also documents native build/activation through `ictc_o3.ascendc` and the
 composed-layer example [`examples/o3_layers.py`](../examples/o3_layers.py).
 Channels and angular degrees are runtime model choices; UB tiling includes
 tails and does not require a fixed atom count.
+
+For independent reciprocal operators, `ictc_o3.MeshElectrostatics` accepts
+`positions [N,3]`, `batch [N]`, `cell [B,3,3]`, `q [N,S]` and optional
+`dipole [N,S,3]` / `quadrupole [N,S,3,3]`. See the runnable
+[standalone energy, force and force-loss example](ELECTROSTATICS.md#standalone-api).
 
 ## 9. Build and run LAMMPS
 
@@ -516,10 +627,93 @@ Per-atom stress is not implemented. See the
 [Ascend deployment guide](../lammps_user_mfftorch/docs/ASCEND.md) for build details,
 HCCL routing, diagnostics and measured complete MD steps.
 
+### Long-range LAMMPS with HCCL
+
+Rebuild both `libictc_ascendc.so` and the installed LAMMPS pair style after
+updating to the electrostatics sources. The pair style supplies a common mesh
+origin to the NPU engine. Use a trained reciprocal-only checkpoint directly;
+the following example assumes H/C/O atom types and a 4.5 Å short-range cutoff.
+Save it as `in.hco_long_range` beside `system.data`:
+
+```lammps
+units metal
+atom_style atomic
+boundary p p p
+newton off
+read_data system.data
+pair_style mff/torch 4.5 npu
+pair_coeff * * models/hco-lr.pth H C O
+neighbor 0.5 bin
+neigh_modify every 1 delay 0 check yes
+velocity all create 300 271828 mom yes rot no dist gaussian
+fix integrator all nve
+timestep 0.0005
+thermo 10
+run 100
+```
+
+The checkpoint supplies the source heads and mesh functional; do not add a
+LAMMPS `kspace_style` or a separate Coulomb pair term to this recipe. Use the
+same runtime environment as the short-range launch above. The qualified
+four-rank deployment uses an exclusive eight-NPU allocation with four active NPUs:
+
+```bash
+export MFF_ASCEND_MODE=performance MFF_ASCEND_HALO=layerwise
+export MFF_TORCH_THREADS=2 ICTC_OMP_THREADS=2
+sbatch --account=YOUR_ACCOUNT --gres=npu:8 --exclusive \
+  --cpus-per-task=32 --mem=80G "$ICTC_REPO/examples/ascend_job.sbatch" \
+  python "$ICTC_REPO/lammps_user_mfftorch/launch_ascend.py" \
+    --queue 2 -- /path/to/mpi/bin/mpiexec -n 4 \
+    /path/to/build-ascend/lmp -in in.hco_long_range
+```
+
+Only owned physical atoms deposit reciprocal sources. HCCL sums Fourier
+amplitudes or scalar spectra and propagates the reverse sums needed for source
+response and coordinate forces. The FFT mesh is replicated on each rank.
+Single- and four-NPU energy/force/global-virial and short MD checks pass;
+four-rank HCCL checks also cover empty owned ranks. The 1/2/4/8-NPU efficiency
+curves in the README measure short-range C64 and MACE-MH-1. For the long-range
+functional and communication details, see [Electrostatics](ELECTROSTATICS.md#lammps-and-hccl).
+
 ## Benchmark protocols and numerical validation
 
 <details>
 <summary>Measurement setup and validation coverage</summary>
+
+### Long-range training and inference
+
+The README long-range figure uses one Ascend 910B3 in performance mode, eager
+FP32 and HF32 disabled. The saved C64/lmax-2 backbone has two interactions,
+correlation 3, eight Bessel functions, radial MLP width 16, readout width 16,
+cutoff polynomial order 5 and a 4.5 Å cutoff. Each atom has 56 directed
+neighbors. Nonzero deterministic initialized source heads use one source
+channel, PCS assignment, Gaussian width 1 Å and approximately 1 Å mesh spacing:
+`32×32×32` at 4,096 atoms and `64×64×32` at 16,384 atoms.
+
+The plot shows complete model throughput. Inference includes energies and
+forces; training includes `zero_grad`, the energy-and-force loss, parameter
+backward through forces and AdamW (`foreach=False`). Each variant starts in a
+fresh process on the same physical NPU. Results are medians of five synchronized
+three-call blocks, divided by three, after at least two seconds of warmup.
+Neighbor construction and input transfers are excluded. The separate individually
+synchronized sweep elsewhere in this guide retains its own timing protocol.
+
+| Atoms | Sources | Training (ms/step) | Extra training time | E/F inference (ms/step) | Extra inference time |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 4,096 | Short range | 227.20 | — | 79.50 | — |
+| 4,096 | q | 252.16 | 11.0% | 91.73 | 15.4% |
+| 4,096 | q+μ+Q | 251.54 | 10.7% | 94.40 | 18.7% |
+| 16,384 | Short range | 893.80 | — | 298.35 | — |
+| 16,384 | q | 972.72 | 8.8% | 335.93 | 12.6% |
+| 16,384 | q+μ+Q | 954.94 | 6.8% | 330.22 | 10.7% |
+
+Extra time is measured relative to the matching short-range call. These
+initialized-model timings measure execution cost. CPU FP64 functional checks,
+before/after full-model energy/force and mixed-gradient comparisons, training
+checkpoint reload, HCCL and actual LAMMPS checks are documented in
+[numerical and deployment checks](ELECTROSTATICS.md#numerical-and-deployment-checks).
+The [matched cost report](ELECTROSTATICS.md#measured-cost-relative-to-short-range-evaluation)
+also records the source/spectral optimization and the corresponding K100 costs.
 
 ### C64 overview: refined OOM sampling
 

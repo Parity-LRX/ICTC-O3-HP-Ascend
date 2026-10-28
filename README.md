@@ -8,7 +8,8 @@ Version 0.1.0 · [MIT License](LICENSE)
 Use `ictc_o3` independently in your own equivariant networks, or `mace_ictc`
 to train, convert and deploy MACE potentials.
 
-[Single-NPU results](#single-npu-results) · [Multi-NPU scaling](#multi-npu-scaling) ·
+[Single-NPU results](#single-npu-results) · [Long-range electrostatics](#native-long-range-electrostatics) ·
+[Multi-NPU scaling](#multi-npu-scaling) ·
 [Usage guide](docs/USAGE.md) · [O(3) API](docs/O3_API.md) · [Electrostatics](docs/ELECTROSTATICS.md) ·
 [LAMMPS](lammps_user_mfftorch/docs/ASCEND.md) · [All performance figures](docs/PERFORMANCE.md)
 
@@ -24,7 +25,8 @@ to train, convert and deploy MACE potentials.
   for pretrained MACE-MH-1. MH-1 weak-scaling efficiency reaches 95.2%.
 - Native reciprocal monopole/dipole/quadrupole electrostatics: Ascend C mesh
   assignment, real FFTs, mixed force-loss adjoints and owned-source HCCL sums.
-  [API, training and LAMMPS examples](docs/ELECTROSTATICS.md).
+  At 16,384 atoms, q+μ+Q adds 6.8% to training and 10.7% to energy-and-force
+  inference. [Long-range results](#native-long-range-electrostatics).
 
 All results use Ascend 910B3, eager FP32 and HF32 disabled, without `torch.compile`.
 See the [measurement protocols and validation](docs/USAGE.md#benchmark-protocols-and-numerical-validation).
@@ -73,6 +75,32 @@ Checkpoint conversion retains all six heads and supports energy-and-force
 inference with `omat_pbe` selected. See the [single-NPU throughput and memory
 comparison](docs/PERFORMANCE.md#pretrained-mace-mh-1) and the
 [conversion recipe](docs/USAGE.md#6-use-mace-mh-1).
+
+## Native long-range electrostatics
+
+![Short-range, monopole and monopole/dipole/quadrupole training and energy-and-force inference throughput on one Ascend 910B3.](docs/figures/ascend-electrostatics.svg)
+
+Learned monopole (`q`), dipole (`μ`) and quadrupole (`Q`) heads add a
+Gaussian-screened reciprocal correction to MACE-ICTC. The standalone
+`ictc_o3.MeshElectrostatics` API supports configurable source channels,
+position and cell gradients, and the mixed derivatives needed for force training.
+
+At 16,384 atoms, q+μ+Q adds 6.8% to full training and 10.7% to energy-and-force
+inference. At 4,096 atoms, the complete calls take 251.54 ms and 94.40 ms,
+respectively, versus 227.20 ms and 79.50 ms without electrostatics. The latest
+source and spectral optimizations reduce the q+μ+Q increment by 38–43%
+across these two sizes and phases.
+
+These paired initialized-model measurements preserve the C64/lmax-2 backbone,
+with two interactions, correlation 3, one source channel, PCS assignment,
+approximately 1 Å mesh spacing and Gaussian width 1 Å. See the
+[measurement protocol](docs/USAGE.md#long-range-training-and-inference).
+
+Native `mff/torch` deployment partitions physical source atoms across ranks;
+HCCL combines reciprocal amplitudes and their adjoints. Single- and four-NPU
+energy, force, virial and MD checks pass, including empty ranks and shifted
+box origins. [Train, restart, predict and deploy](docs/USAGE.md#train-with-long-range-electrostatics) ·
+[Standalone API and physical conventions](docs/ELECTROSTATICS.md).
 
 ## Multi-NPU scaling
 
