@@ -976,6 +976,8 @@ class LatentReciprocalLongRange(nn.Module):
     def _neutralize_source(self, source: torch.Tensor, batch: torch.Tensor, cell: torch.Tensor) -> torch.Tensor:
         if not self.neutralize:
             return source
+        if cell.shape[0] == 1:
+            return source - source.sum(dim=0, keepdim=True) / max(source.shape[0], 1)
         graph_ids = torch.arange(cell.size(0), device=batch.device, dtype=batch.dtype)
         graph_mask = (batch.unsqueeze(1) == graph_ids.unsqueeze(0)).to(dtype=source.dtype)
         counts = graph_mask.sum(dim=0).clamp_min(1.0).unsqueeze(-1)

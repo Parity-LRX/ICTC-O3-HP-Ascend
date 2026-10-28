@@ -127,8 +127,20 @@ class MultipoleReadout(nn.Module):
         quadrupole = None
         if self.max_multipole_l >= 1:
             d_block = self._chan_mix(blocks[1], 1)  # [N, S, 3]
-            dipole = self.dipole_recovery({1: d_block}, squeeze_channel=False) * scale  # [N, S, 3]
+            recovered = None
+            if d_block.device.type == "npu":
+                from mace_ictc.ascend.multipole_readout import recover
+                recovered = recover(self.dipole_recovery, d_block)
+            if recovered is None:
+                recovered = self.dipole_recovery({1: d_block}, squeeze_channel=False)
+            dipole = recovered * scale  # [N, S, 3]
         if self.max_multipole_l >= 2:
             q_block = self._chan_mix(blocks[2], 2)  # [N, S, 5]
-            quadrupole = self.quad_recovery({2: q_block}, squeeze_channel=False) * scale  # [N, S, 3, 3]
+            recovered = None
+            if q_block.device.type == "npu":
+                from mace_ictc.ascend.multipole_readout import recover
+                recovered = recover(self.quad_recovery, q_block)
+            if recovered is None:
+                recovered = self.quad_recovery({2: q_block}, squeeze_channel=False)
+            quadrupole = recovered * scale  # [N, S, 3, 3]
         return monopole, dipole, quadrupole

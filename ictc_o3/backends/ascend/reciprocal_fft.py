@@ -25,9 +25,9 @@ def _lattice(kernel, cell, dtype, y_slice):
     if y_slice is not None:fy = fy[y_slice]
     z = torch.arange(mz//2+1, device=cell.device, dtype=dtype)
     if mz%2==0:z = torch.where(z==mz//2, -z, z)
-    positive = torch.stack(torch.meshgrid(fx, fy, z, indexing='ij'), -1).reshape(-1, 3)
+    positive = torch.stack(torch.meshgrid(fx, fy, z, indexing='ij'), 0).reshape(3, -1).T
     nyquist = positive.new_tensor([-(n//2) if n%2==0 else float('inf') for n in (mx,my,mz)])
-    negative = torch.where(positive==nyquist, positive, -positive)
+    negative = torch.where(positive.T==nyquist[:, None], positive.T, -positive.T).T
     if y_slice is None:
         window = kernel._build_assignment_window(device=cell.device, dtype=dtype)[..., :mz//2+1]
     else:
@@ -63,6 +63,25 @@ def _real_weighted_components(weights, values, *, conjugate=False):
 
 
 def geometry(kernel, cell, dtype, *, exclude_k0, y_slice=None):
+    policy = os.environ.get('ICTC_ASCEND_RECIPROCAL_GEOMETRY', '1')
+    if policy not in ('0', '1'):
+        raise ValueError('ICTC_ASCEND_RECIPROCAL_GEOMETRY must be zero or one')
+    green = kernel.green_kernel
+    from torch.nn.modules import module as module_hooks
+    from ictc_o3.electrostatics.functional import ReciprocalGreenKernel
+    from .runtime import has_triton_ascend
+    if (policy == '1' and cell.device.type == 'npu' and cell.dtype == dtype == torch.float32
+            and not cell.requires_grad and kernel.full_ewald and kernel.reciprocal_only
+            and kernel.smearing_sigma is not None and type(green) is ReciprocalGreenKernel
+            and green.learned_filter is None and not green._forward_hooks
+            and not green._forward_pre_hooks and not green._backward_hooks
+            and not green._backward_pre_hooks and 'forward' not in green.__dict__
+            and not module_hooks._global_forward_hooks and not module_hooks._global_forward_pre_hooks
+            and not module_hooks._global_backward_hooks and not module_hooks._global_backward_pre_hooks
+            and has_triton_ascend()):
+        from .reciprocal_geometry import geometry as fused_geometry
+        lattice = _lattice(kernel, cell, dtype, y_slice)
+        return fused_geometry(kernel, cell, *lattice, exclude_k0=exclude_k0)
     from ictc_o3.electrostatics.functional import _effective_cell_for_boundary
     from ictc_o3.electrostatics.functional import _inverse_3x3
     from ictc_o3.electrostatics.functional import _det_3x3
@@ -141,6 +160,8 @@ def multipole_energy(kernel, pos, batch, cell, source, dipole, quadrupole,
         has_dipole=dipole is not None, has_quadrupole=quadrupole is not None,
         reduce_amplitudes=reduce_amplitudes,compact_quadrupole=compact_quadrupole)
     counts = kernel._graph_counts(batch, cell, dtype=source.dtype) if graph_counts is None else graph_counts
+    if cell.shape[0] == 1:
+        return (graph_energy / counts).reshape(1, 1).expand(source.shape[0], 1)
     return (graph_energy.index_select(0,batch)/counts.index_select(0,batch))[:,None]
 
 

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 """Fused real multipole amplitudes using native multilinear-map adjoints."""
+import os
 import torch
 
 _PLANS = {}
@@ -16,6 +17,15 @@ def _coefficients(k, dipole, quadrupole, compact):
 
 
 def amplitudes(spectrum, kp, kn, channels, *, has_dipole, has_quadrupole, compact_quadrupole):
+    policy = os.environ.get('ICTC_ASCEND_MULTIPOLE_AMPLITUDE', '1')
+    if policy not in ('0', '1'):
+        raise ValueError('ICTC_ASCEND_MULTIPOLE_AMPLITUDE must be zero or one')
+    from .runtime import has_triton_ascend
+    if (policy == '1' and spectrum.device.type == 'npu' and spectrum.dtype == torch.complex64
+            and not kp.requires_grad and not kn.requires_grad and has_triton_ascend()):
+        from .spectral_linear import amplitudes as linear_amplitudes
+        return linear_amplitudes(spectrum, kp, kn, channels, has_dipole=has_dipole,
+            has_quadrupole=has_quadrupole, compact_quadrupole=compact_quadrupole)
     from .sparse_product import sparse_product
     graphs, frequencies = spectrum.shape[:2]
     fields = [spectrum[..., :channels].unsqueeze(-1)]

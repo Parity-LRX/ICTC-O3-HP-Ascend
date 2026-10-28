@@ -183,7 +183,16 @@ are separate implementations.
   tile channel vectors to the device UB capacity.
 - Analytic coordinate VJPs and their mixed adjoints support force training.
 - Paired real-FFT adjoints use CANN transforms and retain second derivatives.
-- Fused positive/negative multipole contractions reduce small NPU launches.
+- Fixed Cartesian recovery matrices replace repeated component expansion in
+  the learned dipole and quadrupole heads. Trainable source maps and gates
+  are evaluated on every call.
+- Fused fixed-cell geometry computes reciprocal vectors, Poisson weights,
+  screening and volume in one vector kernel, reading the current cell each
+  time. Requested cell derivatives and custom or learned Green kernels retain
+  the differentiable geometry path.
+- Direct positive/negative amplitude maps read the FFT channel planes without
+  Cartesian repacking. Paired linear adjoints preserve force-loss derivatives;
+  live reciprocal-vector derivatives retain the general contraction path.
 - Performance mode uses vectorized CANN assignment for large fields with few
   source channels; other shapes use native UB tiling. Capacity and native modes
   retain bounded native assignment. `ICTC_ASCEND_MESH_ASSIGNMENT=auto` is the
@@ -193,91 +202,66 @@ are separate implementations.
 - Caches hold mesh indices and fixed execution metadata. Live coordinates,
   cells, source tensors and learned Green weights are recomputed each call.
 
-## Measured performance
+Recovery, geometry and amplitude optimizations are enabled automatically for
+eligible inputs. For profiling, set `ICTC_ASCEND_MULTIPOLE_RECOVERY=0`,
+`ICTC_ASCEND_RECIPROCAL_GEOMETRY=0` or
+`ICTC_ASCEND_MULTIPOLE_AMPLITUDE=0` to select the corresponding general path.
+The geometry and direct amplitude kernels use Triton Ascend from the `hp`
+installation extra; the standalone Ascend C API retains its existing path
+when that optional backend is unavailable.
 
-Selected paired measurements on one Ascend 910B3, eager FP32 with HF32 disabled:
+## Measured cost relative to short-range evaluation
 
-| Workload | Atoms | Phase | Torch/CANN reference, ms | Ascend HP, ms | Speedup |
-| --- | ---: | --- | ---: | ---: | ---: |
-| Standalone q+mu+Q, 1 source channel | 4,096 | Energy + forces | 36.19 | 17.15 | 2.11x |
-| Standalone q+mu+Q, 1 source channel | 4,096 | Training | 60.22 | 27.39 | 2.20x |
-| Standalone q, 1 source channel | 65,536 | Training | 211.45 | 174.14 | 1.21x |
-| Standalone q, 4 source channels | 65,536 | Training | 357.19 | 109.94 | 3.25x |
-| Standalone q+mu+Q, 1 source channel | 65,536 | Training | 467.60 | 287.87 | 1.62x |
-| MACE C64/lmax 2 with q+mu+Q | 4,096 | Energy + forces | 139.08 | 117.45 | 1.18x |
-| MACE C64/lmax 2 with q+mu+Q | 4,096 | Training | 314.96 | 284.26 | 1.11x |
+The following comparisons use one Ascend 910B3 or one Hygon K100, eager
+FP32 with HF32/TF32 disabled. Both use the same saved C64/lmax-2 backbone,
+two interactions, correlation 3, eight Bessel functions, radial MLP width 16
+and cutoff polynomial order 5. The graph has 56 neighbors per atom at a
+4.5-Angstrom cutoff. Source channels are one, with nonzero deterministic
+learned heads and energy scales, PCS assignment, approximately 1-Angstrom
+mesh spacing and sigma fixed at 1 Angstrom. Meshes are 32x32x32 for 4,096
+atoms and 64x64x32 for 16,384 atoms.
 
-The standalone scan covers 1,024–65,536 atoms and monopole, dipole and
-quadrupole sources. Whole-model pairs use the same Ascend HP backbone on both
-sides; the electrostatic execution schedule changes. Models are initialized
-C64/lmax-2 or C128/lmax-3 networks with two interactions, correlation 3 and a
-nonzero long-range scale. Training includes energy, forces, parameter backward
-and AdamW. Inference includes complete energy and force evaluation.
-Standalone training treats moment tensors as the optimized parameters;
-whole-model training updates all trainable network parameters.
+Training includes energy, forces, parameter backward through forces and
+AdamW with `foreach=False`; inference includes energy and forces. The K100
+backbone uses its current optimized training and inference presets. Each
+variant runs in a fresh process, with one active worker on the same physical
+device for the Ascend pairs. Initial parameters match exactly. Energy, forces,
+coordinate second gradients and all active parameter gradients are checked
+across execution schedules and hardware using the budgets below.
 
-Each backend runs in a fresh process on the same allocated NPU, with at least
-two seconds of warmup and five synchronized timed calls. The reported latency
-is the median. Graph construction and host/device input transfers are excluded.
-The periodic lattice graph has 56 neighbors per atom at a 4.5-Angstrom cutoff.
-Mesh spacing is approximately 1 Angstrom, PCS assignment is used and sigma is
-fixed at 1 Angstrom. These are computation benchmarks, rather than fitted
-potential accuracy or long-trajectory MD measurements.
+Each entry is the additional time over that hardware's own short-range
+measurement; the percentage divides this increment by its short-range time.
+Three calls are timed per synchronized block, then divided by three; values
+are medians of five blocks after at least two seconds of warmup. Neighbor
+graph construction and input transfers are excluded.
 
-The Torch/CANN reference uses the original mesh functional and full complex
-FFTs. Multipole contractions are expressed in equivalent real arithmetic to
-avoid the installed NPU runtime's unsupported complex batched matrix multiply.
-The native path retains the same functional, including its triclinic Nyquist
-terms; it introduces no radial approximation or reduced-precision arithmetic.
-
-### Overhead relative to short-range evaluation
-
-The original 4,096-atom C64/lmax-2 checkpoint and graph give the following
-results with one active worker on one physical NPU. Backbone weights and the
-206,864 trainable backbone parameters match the saved benchmark. Training uses
-its original energy/force loss and AdamW with `foreach=False`. The source
-channel count is one, with a PCS mesh at approximately 1 Angstrom and sigma
-fixed at 1 Angstrom.
-
-| Phase | Synchronization | Short range, ms | With q, ms (added) | With q+mu+Q, ms (added) |
-| --- | --- | ---: | ---: | ---: |
-| Energy + forces | Every 3 calls | 79.82 | 96.98 (21.5%) | 110.14 (38.0%) |
-| Energy + forces | Every call | 86.78 | 105.10 (21.1%) | 117.81 (35.8%) |
-| Training | Every 3 calls | 227.07 | 256.79 (13.1%) | 273.13 (20.3%) |
-| Training | Every call | 235.20 | 264.26 (12.4%) | 281.20 (19.6%) |
-
-The three-call measurements divide each synchronized block's duration by three
-and report the median of five blocks. Individual-call measurements report the
-median of nine synchronized calls. Both follow at least two seconds of warmup.
-The original approximately 79-ms result uses the three-call format. The
-pre-electrostatics source also passes the saved full energy/force and mixed
-gradient oracle; its final repeat gives 79.99 ms in the same three-call format.
-Rebuilding the input graph reproduces all seven saved input tensors exactly.
-
-#### Individually synchronized atom-count sweep
-
-The following on/off pairs retain identical C64/lmax-2 backbone weights and the
-same neighbor graph. Disabling long range removes its source head and mesh
-module. The enabled model includes source prediction and all reciprocal
-derivatives. Each variant uses nine individually synchronized timed calls on
-the same NPU. Eight pairs run concurrently on eight NPUs. These initialized
-weights and execution conditions are separate from the serial saved-checkpoint
-measurements above; compare each enabled model with its paired baseline.
-
-| Atoms | Sources | Phase | Short range, ms | With HP reciprocal correction, ms | Added, ms | Added |
+| Atoms | Sources | Phase | Ascend before, ms (+%) | Ascend after, ms (+%) | K100, ms (+%) | Increment reduced |
 | ---: | --- | --- | ---: | ---: | ---: | ---: |
-| 4,096 | q | Energy + forces | 92.47 | 106.54 | 14.07 | 15.2% |
-| 4,096 | q | Training | 237.25 | 265.55 | 28.30 | 11.9% |
-| 4,096 | q+mu | Energy + forces | 90.80 | 110.79 | 19.99 | 22.0% |
-| 4,096 | q+mu | Training | 237.70 | 266.97 | 29.26 | 12.3% |
-| 4,096 | q+mu+Q | Energy + forces | 91.20 | 116.58 | 25.38 | 27.8% |
-| 4,096 | q+mu+Q | Training | 238.38 | 284.80 | 46.43 | 19.5% |
-| 16,384 | q+mu+Q | Energy + forces | 299.03 | 352.99 | 53.95 | 18.0% |
-| 16,384 | q+mu+Q | Training | 895.28 | 997.04 | 101.76 | 11.4% |
+| 4,096 | q | E/F inference | 14.20 (17.5%) | 12.23 (15.4%) | 14.65 (36.1%) | 13.9% |
+| 4,096 | q | Training | 27.35 (12.0%) | 24.96 (11.0%) | 13.41 (11.9%) | 8.7% |
+| 4,096 | q+mu+Q | E/F inference | 26.10 (32.2%) | 14.90 (18.7%) | 34.81 (85.7%) | 42.9% |
+| 4,096 | q+mu+Q | Training | 42.32 (18.5%) | 24.34 (10.7%) | 30.38 (26.9%) | 42.5% |
+| 16,384 | q | E/F inference | 40.70 (13.6%) | 37.58 (12.6%) | 17.51 (13.3%) | 7.7% |
+| 16,384 | q | Training | 84.46 (9.4%) | 78.92 (8.8%) | 20.55 (5.2%) | 6.6% |
+| 16,384 | q+mu+Q | E/F inference | 53.68 (18.0%) | 31.87 (10.7%) | 36.27 (27.5%) | 40.6% |
+| 16,384 | q+mu+Q | Training | 99.08 (11.1%) | 61.14 (6.8%) | 40.91 (10.3%) | 38.3% |
 
-Source channels are one in all these pairs. The short-range repeats in separate
-source-order pairs are measured separately. These timings describe initialized
-models with an active reciprocal term, rather than a fitted foundation model.
+The optimized 4,096-atom Ascend short-range baseline is 79.50 ms for energy
+and forces and 227.20 ms for training. With q+mu+Q, the complete calls take
+94.40 and 251.54 ms. The corresponding K100 short-range times are 40.62 and
+112.75 ms; complete q+mu+Q calls take 75.43 and 143.13 ms. Incremental and
+complete-model costs are distinct measurements.
+
+The q+mu+Q increment falls by 38-43% across these two sizes and phases.
+Scalar-only training remains more expensive on Ascend: at 16,384 atoms it
+adds 78.92 ms, compared with 20.55 ms on K100. These are initialized-model
+compute measurements; they do not establish fitted-potential accuracy or
+long-trajectory MD behavior.
+
+The original approximately 79-ms result uses the three-call format above.
+Individually synchronized calls are also measured separately: at 4,096 atoms,
+Ascend short-range/q+mu+Q inference takes 86.29/101.18 ms, and training takes
+234.52/258.91 ms. These synchronization formats should be compared separately.
 
 ## Numerical and deployment checks
 
@@ -290,6 +274,13 @@ models with an active reciprocal term, rather than a fitted foundation model.
   cubic meshes with box-dependent screening are also checked.
 - Learned Green filters with nonzero parameters, parameter-only force-loss
   backward, and batch-validation cache invalidation after an in-place update.
+- Exact recovery matrices across channel tails, source-channel counts and
+  basis mutations; differentiable or customized recoveries retain the general
+  path. Fused geometry also checks live cell updates and disjoint frequency
+  slices. Direct amplitude maps check compact/dense quadrupoles, absent moment
+  degrees and mixed second derivatives.
+- Fixed-cell weighted atomic energies, multiple graphs, empty inputs and
+  standalone execution with MACE and Triton unavailable.
 - Three complete MACE models: energy/force and coordinate/cell mixed derivatives,
   network parameter gradients, AdamW, strict checkpoint loading and deployment.
   The training CLI also completes an energy-and-force epoch and reloads its

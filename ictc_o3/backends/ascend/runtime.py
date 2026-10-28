@@ -4,12 +4,22 @@ from __future__ import annotations
 from functools import lru_cache
 from contextlib import contextmanager
 from contextvars import ContextVar
+import importlib.util
 import os
 
 import torch
 
 
 _graph_queue = ContextVar("ictc_ascend_graph_queue", default=None)
+
+
+@lru_cache(maxsize=1)
+def has_triton_ascend():
+    """Keep the standalone Ascend C API usable without Triton installed."""
+    try:
+        return importlib.util.find_spec("triton.backends.ascend") is not None
+    except (ImportError, ValueError):
+        return False
 
 
 @lru_cache(maxsize=None)
