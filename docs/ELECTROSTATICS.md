@@ -232,11 +232,37 @@ terms; it introduces no radial approximation or reduced-precision arithmetic.
 
 ### Overhead relative to short-range evaluation
 
+The original 4,096-atom C64/lmax-2 checkpoint and graph give the following
+results with one active worker on one physical NPU. Backbone weights and the
+206,864 trainable backbone parameters match the saved benchmark. Training uses
+its original energy/force loss and AdamW with `foreach=False`. The source
+channel count is one, with a PCS mesh at approximately 1 Angstrom and sigma
+fixed at 1 Angstrom.
+
+| Phase | Synchronization | Short range, ms | With q, ms (added) | With q+mu+Q, ms (added) |
+| --- | --- | ---: | ---: | ---: |
+| Energy + forces | Every 3 calls | 79.82 | 96.98 (21.5%) | 110.14 (38.0%) |
+| Energy + forces | Every call | 86.78 | 105.10 (21.1%) | 117.81 (35.8%) |
+| Training | Every 3 calls | 227.07 | 256.79 (13.1%) | 273.13 (20.3%) |
+| Training | Every call | 235.20 | 264.26 (12.4%) | 281.20 (19.6%) |
+
+The three-call measurements divide each synchronized block's duration by three
+and report the median of five blocks. Individual-call measurements report the
+median of nine synchronized calls. Both follow at least two seconds of warmup.
+The original approximately 79-ms result uses the three-call format. The
+pre-electrostatics source also passes the saved full energy/force and mixed
+gradient oracle; its final repeat gives 79.99 ms in the same three-call format.
+Rebuilding the input graph reproduces all seven saved input tensors exactly.
+
+#### Individually synchronized atom-count sweep
+
 The following on/off pairs retain identical C64/lmax-2 backbone weights and the
 same neighbor graph. Disabling long range removes its source head and mesh
 module. The enabled model includes source prediction and all reciprocal
-derivatives. Each variant uses nine synchronized timed calls on the same NPU;
-the other settings follow the protocol above.
+derivatives. Each variant uses nine individually synchronized timed calls on
+the same NPU. Eight pairs run concurrently on eight NPUs. These initialized
+weights and execution conditions are separate from the serial saved-checkpoint
+measurements above; compare each enabled model with its paired baseline.
 
 | Atoms | Sources | Phase | Short range, ms | With HP reciprocal correction, ms | Added, ms | Added |
 | ---: | --- | --- | ---: | ---: | ---: | ---: |
