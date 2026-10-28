@@ -2103,7 +2103,7 @@ class PureCartesianICTDFix(nn.Module):
         long_range_neutralize: bool = True,
         long_range_filter_hidden_dim: int = 64,
         long_range_kmax: int = 2,
-        long_range_mesh_size: int = 16,
+        long_range_mesh_size: int | tuple[int, int, int] = 16,
         long_range_slab_padding_factor: int = 2,
         long_range_include_k0: bool = False,
         long_range_source_channels: int = 1,
@@ -2114,6 +2114,7 @@ class PureCartesianICTDFix(nn.Module):
         long_range_assignment: str = "pcs",
         long_range_mesh_fft_full_ewald: bool = False,
         long_range_mesh_fft_reciprocal_only: bool = False,
+        long_range_smearing_sigma: float | None = None,
         long_range_max_multipole_l: int = 0,
         long_range_multipole_gate_init: float = 0.1,
         long_range_dispersion: bool = False,
@@ -2548,7 +2549,10 @@ class PureCartesianICTDFix(nn.Module):
         self.long_range_boundary = str(long_range_boundary)
         self.long_range_neutralize = bool(long_range_neutralize)
         self.long_range_mesh_fft_full_ewald = bool(long_range_mesh_fft_full_ewald)
-        self.long_range_mesh_size = int(long_range_mesh_size)
+        from ictc_o3.electrostatics.mesh import normalize_mesh_size
+        self.long_range_mesh_size = normalize_mesh_size(long_range_mesh_size)
+        self.long_range_smearing_sigma = long_range_smearing_sigma
+        self.long_range_mesh_fft_reciprocal_only = bool(long_range_mesh_fft_reciprocal_only)
         self.long_range_slab_padding_factor = int(long_range_slab_padding_factor)
         self.long_range_module = build_long_range_module(
             mode=self.long_range_mode,
@@ -2569,6 +2573,7 @@ class PureCartesianICTDFix(nn.Module):
             assignment=long_range_assignment,
             mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
             mesh_fft_reciprocal_only=long_range_mesh_fft_reciprocal_only,
+            smearing_sigma=long_range_smearing_sigma,
             max_multipole_l=long_range_max_multipole_l,
             multipole_feature_channels=self.channels,
             theta=long_range_theta,
@@ -2642,8 +2647,11 @@ class PureCartesianICTDFix(nn.Module):
             # truth) so the C++ reciprocal solver reproduces the in-model multipole_energy exactly:
             # screened |S(k)|^2 PME with green_mode/mesh_size/boundary/full_ewald all matched.
             _mp_kernel = self.long_range_module.kernel
+            # The multipole functional has always been reciprocal-only.
+            _mp_kernel.reciprocal_only = True
+            self.long_range_mesh_fft_reciprocal_only = True
             self.long_range_mesh_fft_full_ewald = bool(getattr(_mp_kernel, "full_ewald", bool(long_range_mesh_fft_full_ewald)))
-            self.long_range_mesh_size = int(getattr(_mp_kernel, "mesh_size", 16))
+            self.long_range_mesh_size = normalize_mesh_size(getattr(_mp_kernel, "mesh_size", 16))
             self.long_range_green_mode = str(getattr(_mp_kernel, "green_mode", "poisson"))
             self.long_range_boundary = str(getattr(_mp_kernel, "boundary", "periodic"))
             # multipole_energy always distributes e_graph/n_local uniformly (it ignores the kernel's

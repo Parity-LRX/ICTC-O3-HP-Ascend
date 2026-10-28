@@ -276,6 +276,9 @@ void PairMFFTorch::update_positions() {
   // Relative vectors, periodic shifts and their derivatives are unchanged.
   double origin[3]={0.,0.,0.};
   if(nodes_)for(int axis=0;axis<3;axis++)origin[axis]=atom->x[model_to_atom_[0]][axis];
+  // Relative short-range vectors keep their local FP32 origin. Reciprocal
+  // meshes must share the global box origin across every MPI rank.
+  for(int axis=0;axis<3;axis++)mesh_origin_[axis]=static_cast<float>(origin[axis]-domain->boxlo[axis]);
   for(int m=0;m<nodes_;m++)for(int axis=0;axis<3;axis++)
     positions_[static_cast<size_t>(m)*3+axis]=static_cast<float>(atom->x[model_to_atom_[m]][axis]-origin[axis]);
   const float values[]={static_cast<float>(domain->xprd),0,0,static_cast<float>(domain->xy),static_cast<float>(domain->yprd),0,
@@ -291,9 +294,11 @@ void PairMFFTorch::compute(int eflag,int vflag) {
   update_positions();
   positions_seconds_+=MPI_Wtime()-updated;
   try {
-    Gil gil;Ref args(PyTuple_New(3));
+    Gil gil;Ref args(PyTuple_New(4));
     PyTuple_SET_ITEM(args.value,0,view(positions_));PyTuple_SET_ITEM(args.value,1,cell_view(cell_));
     PyTuple_SET_ITEM(args.value,2,PyBool_FromLong(vflag_global));
+    PyTuple_SET_ITEM(args.value,3,PyMemoryView_FromMemory(
+        reinterpret_cast<char*>(mesh_origin_),sizeof(mesh_origin_),PyBUF_READ));
     Ref method(PyObject_GetAttrString(engine_,"compute"));Ref result(PyObject_CallObject(method,args));
     started=MPI_Wtime();
     if(!PyTuple_Check(result) || PyTuple_Size(result)!=4)throw std::runtime_error("Invalid Ascend engine result");

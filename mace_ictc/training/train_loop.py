@@ -266,7 +266,8 @@ class ForceTrainer:
         if next(self.model.parameters()).device.type == "npu":
             from mace_ictc.ascend.runtime import configure_model
             self.operator_plan_info = configure_model(
-                self.model, policy=operator_plan, training=True, capture=self.train_makefx_compile)
+                self.model, policy=operator_plan, training=True, capture=self.train_makefx_compile,
+                electrostatics_backend=self.extra_hparams.get("electrostatics_backend", "auto"))
         else:
             from mace_ictc.models.operator_plans import configure_mace_runtime_plan
             self.operator_plan_info = configure_mace_runtime_plan(
@@ -1916,7 +1917,8 @@ class ForceTrainer:
                 "long_range_source_channels", "long_range_backend",
                 "long_range_reciprocal_backend", "long_range_energy_partition",
                 "long_range_green_mode", "long_range_assignment",
-                "long_range_mesh_fft_full_ewald", "long_range_max_multipole_l",
+                "long_range_mesh_fft_full_ewald", "long_range_mesh_fft_reciprocal_only",
+                "long_range_smearing_sigma", "long_range_max_multipole_l",
                 "long_range_dispersion_mode", "long_range_dispersion", "dispersion_cutoff",
                 "dispersion_min_cutoff", "dispersion_switch_width",
                 "dispersion_max_num_neighbors", "dispersion_neighbor_method",

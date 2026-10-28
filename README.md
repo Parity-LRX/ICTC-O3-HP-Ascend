@@ -9,7 +9,7 @@ Use `ictc_o3` independently in your own equivariant networks, or `mace_ictc`
 to train, convert and deploy MACE potentials.
 
 [Single-NPU results](#single-npu-results) · [Multi-NPU scaling](#multi-npu-scaling) ·
-[Usage guide](docs/USAGE.md) · [O(3) API](docs/O3_API.md) ·
+[Usage guide](docs/USAGE.md) · [O(3) API](docs/O3_API.md) · [Electrostatics](docs/ELECTROSTATICS.md) ·
 [LAMMPS](lammps_user_mfftorch/docs/ASCEND.md) · [All performance figures](docs/PERFORMANCE.md)
 
 ## Highlights
@@ -22,6 +22,9 @@ to train, convert and deploy MACE potentials.
   original PyTorch MACE/e3nn throughput at C128/lmax 3 and 2,048 atoms.
 - Eight-NPU LAMMPS strong-scaling efficiency reaches 83.0% for C64 and 89.7%
   for pretrained MACE-MH-1. MH-1 weak-scaling efficiency reaches 95.2%.
+- Native reciprocal monopole/dipole/quadrupole electrostatics: Ascend C mesh
+  assignment, real FFTs, mixed force-loss adjoints and owned-source HCCL sums.
+  [API, training and LAMMPS examples](docs/ELECTROSTATICS.md).
 
 All results use Ascend 910B3, eager FP32 and HF32 disabled, without `torch.compile`.
 See the [measurement protocols and validation](docs/USAGE.md#benchmark-protocols-and-numerical-validation).

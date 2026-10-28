@@ -226,12 +226,10 @@ The supplied Ascend recipe explicitly sets:
 --long-range-mode none --long-range-dispersion-mode none
 ```
 
-The qualified Ascend workflow is short range. Native K100 monopole/dipole/
-quadrupole electrostatics has not been ported and qualified here. Inherited
-long-range configuration fields are not an Ascend HP recipe, and the Ascend
-LAMMPS loader rejects checkpoints with added long-range terms. Use the
-[K100 user guide](https://github.com/Parity-LRX/ICTC-O3-HP-K100/blob/main/docs/USAGE.md)
-for that supported implementation.
+To add reciprocal monopole/dipole/quadrupole electrostatics, use
+`examples/train_hco_long_range.sh`. The [electrostatics guide](ELECTROSTATICS.md)
+provides the native Ascend C API, complete training flags, fixed Gaussian
+screening convention and owned-source HCCL LAMMPS deployment.
 
 ## 4. Restart, warm-start and evaluate
 

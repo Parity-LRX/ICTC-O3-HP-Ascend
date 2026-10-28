@@ -10,5 +10,7 @@ if hasattr(torch.serialization, "add_safe_globals"):
 
 from .operators import *
 from .operators import __all__
+from .electrostatics import MeshElectrostatics, mesh_spread, mesh_gather, mesh_shape_for_cell
+__all__ = [*__all__, "MeshElectrostatics", "mesh_spread", "mesh_gather", "mesh_shape_for_cell"]
 
 __version__ = "0.1.0"

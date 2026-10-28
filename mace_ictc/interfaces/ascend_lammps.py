@@ -17,7 +17,7 @@ import torch_npu
 
 
 def load_checkpoint(path, device):
-    """Rebuild a trusted FP32 short-range ICTC checkpoint without deployment tracing."""
+    """Rebuild a trusted FP32 short-range or reciprocal ICTC checkpoint."""
     import e3nn
     from mace_ictc.models.pure_cartesian_ictd_fix import PureCartesianICTDFix
     from mace_ictc.utils.checkpoint_metadata import get_checkpoint_e3_state_dict
@@ -54,10 +54,9 @@ def load_checkpoint(path, device):
     values = {**meta, **checkpoint}
     if values.get('angular_basis', 'ictd') != 'ictd':
         raise ValueError('Ascend LAMMPS currently requires the ICTC angular basis')
-    if (values.get('long_range_mode', 'none') != 'none'
-            or values.get('long_range_dispersion_mode', 'none') != 'none'
+    if (values.get('long_range_dispersion_mode', 'none') != 'none'
             or values.get('long_range_dispersion', False)):
-        raise ValueError('This Ascend pair style supports short-range checkpoints only')
+        raise ValueError('Ascend LAMMPS dispersion requires a separate deployment implementation')
     if values.get('zbl_enabled', False):
         raise ValueError('A separate ZBL energy contribution is not implemented by this pair style')
     if values.get('feature_spectral_mode', 'none') != 'none' or values.get('num_fidelity_levels', 0):
@@ -108,6 +107,9 @@ def load_checkpoint(path, device):
         torch.set_default_dtype(previous_dtype)
         e3nn.set_optimization_defaults(**previous_options)
     model = model.to(device=device, dtype=torch.float32).eval().requires_grad_(False)
+    if model.long_range_module is not None:
+        from .ascend_electrostatics import NativeReciprocal
+        NativeReciprocal(model)  # Validate the saved functional before deployment.
     if any(p.dtype != torch.float32 for p in model.parameters()):
         raise ValueError('All model parameters must remain FP32')
     e0 = torch.zeros(max(keys) + 1, device=device, dtype=torch.float32)
@@ -190,6 +192,10 @@ class AscendLAMMPSEngine:
         from mace_ictc.hp import configure_model
         enable(mode=os.environ.get('MFF_ASCEND_MODE', 'performance'))
         self.model, self.e0, self.state_source = load_checkpoint(checkpoint, self.device)
+        self.reciprocal = None
+        if getattr(self.model, 'long_range_module', None) is not None:
+            from .ascend_electrostatics import NativeReciprocal
+            self.reciprocal = NativeReciprocal(self.model)
         self.foundation = getattr(self.model, 'architecture', None) == 'mace-foundation-nonlinear'
         self.cutoff = float(self.model.max_radius)
         self.depth = int(self.model.num_interaction)
@@ -391,6 +397,8 @@ class AscendLAMMPSEngine:
             self._skin_has_shifts = bool(np.any(self._skin_edges[2]))
             self._active_edges = None
         self.batch = torch.zeros(nodes, dtype=torch.int64, device=device)
+        if self.reciprocal is not None:
+            self.reciprocal.set_ownership(self.nlocal, self.world_size, device)
         ghosts = self._host(ghost_nodes, np.int64, (-1,)).to(device)
         slots = self._host(ghost_slots, np.int64, (-1,)).to(device)
         receivers = self._host(receive_indices, np.int64, (-1,)).to(device)
@@ -586,24 +594,36 @@ class AscendLAMMPSEngine:
         flat = value.reshape(self.nodes, width)
         return _FeatureHalo.apply(flat, self._halo_anchor, self, slot).reshape(value.shape)
 
-    def _device_prediction(self, pos, box, want_virial):
+    def _device_prediction(self, pos, box, want_virial, mesh_origin=None):
         with torch.enable_grad():
             pos.requires_grad_(True)
+            strain = None
+            eval_pos, eval_box = pos, box
+            if self.reciprocal is not None and want_virial:
+                # Strain both coordinates and the cell so reciprocal, source
+                # and short-range contributions enter the same virial.
+                strain = pos.new_zeros(3, 3, requires_grad=True)
+                transform = torch.eye(3, device=pos.device, dtype=pos.dtype) + strain
+                eval_pos, eval_box = pos @ transform, box @ transform
             edge_vec = None
+            reciprocal_source = None
             if self.nodes:
                 from mace_ictc.ascend.geometry import edge_vectors
-                edge_vec = edge_vectors(pos, box, self.shifts, self.batch, self.src, self.dst)
+                edge_vec = edge_vectors(eval_pos, eval_box, self.shifts, self.batch, self.src, self.dst)
                 if edge_vec is None:
-                    edge_cells = box[self.batch[self.src]]
+                    edge_cells = eval_box[self.batch[self.src]]
                     shifts = torch.einsum('ni,nij->nj', self.shifts, edge_cells)
-                    edge_vec = pos[self.dst] - pos[self.src] + shifts
+                    edge_vec = eval_pos[self.dst] - eval_pos[self.src] + shifts
                 callback = None
                 if self.halo_mode == 'layerwise' and self.world_size > 1 and self.depth > 1:
                     self._halo_anchor = pos.sum()*0
                     callback = ((lambda slot, value: self._exchange_state(value, slot))
                                 if self.foundation else self._layer_state)
-                prediction = self.model(pos, self.atomic_numbers, self.batch, self.src, self.dst, self.shifts, box,
-                                        precomputed_edge_vec=edge_vec, layer_state_callback=callback)
+                options = dict(precomputed_edge_vec=edge_vec, layer_state_callback=callback)
+                if self.reciprocal is not None:options['return_reciprocal_source'] = True
+                prediction = self.model(eval_pos, self.atomic_numbers, self.batch, self.src, self.dst, self.shifts, eval_box,
+                                        **options)
+                if self.reciprocal is not None:prediction, reciprocal_source = prediction
                 if self._feature_pending:
                     raise RuntimeError('The model did not join its pending feature exchanges')
                 energy_nodes = self.nlocal if self.compact_outputs else self.nodes
@@ -613,14 +633,31 @@ class AscendLAMMPSEngine:
             else:
                 atomic = pos.new_empty(0)
                 energy = pos.sum() * 0
-            variables = (pos, edge_vec) if want_virial and self.nodes else (pos,)
+            if self.reciprocal is not None:
+                if reciprocal_source is None:
+                    reciprocal_source = pos.new_empty(0, self.reciprocal.width)
+                # C++ centers short-range coordinates independently on each
+                # rank. Restore the common box frame only for reciprocal FFTs.
+                offset = mesh_origin if strain is None else mesh_origin @ transform
+                reciprocal_pos = eval_pos + offset
+                extra = self.reciprocal(reciprocal_pos, self.batch, eval_box, reciprocal_source,
+                                        owned=self.nlocal, size=self.world_size).reshape(-1)
+                atomic = atomic + extra[:atomic.shape[0]]
+                energy = atomic[:self.nlocal].sum()
+            variables = ((pos, strain) if strain is not None else
+                         (pos, edge_vec) if want_virial and self.nodes else (pos,))
             connected = energy + pos.sum()*0
-            if want_virial and self.nodes:connected = connected + edge_vec.sum()*0
+            if want_virial and self.nodes and strain is None:connected = connected + edge_vec.sum()*0
             gradients = torch.autograd.grad(connected,
                                             variables, allow_unused=True)
             self._halo_anchor = None
         forces = -gradients[0].detach()
-        if want_virial and self.nodes and self.src.numel():
+        if strain is not None:
+            tensor = -gradients[1].detach() if gradients[1] is not None else pos.new_zeros(3, 3)
+            tensor = (tensor+tensor.T)*.5
+            virial = torch.stack((tensor[0, 0], tensor[1, 1], tensor[2, 2],
+                                  tensor[0, 1], tensor[0, 2], tensor[1, 2]))
+        elif want_virial and self.nodes and self.src.numel():
             # Homogeneous strain transforms every periodic edge as r -> r T.
             # Its derivative is r.T @ dE/dr. Using short edge displacements
             # avoids cancellation between large absolute-position/cell terms.
@@ -631,16 +668,20 @@ class AscendLAMMPSEngine:
         else:virial = pos.new_zeros(6)
         return forces, atomic, energy, virial
 
-    def compute(self, positions, cell, want_virial):
+    def compute(self, positions, cell, want_virial, mesh_origin=None):
         if self.generation is None:raise RuntimeError('Model topology has not been supplied')
+        if self.reciprocal is not None and mesh_origin is None:
+            raise ValueError('Reciprocal electrostatics requires the common mesh origin; rebuild the Ascend LAMMPS pair style')
         if self.profile:torch.npu.synchronize()
         start = time.perf_counter()
         if self.prune_skin:self._filter_skin(positions, cell)
         pos = self._host(positions, np.float32, (self.nodes, 3)).to(self.device)
         box = self._host(cell, np.float32, (1, 3, 3)).to(self.device)
+        origin = (self._host(mesh_origin, np.float32, (3,)).to(self.device)
+                  if self.reciprocal is not None else None)
         if self.profile:torch.npu.synchronize()
         transferred = time.perf_counter()
-        forces, atomic, energy, virial = self._device_prediction(pos, box, bool(want_virial))
+        forces, atomic, energy, virial = self._device_prediction(pos, box, bool(want_virial), origin)
         if self.profile:torch.npu.synchronize()
         evaluated = time.perf_counter()
         with torch.no_grad():

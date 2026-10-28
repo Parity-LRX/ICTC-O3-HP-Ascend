@@ -11,6 +11,7 @@ include(GNUInstallDirs)
 include(cmake/TorchNPU.cmake)
 
 ascendc_library(ictc_ascendc_kernel STATIC
+    op_kernel/electrostatics.cpp
     op_kernel/vector.cpp
     op_kernel/weighted_map.cpp
     op_kernel/epilogue.cpp
@@ -31,6 +32,7 @@ target_compile_definitions(ictc_ascendc_kernel PRIVATE
 )
 
 add_library(ictc_ascendc SHARED
+    op_host/electrostatics_bindings.cpp
     op_host/bindings.cpp
     op_host/epilogue_bindings.cpp
     op_host/epilogue_adjoint_bindings.cpp

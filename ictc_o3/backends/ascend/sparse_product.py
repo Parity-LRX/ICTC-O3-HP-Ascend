@@ -140,7 +140,7 @@ def available():
 
 def _raw(left, right, weight, index, plan, bank, mode=0, grad=None):
     from ictc_o3.ascendc.runtime import is_enabled
-    if is_enabled() or '_ascendc_graph' in plan:
+    if is_enabled() or '_ascendc_graph' in plan or plan.get('_ascendc_native', False):
         from ictc_o3.ascendc.product import raw
         return raw(left,right,weight,index,plan,bank,mode,grad)
     if plan.get("_ascend_gemm",False):
@@ -376,7 +376,7 @@ def sparse_product(left, right, weight, plan, *, index=None, bank=True):
             raise ValueError("Species index must be an integer [N] tensor on the NPU")
         from .species import validate_species
         validate_species(index, weight.shape[0])
-    if not available():
+    if not plan.get('_ascendc_native', False) and not available():
         raise RuntimeError("Ascend sparse maps require Triton-Ascend; install the NPU toolchain")
     return _Product.apply(left.contiguous(), right.contiguous(), weight.contiguous(),
                           None if index is None else index.contiguous(), plan, bank)

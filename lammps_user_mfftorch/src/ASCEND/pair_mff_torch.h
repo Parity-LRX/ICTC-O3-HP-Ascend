@@ -46,6 +46,7 @@ class PairMFFTorch : public Pair {
   std::vector<int64_t> send_counts_, receive_counts_;
   std::vector<float> positions_, shifts_, force_result_, energy_result_;
   float cell_[9] = {};
+  float mesh_origin_[3] = {};
   _object *engine_ = nullptr;
 };
 }

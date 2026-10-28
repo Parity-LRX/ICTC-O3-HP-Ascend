@@ -7,7 +7,7 @@ import torch
 def create_model(*, channels=64, lmax=3, edge_lmax=None, num_interactions=2,
                  correlation=3, use_reduced_cg=False,
                  atomic_numbers=(1, 6, 8), cutoff=5.0, avg_num_neighbors=50.0,
-                 device="npu", dtype=torch.float32):
+                 device="npu", dtype=torch.float32, electrostatics=None):
     """Create a parameterized Cartesian bridge-U model, without a runtime plan.
 
     New TP base coefficients are fixed by construction; radial/linear/SC weights
@@ -34,6 +34,27 @@ def create_model(*, channels=64, lmax=3, edge_lmax=None, num_interactions=2,
     _degree(edge_lmax, "edge_lmax")
     if edge_lmax < lmax:
         raise ValueError("edge_lmax must be at least lmax")
+    from collections.abc import Mapping
+    long_range_options = {}
+    if electrostatics is not None:
+        if not isinstance(electrostatics, Mapping):
+            raise TypeError("electrostatics must be a configuration mapping or None")
+        allowed = {'mode', 'boundary', 'reciprocal_backend', 'kmax', 'mesh_size',
+                   'source_channels', 'hidden_dim', 'filter_hidden_dim', 'neutralize',
+                   'include_k0', 'energy_partition', 'green_mode', 'assignment',
+                   'slab_padding_factor', 'mesh_fft_full_ewald', 'mesh_fft_reciprocal_only',
+                   'max_multipole_l', 'multipole_gate_init', 'smearing_sigma'}
+        unknown = set(electrostatics) - allowed
+        if unknown:
+            raise ValueError(f"Unknown electrostatics options: {sorted(unknown)}")
+        options = dict(mode='reciprocal-spectral-v1', boundary='periodic',
+                       reciprocal_backend='mesh_fft', mesh_size=32, assignment='pcs',
+                       mesh_fft_full_ewald=True, mesh_fft_reciprocal_only=True)
+        options.update(electrostatics)
+        if 'smearing_sigma' not in options:
+            options['smearing_sigma'] = (1.0 if options['reciprocal_backend'] == 'mesh_fft'
+                                        and options['mesh_fft_full_ewald'] else None)
+        long_range_options = {'long_range_' + key: value for key, value in options.items()}
     from mace_ictc.models.factory import build_baseline_model
     from mace_ictc.utils.config import ModelConfig
     import e3nn
@@ -53,6 +74,7 @@ def create_model(*, channels=64, lmax=3, edge_lmax=None, num_interactions=2,
             edge_lmax=edge_lmax, attn_heads=0, atomic_numbers=list(atomic_numbers),
             ictd_save_tp_mode="fully-connected", invariant_channels=32,
             device=torch.device(device), dtype=config.dtype,
+            **long_range_options,
         )
     finally:
         torch.set_default_dtype(previous_dtype)
@@ -108,13 +130,16 @@ def check_model(model, *, training=False, capture=False):
 
 
 def configure_model(model, *, training=False, policy="auto", layout="packed",
-                    capture=False, message_chunk_edges=None):
+                    capture=False, message_chunk_edges=None, electrostatics_backend="auto"):
     """Select dynamic Ascend operators or the differentiable CPU reference."""
     if layout not in ("packed", "fused_pack"):
         raise ValueError("layout must be packed or fused_pack")
     if next(model.parameters()).device.type == "npu":
         from mace_ictc.ascend.runtime import configure_model as configure_ascend
         return configure_ascend(model, training=training, policy=policy, capture=capture,
-                                edge_chunk_size=message_chunk_edges)
+                                edge_chunk_size=message_chunk_edges,
+                                electrostatics_backend=electrostatics_backend)
+    from .electrostatics import configure_electrostatics
+    configure_electrostatics(model, backend=electrostatics_backend)
     from mace_ictc.models.operator_plans import configure_mace_runtime_plan
     return configure_mace_runtime_plan(model, policy=policy, training=training, capture=capture)

@@ -58,8 +58,10 @@ Requirements for ordinary training checkpoints:
   order and product backend.
 - Explicit `atomic_energy_keys` and `atomic_energy_values` covering the trained
   elements. Extra reference-energy entries are allowed.
-- Short-range energy output. Long-range, spectral and runtime multi-fidelity
-  models need a separate deployment implementation.
+- Short-range energy output or a reciprocal-only `mesh_fft` q/mu/Q correction.
+  Dispersion, feature-spectral and runtime multi-fidelity models need a separate
+  deployment implementation. See the [electrostatics guide](../../docs/ELECTROSTATICS.md)
+  for the supported functional and HCCL ownership convention.
 
 The cutoff passed to `pair_style` must match the checkpoint. Element symbols
 passed to `pair_coeff` map LAMMPS atom types to trained elements. `NULL` mappings

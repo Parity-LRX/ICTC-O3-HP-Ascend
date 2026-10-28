@@ -4,6 +4,11 @@
 
 // Host-callable launchers compiled by the CANN ASC compiler.
 namespace ictc_ascendc {
+void launch_electrostatic_assignment(uint32_t blocks,aclrtStream stream,
+    uint8_t* f,uint8_t* batch,uint8_t* source,uint8_t* mesh,uint8_t* direction,
+    uint8_t* ds,uint8_t* dm,uint8_t* df,uint64_t n,uint32_t c,
+    uint32_t mx,uint32_t my,uint32_t mz,uint32_t order,uint32_t mode,
+    uint32_t slab,uint32_t flags,uint32_t tile);
 void launch_batched_vector(uint32_t blocks, aclrtStream stream,
     uint8_t* a, uint8_t* b, uint8_t* out, uint8_t* ix, uint64_t n, uint64_t as, uint64_t bs,
     uint32_t q, uint32_t i, uint32_t c, uint32_t mode, uint32_t rows, uint32_t bc);

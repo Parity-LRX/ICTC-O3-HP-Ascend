@@ -22,6 +22,7 @@ ictc_o3/ops/               # Symmetric contractions and mathematical plans
 ictc_o3/autograd/          # Derivative dependency utilities
 ictc_o3/backends/ascend/   # Eager NPU execution schedules
 ictc_o3/ascendc/           # Ascend C source, builder, loader and native adjoints
+ictc_o3/electrostatics/    # Reciprocal q/mu/Q API, mesh conventions and reference
 ```
 
 ## 1. Install and enable the high-performance backend
@@ -111,6 +112,11 @@ A degree `l` block has `2*l+1` angular components.
 | `channel_linear` | `[...,I,M]`, `[O,I]` → `[...,O,M]` |
 | `species_channel_linear` | `[N,I,M]`, `[S,O,I]`, species `[N]` → `[N,O,M]` |
 | `normalized_silu` | Even scalar features → `scale * silu(features)` |
+| `MeshElectrostatics` | Positions, cells and Cartesian q/mu/Q → reciprocal atomic energies |
+| `mesh_spread` / `mesh_gather` | Differentiable CIC/TSC/PCS mesh assignment and its adjoint |
+
+See the [electrostatics API and examples](ELECTROSTATICS.md) for rectangular
+meshes, analytic force-loss adjoints, fixed Gaussian screening and HCCL deployment.
 
 The angular coordinates use the component-normalized ICTC basis. Equal shapes
 do not make arbitrary e3nn spherical components interchangeable with ICTC

@@ -42,7 +42,7 @@ def check_model(model, *, training=False, capture=False):
 
 
 def configure_model(model, *, training=False, policy="auto", capture=False,
-                    edge_chunk_size=None):
+                    edge_chunk_size=None, electrostatics_backend="auto"):
     from mace_ictc.ascendc.runtime import is_enabled,mode,native_graph_enabled
     if policy not in ("auto", "generated", "reference"):
         raise ValueError("policy must be auto, generated or reference")
@@ -51,6 +51,8 @@ def configure_model(model, *, training=False, policy="auto", capture=False,
         raise ValueError("edge_chunk_size must be a positive integer or None for automatic sizing")
     from mace_ictc.models.operator_plans import mace_backbone_core, configure_mace_runtime_plan
     core = mace_backbone_core(model)
+    from ictc_o3.electrostatics.api import configure_electrostatics
+    electrostatic_info = configure_electrostatics(model, backend=electrostatics_backend)
     coverage = check_model(model, training=training, capture=capture)
     if policy == "generated" and not coverage["supported"]:
         raise ValueError("Ascend HP unavailable: " + "; ".join(coverage["reasons"]))
@@ -78,6 +80,7 @@ def configure_model(model, *, training=False, policy="auto", capture=False,
             layer.tp._ascend_tp_schedule = "gemm" if training else "structured"
     return {"requested": policy, "selected": "generated" if selected else "reference",
             "backend": "ascend", "reasons": coverage["reasons"] if policy != "reference" else [],
+            "electrostatics": electrostatic_info,
             "arithmetic": "strict FP32; HF32 and autocast disabled",
             "edge_chunk_size": ("auto" if edge_chunk_size is None else edge_chunk_size) if selected else None,
             "kernel_backend": ("ascendc" if is_enabled() else "triton_gemm") if selected else "reference",
