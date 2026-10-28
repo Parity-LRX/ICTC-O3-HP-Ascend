@@ -49,12 +49,11 @@ Columns show C64/lmax 2, C128/lmax 2, C128/lmax 3 and C256/lmax 3, each with
 two interactions and correlation 3. Training is above; energy-and-force inference
 is below, with separate performance and capacity modes.
 
-At C256/lmax 3 and 16,384 atoms, the capacity update reduces latency from
-18.61 to 4.55 s per call (4.09× over the previous HP capacity implementation),
-reaching 3.60k atom-steps/s. Peak allocated memory falls from 54.73 to 39.58 GiB.
-
 C64/lmax 2 reaches 18.4k atom-steps/s in full training and 54.9k in inference;
-capacity inference completes 196,608 atoms. See the
+capacity inference sustains 40.7–42.8k atom-steps/s from 16,384 to 229,376 atoms.
+At 196,608 atoms, capacity mode takes 4.65 s and uses 43.55 GiB of allocated memory.
+C256/lmax 3 capacity inference reaches 5.53k atom-steps/s at 16,384 atoms.
+See the
 [four-model memory curves](docs/PERFORMANCE.md#memory) and
 [C64 throughput, memory and OOM brackets](docs/PERFORMANCE.md#c64-capacity-and-oom).
 

@@ -534,7 +534,7 @@ data and freshly measured capacity curves; the other training and performance
 inference curves retain their recorded measurements.
 
 The bars above the C64 panels connect the last successful size to the first
-observed OOM. Each bracket spans 16.7–20% of its last successful atom count:
+observed OOM. These are measured brackets:
 
 | Workload | Backend | Last success (atoms) | First OOM (atoms) |
 | --- | --- | ---: | ---: |
@@ -542,7 +542,7 @@ observed OOM. Each bracket spans 16.7–20% of its last successful atom count:
 | Energy-and-force training | HP | 20,480 | 24,576 |
 | Energy-and-force inference | Original MACE/e3nn | 24,576 | 28,672 |
 | Energy-and-force inference | HP performance | 40,960 | 49,152 |
-| Energy-and-force inference | HP capacity | 196,608 | 229,376 |
+| Energy-and-force inference | HP capacity | 229,376 | 262,144 |
 
 Training measures the ordinary energy-and-force loss, parameter backward and
 AdamW. Each process passes the CPU FP64 small-case derivative gate; shared
@@ -582,27 +582,36 @@ parameter rescaling.
 Whole-model timings are medians of five individually synchronized calls after
 at least two seconds and three calls of warmup. Separate three-call-block results
 are not mixed into these curves. The broad performance/training data and
-standalone TP data retain their qualified production paths; all 27 successful
-capacity points use the updated implementation. Peak PyTorch allocation includes
+standalone TP data retain their qualified production paths; the capacity curves
+use the updated implementation. Peak PyTorch allocation includes
 resident graph/model tensors and, for training, optimizer state; external CANN
 and driver allocations are excluded. Each new size
 runs in a fresh process. Graph construction, neighbor lists, transfers and
 compilation are excluded. Each measurement uses a single NPU; concurrent workers
 are independent measurements.
 
-Capacity inference streams the original frozen radial output Linear inside
-message chunks when full gate and gate-gradient tensors would exhaust the
-working-memory budget. Chunk sizes follow the current graph, operator widths
-and available memory. The original weights, FP32 arithmetic and dynamic graph
-are retained. Twenty-three old/new capacity pairs across the four model
+Capacity inference accumulates compact node outputs across edge chunks and
+restores path order once per message. With radial streaming, its first adjoint prepares
+node cotangents once, recomputes group-local edge buffers and accumulates feature gradients into
+one node buffer. Large frozen radial output Linear layers stream inside the
+chunks; their hidden-feature adjoints also use coupling groups. Chunk sizes
+follow the current graph, operator widths and available memory. The original
+weights, FP32 arithmetic and dynamic graph are retained. Twenty-seven old/new
+capacity pairs across the four model
 configurations pass full-size energy and force comparisons. Every new size
 passes small-case original-MACE CPU FP64 checks for energy, forces, coordinate
 second derivatives and mapped parameter gradients. Larger C64 points beyond
 the old OOM limit retain these small-case checks and full-size finite-output
 checks. Eighteen external-gate and eighteen projected operator cases cover
 derivatives through third order, channel tails, masks, empty inputs, shared
-inputs and coefficient mutation/replacement guards. See the
+inputs and coefficient mutation/replacement guards. Additional checks cover
+selective derivatives, missing angular inputs, 3-D gates, changing graph sizes,
+owned destinations, fallback policies and native Vector adjoints with channel
+tails. The standalone capacity API is also checked without importing MACE. See the
 [capacity API](HP_API.md#capacity-inference) for execution details.
+
+Unchanged baseline measurements can be reused on the same physical NPU;
+the checkpoint, graph, precision and source are matched for each comparison.
 
 Standalone TP curves use natural-parity, path-preserving `uvu` products,
 lmax 2/3, and live external path weights. Forward-plus-VJP includes gradients

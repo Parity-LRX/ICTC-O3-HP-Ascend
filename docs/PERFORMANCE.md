@@ -46,10 +46,9 @@ including energy-and-force loss backward and AdamW; the lower row measures
 energy-and-force inference. At C128/lmax 3 and 2,048 atoms, HP reaches 4.76×
 training and 4.48× inference throughput over original PyTorch MACE/e3nn.
 
-At C256/lmax 3 and 16,384 atoms, streaming the frozen radial output projection
-reduces capacity-mode latency from 18.61 s to 4.55 s (4.09×), reaching
-3.60k atom-steps/s. Peak allocated memory falls from 54.73 to 39.58 GiB.
-These before/after measurements use the same weights, graph and NPU.
+Capacity inference sustains 40.7–42.8k atom-steps/s at C64/lmax 2 from
+16,384 to 229,376 atoms. At C256/lmax 3 and 16,384 atoms, it reaches
+5.53k atom-steps/s, or 2.96 s per energy-and-force call.
 
 [Download PNG](figures/ascend-mace-throughput.png).
 
@@ -72,9 +71,14 @@ match the detailed overview below.
 
 C64/lmax 2 reaches 18.4k atom-steps/s in full training and 54.9k in
 energy-and-force inference: 3.66× and 3.63× original MACE/e3nn at 8,192 and
-16,384 atoms, respectively. Capacity inference completes 196,608 atoms;
-the first observed capacity-mode OOM is 229,376 atoms. Bars above the panels
+16,384 atoms, respectively. Capacity inference completes 229,376 atoms;
+the first observed capacity-mode OOM is 262,144 atoms. Bars above the panels
 connect each backend's last successful size to its first measured OOM.
+
+At 196,608 atoms, the capacity update reduces latency from 11.30 to 4.65 s
+(2.43× over the previous HP capacity implementation). Peak allocated memory
+falls from 52.68 to 43.55 GiB. These measurements use the same weights, graph
+and physical NPU for each before/after pair.
 
 [Download PNG](figures/ascend-training-inference.png).
 
