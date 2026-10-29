@@ -216,8 +216,8 @@ sbatch --account=YOUR_ACCOUNT "$ICTC_REPO/examples/ascend_job.sbatch" \
 
 Native symmetric contractions cover correlation 1, 2 and 3. Reduce batch size
 when memory is insufficient. `--gradient-accumulation-steps 4` accumulates four
-microbatches per update. This release supports single-NPU training; the CLI
-rejects multi-NPU DDP on NPU. HCCL multi-NPU LAMMPS is a separate deployment path.
+microbatches per update. For distributed training, use the
+[HCCL DDP recipe](#multi-npu-training-with-hccl).
 
 ### Train with long-range electrostatics
 
@@ -320,6 +320,37 @@ For a validation pass, use the same wrapper and long-range options with
 Long-range training includes the energy-and-force loss, mixed parameter
 derivatives and AdamW on one NPU. Atom and edge counts remain dynamic.
 For multi-NPU deployment, use the [HCCL LAMMPS recipe](#long-range-lammps-with-hccl).
+
+### Multi-NPU training with HCCL
+
+Use one training process per NPU. The launcher maps `LOCAL_RANK` onto the
+NPUs in the Slurm allocation; `auto` selects HCCL for NPU DDP. For eight NPUs:
+
+```bash
+export ICTC_OMP_THREADS=2 TASK_QUEUE_ENABLE=1
+sbatch --account=YOUR_ACCOUNT --gres=npu:8 --exclusive \
+  --cpus-per-task=32 --mem=128G "$ICTC_REPO/examples/ascend_job.sbatch" \
+  python -m torch.distributed.run --standalone --nproc_per_node=8 --no_python \
+    bash "$ICTC_REPO/examples/train_hco_long_range.sh" data/hco models/hco-ddp.pth \
+      --ddp on --ddp-backend hccl --ddp-find-unused-parameters \
+      --batch-size 4 --num-workers 0 --long-range-max-multipole-l 2 \
+      --checkpoint-interval-steps 1000
+```
+
+`batch-size` is per process. DDP distributes independent configurations;
+each process evaluates its own long-range meshes and HCCL averages parameter
+gradients. Energy-and-force loss retains the mixed second derivatives.
+Use `--long-range-max-multipole-l 0/1/2` for q / q+μ / q+μ+Q. Use
+`train_hco.sh` instead for a short-range model. Choose 2/4/8 processes and
+matching allocated NPUs. For one NPU, use the ordinary training recipe above.
+
+The distributed sampler partitions training data. Rank zero validates and
+writes checkpoints; all ranks restore the same recovery checkpoint and
+optimizer state with the [restart options](#4-restart-warm-start-and-evaluate).
+Ordinary gradient buckets are used (`gradient_as_bucket_view=False`). NPU
+metric collectives use FP32 and diagnostic counters use integers; model and
+optimizer arithmetic remain FP32. See the
+[DDP throughput and protocol](ELECTROSTATICS.md#ddp-training-scaling).
 
 ## 4. Restart, warm-start and evaluate
 
@@ -619,7 +650,9 @@ Use the site's MPI configuration to keep all ranks within the allocation.
 The one-node 1/2/4/8-rank qualification used exclusive eight-NPU allocations;
 partial-NPU isolation and multi-node deployment were not qualified on that stack.
 For a single-rank starting run, request the same qualified allocation and change
-`mpiexec -n 8` to `-n 1`. Single-NPU training above is independent of this MPI setup.
+`mpiexec -n 8` to `-n 1`. Training uses the
+[recipes above](#3-train-an-energy-and-force-potential), including
+[HCCL DDP](#multi-npu-training-with-hccl).
 
 Global virial, changing atom ownership, neighbor rebuilds, triclinic cells,
 empty ranks and both Newton settings are covered by deployment checks.
@@ -667,13 +700,18 @@ sbatch --account=YOUR_ACCOUNT --gres=npu:8 --exclusive \
     /path/to/build-ascend/lmp -in in.hco_long_range
 ```
 
-Only owned physical atoms deposit reciprocal sources. HCCL sums Fourier
-amplitudes or scalar spectra and propagates the reverse sums needed for source
-response and coordinate forces. The FFT mesh is replicated on each rank.
-Single- and four-NPU energy/force/global-virial and short MD checks pass;
-four-rank HCCL checks also cover empty owned ranks. The 1/2/4/8-NPU efficiency
-curves in the README measure short-range C64 and MACE-MH-1. For the long-range
-functional and communication details, see [Electrostatics](ELECTROSTATICS.md#lammps-and-hccl).
+Only owned physical atoms deposit reciprocal sources. Large multipole meshes
+use HCCL reduce-scatter and all-to-all to distribute FFTs and spectral work.
+Scalar q and small multipole meshes use replicated FFTs. Differentiable reverse
+collectives retain source response, coordinate forces and cell gradients.
+The [FFT schedule options](ELECTROSTATICS.md#lammps-and-hccl) describe automatic
+selection and explicit overrides.
+Energy/force/global-virial and live MD checks pass at 1/2/4/8 NPUs;
+four-rank HCCL checks also cover empty owned ranks. The
+[long-range scaling results](ELECTROSTATICS.md#multi-npu-scaling) measure
+short range, q, q+μ and q+μ+Q with the same saved C64 backbone. Their timing
+protocol rebuilds neighbors every step and uses `--queue 1`; the earlier
+short-range C64 and MACE-MH-1 figures retain their own recorded protocols.
 
 ## Benchmark protocols and numerical validation
 
@@ -684,7 +722,7 @@ functional and communication details, see [Electrostatics](ELECTROSTATICS.md#lam
 
 The README long-range figure uses one Ascend 910B3 in performance mode, eager
 FP32 and HF32 disabled. The saved C64/lmax-2 backbone has two interactions,
-correlation 3, eight Bessel functions, radial MLP width 16, readout width 16,
+correlation 3, eight Bessel functions, radial MLP `[64,64,64]`, readout width 16,
 cutoff polynomial order 5 and a 4.5 Å cutoff. Each atom has 56 directed
 neighbors. Nonzero deterministic initialized source heads use one source
 channel, PCS assignment, Gaussian width 1 Å and approximately 1 Å mesh spacing:

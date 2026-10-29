@@ -401,6 +401,23 @@ differences at 10,976 atoms are additionally checked against full-system
 original-MACE FP64 energy central differences at steps of `1e-4` and `5e-5`
 Angstrom; both NPU predictions satisfy the original single-reference budgets.
 
+### Long-range scaling
+
+The [long-range measurements](../../docs/ELECTROSTATICS.md#multi-npu-scaling)
+cover short range, q, q+μ and q+μ+Q on 1/2/4/8 NPUs. Strong scaling fixes
+32,768 atoms; weak scaling fixes 16,384 atoms/NPU and reaches 131,072 atoms.
+The saved C64 backbone, PCS assignment, 1 Å Gaussian width and 0.5 Å mesh
+spacing are shared by all four variants. Multipole FFTs and spectral work use
+HCCL x/y slabs; scalar q retains replicated FFTs.
+
+This sweep uses task queue 1 and rebuilds neighbors every step, with a
+0.1 fs timestep. It reports median complete five-step loops after warmup.
+Eight-NPU q strong/weak efficiency is 57.5%/71.5%; q+μ+Q reaches 59.8%/70.5%.
+Slab FFTs reduce the same 131,072-atom q+μ+Q step from 1,927 to 1,012 ms.
+The linked results include all timings and per-rank peak memory, full-size
+energy/force/virial comparisons, CPU FP64 replay on every rank count, live
+ownership changes and amplified-moment force checks.
+
 ## Diagnostics
 
 Set `MFF_ASCEND_STATS=/absolute/output/directory` to save one JSON report per

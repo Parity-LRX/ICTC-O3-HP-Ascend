@@ -141,10 +141,11 @@ sbatch --account=YOUR_ACCOUNT "$ICTC_REPO/examples/ascend_job.sbatch" \
 ```
 
 It extends the [H/C/O energy-and-force recipe](USAGE.md#3-train-an-energy-and-force-potential)
-with the native reciprocal configuration. Single-NPU energy/force training
-includes parameter mixed derivatives and AdamW. DDP training is not enabled
-by this addition. Checkpoints save mesh shape, sigma, multipole rank and the
-screened reciprocal-only convention; preserve these on restart.
+with the native reciprocal configuration. Energy/force training includes
+parameter mixed derivatives and AdamW. The [HCCL DDP recipe](USAGE.md#multi-npu-training-with-hccl)
+distributes independent configurations across NPUs and averages parameter
+gradients. Checkpoints save mesh shape, sigma, multipole rank and the screened
+reciprocal-only convention; preserve these on restart.
 
 ## LAMMPS and HCCL
 
@@ -169,13 +170,23 @@ run 1000
 ```
 
 Use one MPI rank per allocated NPU. Only owned atoms deposit sources; ghost
-atoms are excluded from the reciprocal source count. HCCL sums compressed
-Fourier amplitudes or scalar spectra, with differentiable reverse sums for
-learned-source and coordinate forces. The FFT mesh is replicated on each rank.
+atoms are excluded from the reciprocal source count. For multipoles on large
+meshes, HCCL reduce-scatter sums real-space x slabs and an all-to-all transpose
+distributes y slabs. Each rank performs its share of the FFTs and spectral
+contraction. Reverse collectives preserve learned-source, position and cell
+gradients. Assignment still uses a full real-grid buffer on each rank.
+Scalar q retains replicated FFTs and differentiable spectrum reductions.
 Global atom counts are refreshed at topology rebuilds. Virials differentiate
 both positions and the cell under homogeneous strain. This deployment supports
 the reciprocal-only functional; dispersion and a full real-space Ewald solver
 are separate implementations.
+
+`ICTC_ASCEND_MULTIPOLE_FFT=auto` is the default for LAMMPS. It selects slab
+FFTs with multiple ranks, at least 262,144 mesh points and at least as many
+y planes as ranks. Smaller grids and one rank retain replicated FFTs.
+Use `replicated` or `slabs` to select a schedule explicitly; the latter still
+requires multiple ranks and sufficient y planes. Padding is confined to
+communication buffers; physical mesh dimensions and the potential are unchanged.
 
 ## Implementation
 
@@ -187,6 +198,10 @@ are separate implementations.
   Hessians retain the original native sequential reduction. The tiles use
   bounded workspace and accept live atom counts and rectangular meshes.
 - Paired real-FFT adjoints use CANN transforms and retain second derivatives.
+- Multi-rank multipole FFTs distribute transforms, reciprocal geometry and
+  spectral contraction over x/y slabs. Balanced tail buffers support odd,
+  rectangular and nondivisible meshes, multiple graphs and source channels.
+  Explicit paired FFT adjoints support force and mixed second derivatives.
 - Fixed Cartesian recovery matrices replace repeated component expansion in
   the learned dipole and quadrupole heads. Trainable source maps and gates
   are evaluated on every call.
@@ -231,8 +246,9 @@ when that optional backend is unavailable.
 
 The following comparisons use one Ascend 910B3 or one Hygon K100, eager
 FP32 with HF32/TF32 disabled. Both use the same saved C64/lmax-2 backbone,
-two interactions, correlation 3, eight Bessel functions, radial MLP width 16
-and cutoff polynomial order 5. The graph has 56 neighbors per atom at a
+two interactions, correlation 3, eight Bessel functions, radial MLP widths
+`[64,64,64]`, a 16-channel hidden readout and cutoff polynomial order 5.
+The graph has 56 neighbors per atom at a
 4.5-Angstrom cutoff. Source channels are one, with nonzero deterministic
 learned heads and energy scales, PCS assignment, approximately 1-Angstrom
 mesh spacing and sigma fixed at 1 Angstrom. Meshes are 32x32x32 for 4,096
@@ -346,3 +362,183 @@ Ascend short-range/q+mu+Q inference takes 86.29/101.18 ms, and training takes
 Native FP32 comparisons use a component budget of `2e-5 + 1e-4*abs(reference)`
 and a relative L2 check. The mesh functional and precision remain unchanged
 between performance schedules.
+
+## Multi-NPU scaling
+
+### LAMMPS strong and weak scaling
+
+![Complete LAMMPS step throughput for short range, q, q+mu and q+mu+Q.](figures/ascend-electrostatics-scaling.svg)
+
+One exclusive Ascend 910B3 node runs each point at 1/2/4/8 NPUs. Strong
+scaling fixes 32,768 physical atoms; weak scaling fixes 16,384 atoms/NPU,
+reaching 131,072 atoms. All four series use identical saved C64/lmax-2
+backbone tensors, two interactions, correlation 3, eight Bessel functions,
+radial MLP `[64,64,64]`, hidden readout width 16, cutoff polynomial order 5
+and a 4.5 Å cutoff. The nonzero initialized source heads use one source
+channel, PCS assignment, Gaussian width 1 Å and fixed 0.5 Å physical mesh
+spacing. The H/C/O periodic systems have density 0.125 atoms/Å³, with
+56 neighbors/atom inside the physical cutoff and approximately 80 stored
+directed edges/atom with the 0.5 Å neighbor skin.
+
+Measurements use eager FP32, HF32 disabled, performance mode, task queue 1
+and two Torch threads/rank. Each process starts from the same checkpoint.
+After three warmup steps, the reported time is the median of three five-step
+LAMMPS loops. Every step rebuilds neighbors (`every 1 delay 0 check no`,
+0.5 Å skin); atom sorting runs every two steps. NVE uses a 0.1 fs timestep
+and 20 K initial velocities. Integration, neighbors, transfers, energy,
+forces, thermodynamic virial and HCCL are included. Startup and JIT
+compilation are excluded. Throughput counts physical atoms, excluding ghosts.
+
+Strong efficiency is `T1 / (P * TP)`; weak efficiency is `T1 / TP`.
+Peak memory below is the largest rank's PyTorch allocated peak, excluding
+driver and communication allocations. Multipole transforms and spectral work
+use HCCL x/y slabs; scalar q retains replicated FFTs. At fixed spacing, weak
+scaling grows the global grid with the simulation volume. Eight-NPU
+strong/weak efficiencies are 57.5%/71.5% for q, 61.8%/76.4% for q+μ, and
+59.8%/70.5% for q+μ+Q.
+
+At 131,072 atoms on eight NPUs, the q+μ+Q step falls from 1,926.926 to
+1,011.944 ms (1.90×), raising weak efficiency from 36.8% to 70.5%.
+At 32,768 atoms on eight NPUs, it falls from 520.654 to 299.408 ms (1.74×).
+Both comparisons preserve the checkpoint, FP32 precision, physical mesh and
+complete-step timing. All sixteen multipole points are remeasured; the
+unchanged short-range and scalar-q measurements are retained.
+
+All 32 timing points pass full initial energy/force/virial comparisons with
+one NPU; weak cases use its periodically replicated reference. Sixteen
+512-atom cases cover all four variants and rank counts, independently
+replaying CPU FP64 references before MD, after an ownership-changing
+translation, and after MD. Eight amplified-moment cases cover 1/2/4/8 ranks
+and pass independent CPU FP64 references at the same tolerances; throughput
+checkpoints retain their original energy scale. Slab FFT values, adjoints and
+HVPs also pass on odd/even and nondivisible meshes with multiple graphs and
+channels. Separate FP64 checks cover five empty ranks, two source channels,
+triclinic cells, periodic and padded-slab boundaries. Earlier C64 and MH-1
+scaling figures retain their own neighbor and queue settings.
+
+<details>
+<summary>LAMMPS latency, throughput and peak allocated memory</summary>
+
+| Sources | Phase | NPUs | Atoms | ms/step | atom-steps/s | Efficiency | Peak GiB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Short range | strong | 1 | 32,768 | 1114.402 | 29,404 | 100.00% | 57.03 |
+| Short range | strong | 2 | 32,768 | 639.784 | 51,217 | 87.09% | 29.13 |
+| Short range | strong | 4 | 32,768 | 344.826 | 95,028 | 80.79% | 14.71 |
+| Short range | strong | 8 | 32,768 | 221.328 | 148,052 | 62.94% | 7.51 |
+| q | strong | 1 | 32,768 | 1175.942 | 27,865 | 100.00% | 57.07 |
+| q | strong | 2 | 32,768 | 688.728 | 47,578 | 85.37% | 29.16 |
+| q | strong | 4 | 32,768 | 387.558 | 84,550 | 75.86% | 14.74 |
+| q | strong | 8 | 32,768 | 255.830 | 128,085 | 57.46% | 7.54 |
+| q + μ | strong | 1 | 32,768 | 1303.040 | 25,147 | 100.00% | 57.07 |
+| q + μ | strong | 2 | 32,768 | 796.414 | 41,144 | 81.81% | 29.14 |
+| q + μ | strong | 4 | 32,768 | 426.076 | 76,906 | 76.46% | 14.72 |
+| q + μ | strong | 8 | 32,768 | 263.668 | 124,278 | 61.77% | 7.51 |
+| q + μ + Q | strong | 1 | 32,768 | 1432.954 | 22,867 | 100.00% | 57.07 |
+| q + μ + Q | strong | 2 | 32,768 | 915.970 | 35,774 | 78.22% | 29.14 |
+| q + μ + Q | strong | 4 | 32,768 | 501.954 | 65,281 | 71.37% | 14.72 |
+| q + μ + Q | strong | 8 | 32,768 | 299.408 | 109,443 | 59.82% | 7.51 |
+| Short range | weak | 1 | 16,384 | 553.452 | 29,603 | 100.00% | 28.53 |
+| Short range | weak | 2 | 32,768 | 586.100 | 55,909 | 94.43% | 30.02 |
+| Short range | weak | 4 | 65,536 | 625.686 | 104,743 | 88.46% | 29.15 |
+| Short range | weak | 8 | 131,072 | 698.772 | 187,575 | 79.20% | 29.17 |
+| q | weak | 1 | 16,384 | 584.530 | 28,029 | 100.00% | 28.55 |
+| q | weak | 2 | 32,768 | 652.276 | 50,236 | 89.61% | 29.18 |
+| q | weak | 4 | 65,536 | 700.630 | 93,539 | 83.43% | 29.22 |
+| q | weak | 8 | 131,072 | 816.964 | 160,438 | 71.55% | 29.32 |
+| q + μ | weak | 1 | 16,384 | 653.608 | 25,067 | 100.00% | 28.55 |
+| q + μ | weak | 2 | 32,768 | 752.898 | 43,522 | 86.81% | 29.15 |
+| q + μ | weak | 4 | 65,536 | 790.050 | 82,952 | 82.73% | 29.16 |
+| q + μ | weak | 8 | 131,072 | 855.648 | 153,184 | 76.39% | 29.18 |
+| q + μ + Q | weak | 1 | 16,384 | 713.270 | 22,970 | 100.00% | 28.55 |
+| q + μ + Q | weak | 2 | 32,768 | 889.880 | 36,823 | 80.15% | 29.15 |
+| q + μ + Q | weak | 4 | 65,536 | 936.356 | 69,990 | 76.18% | 29.16 |
+| q + μ + Q | weak | 8 | 131,072 | 1011.944 | 129,525 | 70.49% | 29.18 |
+
+</details>
+
+[Download PNG](figures/ascend-electrostatics-scaling.png) ·
+[LAMMPS launch recipe](USAGE.md#long-range-lammps-with-hccl).
+
+### DDP training scaling
+
+![Complete force-training HCCL DDP throughput for short range, q, q+mu and q+mu+Q.](figures/ascend-electrostatics-ddp.svg)
+
+Strong scaling fixes 16,384 atoms in eight independent 2,048-atom graphs;
+weak scaling fixes four such graphs/NPU (8,192 atoms/NPU), reaching 65,536
+atoms. The four variants share the saved C64 backbone, with the architecture
+and source settings above. Each graph has 56 directed neighbors/atom and
+its own periodic `64×64×32` mesh at 0.5 Å spacing. Small configuration-dependent
+displacements give the graphs distinct energies and forces. DDP partitions
+configurations; every rank evaluates its local meshes and HCCL synchronizes
+parameter gradients.
+
+On eight NPUs, q+μ+Q delivers 79.0k atom-steps/s at 16,384 atoms with 66.1%
+strong efficiency. At 65,536 atoms it delivers 117.6k atom-steps/s with 98.9%
+weak efficiency. Weak efficiency across all four variants is 98.9–99.4%.
+
+The loss is `mean((E_graph / N_graph)**2) + mean(F**2)`, with zero targets.
+Each step includes `zero_grad`, forward, forces with `create_graph=True`,
+backward to every trainable parameter, HCCL gradient averaging and AdamW
+(`lr=1e-4`, `weight_decay=0`, `foreach=False`). Execution uses eager FP32,
+HF32 disabled, performance mode, task queue 1 and two Torch threads/rank.
+DDP uses ordinary buckets, `broadcast_buffers=False` and
+`find_unused_parameters=True`. After eight warmup updates, three five-step
+means are measured using the slowest rank in each round; the median is
+reported. Graph construction, data transfer, initialization, JIT and epoch
+validation are excluded. Peak allocated memory is the largest rank's peak.
+
+All four variants at every rank count are checked against serial training
+on the identical global batch (eight 256-atom graphs). All parameter gradients
+are retained, with separate relative checks for each learned moment degree.
+Concatenated gradient relative L2 error is below `1e-5`; each active learned
+moment degree is below `1e-4`.
+Each first AdamW update is checked against its formula, then updated models
+are compared on full energy and force tensors. The neutralized scalar source
+bias is a physical null direction: its tiny reduction-dependent FP32 gradient
+is recorded separately in parameter-update comparisons; gradient and physical
+output tolerances are retained. The public two-NPU training CLI additionally
+passes short-range and q+μ+Q epochs, rank-zero validation, checkpoint writes
+and optimizer restart.
+
+<details>
+<summary>DDP training latency, throughput and peak allocated memory</summary>
+
+| Sources | Phase | NPUs | Atoms | ms/step | atom-steps/s | Efficiency | Peak GiB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Short range | strong | 1 | 16,384 | 906.021 | 18,083 | 100.00% | 49.42 |
+| Short range | strong | 2 | 16,384 | 448.354 | 36,543 | 101.04% | 46.25 |
+| Short range | strong | 4 | 16,384 | 230.577 | 71,057 | 98.23% | 10.54 |
+| Short range | strong | 8 | 16,384 | 165.970 | 98,717 | 68.24% | 5.76 |
+| q | strong | 1 | 16,384 | 957.352 | 17,114 | 100.00% | 39.37 |
+| q | strong | 2 | 16,384 | 480.929 | 34,067 | 99.53% | 20.27 |
+| q | strong | 4 | 16,384 | 256.323 | 63,919 | 93.37% | 10.55 |
+| q | strong | 8 | 16,384 | 193.970 | 84,467 | 61.69% | 5.77 |
+| q + μ | strong | 1 | 16,384 | 1014.778 | 16,145 | 100.00% | 39.44 |
+| q + μ | strong | 2 | 16,384 | 512.794 | 31,950 | 98.95% | 20.31 |
+| q + μ | strong | 4 | 16,384 | 277.693 | 59,000 | 91.36% | 10.57 |
+| q + μ | strong | 8 | 16,384 | 198.614 | 82,492 | 63.87% | 5.78 |
+| q + μ + Q | strong | 1 | 16,384 | 1096.000 | 14,949 | 100.00% | 39.49 |
+| q + μ + Q | strong | 2 | 16,384 | 552.672 | 29,645 | 99.15% | 20.33 |
+| q + μ + Q | strong | 4 | 16,384 | 295.492 | 55,447 | 92.73% | 10.58 |
+| q + μ + Q | strong | 8 | 16,384 | 207.416 | 78,991 | 66.05% | 5.78 |
+| Short range | weak | 1 | 8,192 | 448.289 | 18,274 | 100.00% | 46.46 |
+| Short range | weak | 2 | 16,384 | 450.139 | 36,398 | 99.59% | 46.34 |
+| Short range | weak | 4 | 32,768 | 450.893 | 72,674 | 99.42% | 46.98 |
+| Short range | weak | 8 | 65,536 | 451.921 | 145,017 | 99.20% | 46.45 |
+| q | weak | 1 | 8,192 | 479.506 | 17,084 | 100.00% | 20.27 |
+| q | weak | 2 | 16,384 | 479.485 | 34,170 | 100.00% | 20.27 |
+| q | weak | 4 | 32,768 | 481.361 | 68,074 | 99.61% | 20.27 |
+| q | weak | 8 | 65,536 | 482.509 | 135,823 | 99.38% | 20.27 |
+| q + μ | weak | 1 | 8,192 | 512.108 | 15,997 | 100.00% | 20.31 |
+| q + μ | weak | 2 | 16,384 | 513.959 | 31,878 | 99.64% | 20.31 |
+| q + μ | weak | 4 | 32,768 | 517.297 | 63,345 | 99.00% | 20.31 |
+| q + μ | weak | 8 | 65,536 | 517.125 | 126,731 | 99.03% | 20.31 |
+| q + μ + Q | weak | 1 | 8,192 | 551.592 | 14,852 | 100.00% | 20.33 |
+| q + μ + Q | weak | 2 | 16,384 | 554.363 | 29,555 | 99.50% | 20.33 |
+| q + μ + Q | weak | 4 | 32,768 | 553.814 | 59,168 | 99.60% | 20.33 |
+| q + μ + Q | weak | 8 | 65,536 | 557.466 | 117,560 | 98.95% | 20.34 |
+
+</details>
+
+[Download PNG](figures/ascend-electrostatics-ddp.png) ·
+[HCCL training recipe](USAGE.md#multi-npu-training-with-hccl).

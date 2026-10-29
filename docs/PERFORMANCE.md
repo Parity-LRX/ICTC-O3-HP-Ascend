@@ -107,6 +107,36 @@ Scaling figures use blue for the C64 model and green for MH-1.
 [Download C64 PNG](figures/ascend_lammps_scaling.png) ·
 [Download MH-1 PNG](figures/ascend_mh1_scaling.png).
 
+### Long-range scaling
+
+![Complete LAMMPS step throughput for short range, q, q+mu and q+mu+Q on 1/2/4/8 NPUs.](figures/ascend-electrostatics-scaling.svg)
+
+Strong scaling uses 32,768 atoms; weak scaling uses 16,384 atoms/NPU, up to
+131,072 atoms. On eight NPUs, q+μ reaches 153.2k atom-steps/s and 76.4% weak
+efficiency; q+μ+Q reaches 129.5k and 70.5%. Distributed slab FFTs reduce the
+same 131,072-atom q+μ+Q step from 1,927 to 1,012 ms (1.90×). Scalar q retains
+replicated FFTs and reaches 160.4k atom-steps/s with 71.5% weak efficiency.
+
+[Download PNG](figures/ascend-electrostatics-scaling.png) ·
+[All measurements, memory and protocol](ELECTROSTATICS.md#multi-npu-scaling).
+
+## Multi-NPU training
+
+![Energy-and-force training throughput with HCCL DDP for short range, q, q+mu and q+mu+Q.](figures/ascend-electrostatics-ddp.svg)
+
+Strong scaling fixes eight 2,048-atom graphs (16,384 atoms); weak scaling
+fixes four graphs/NPU (8,192 atoms/NPU). Complete steps include the force-loss
+mixed backward, HCCL gradient averaging and AdamW. Graphs are resident on the
+NPUs; data loading and neighbor construction are excluded.
+
+On eight NPUs, q+μ+Q reaches 79.0k atom-steps/s and 66.1% strong efficiency,
+or 117.6k atom-steps/s and 98.9% weak efficiency. Weak efficiency across all
+four variants is 98.9–99.4%.
+
+[Download PNG](figures/ascend-electrostatics-ddp.png) ·
+[Measurements and numerical checks](ELECTROSTATICS.md#ddp-training-scaling) ·
+[Training recipe](USAGE.md#multi-npu-training-with-hccl).
+
 ## Shareable overview
 
 ![MACE single-NPU training and inference plus pretrained MH-1 strong and weak scaling.](figures/ascend-performance-overview.svg)

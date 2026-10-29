@@ -21,12 +21,14 @@ to train, convert and deploy MACE potentials.
   throughput over e3nn.
 - MACE training and energy-and-force inference reach up to 4.76× and 4.48×
   original PyTorch MACE/e3nn throughput at C128/lmax 3 and 2,048 atoms.
+  C64 HCCL DDP training retains 98.9–99.4% weak-scaling efficiency on eight NPUs.
 - Eight-NPU LAMMPS strong-scaling efficiency reaches 83.0% for C64 and 89.7%
   for pretrained MACE-MH-1. MH-1 weak-scaling efficiency reaches 95.2%.
 - Native reciprocal monopole/dipole/quadrupole electrostatics: bounded mesh
-  assignment, real FFTs, mixed force-loss adjoints and owned-source HCCL sums.
-  At 16,384 atoms, scalar q adds 5.2% to training and 6.2% to energy-and-force
-  inference. [Long-range results](#native-long-range-electrostatics).
+  assignment, distributed multipole FFTs, mixed force-loss adjoints and HCCL.
+  At 131,072 atoms on eight NPUs, slab FFTs accelerate complete q+μ+Q MD
+  steps by 1.90×, raising weak-scaling efficiency from 36.8% to 70.5%.
+  [Long-range results](#native-long-range-electrostatics).
 
 All results use Ascend 910B3, eager FP32 and HF32 disabled, without `torch.compile`.
 See the [measurement protocols and validation](docs/USAGE.md#benchmark-protocols-and-numerical-validation).
@@ -97,16 +99,16 @@ scalar-q/short-range rerun with the retained q+μ+Q sweep. See the
 [measurement protocol](docs/USAGE.md#long-range-training-and-inference).
 
 Native `mff/torch` deployment partitions physical source atoms across ranks;
-HCCL combines reciprocal amplitudes and their adjoints. Single- and four-NPU
-energy, force, virial and MD checks pass, including empty ranks and shifted
-box origins. [Train, restart, predict and deploy](docs/USAGE.md#train-with-long-range-electrostatics) ·
+HCCL distributes multipole FFT slabs and their adjoints. Energy, force, virial
+and MD checks pass at 1/2/4/8 NPUs, with additional coverage for empty ranks
+and shifted box origins. [Train, restart, predict and deploy](docs/USAGE.md#train-with-long-range-electrostatics) ·
 [Standalone API and physical conventions](docs/ELECTROSTATICS.md).
 
 ## Multi-NPU scaling
 
-Both models use 1/2/4/8 NPUs on one node. Timings cover complete LAMMPS steps:
+LAMMPS measurements use 1/2/4/8 NPUs on one node and cover complete steps:
 integration, dynamic neighbors, host/device transfers, energy, forces, virial
-and HCCL communication.
+and HCCL communication. DDP training is measured separately below.
 
 ### C64 scaling
 
@@ -124,6 +126,31 @@ Strong scaling fixes 10,976 atoms: eight NPUs reach 7.17× speedup and 89.7%
 efficiency. Weak scaling fixes 4,000 atoms/NPU: eight NPUs reach 95.2%
 efficiency and 52.5k atom-steps/s at 32,000 atoms.
 See the [full measurements and protocol](lammps_user_mfftorch/docs/ASCEND.md#mace-mh-1-scaling).
+
+### Long-range LAMMPS scaling
+
+![Complete-step short-range and q, q+mu, q+mu+Q throughput under strong and weak scaling.](docs/figures/ascend-electrostatics-scaling.svg)
+
+Strong scaling fixes 32,768 atoms; weak scaling fixes 16,384 atoms/NPU.
+On eight NPUs, q+μ reaches 61.8% strong and 76.4% weak efficiency;
+q+μ+Q reaches 59.8% and 70.5%, delivering 109.4k and 129.5k atom-steps/s.
+Distributed multipole FFTs reduce the 131,072-atom q+μ+Q step from
+1,927 to 1,012 ms with the same checkpoint, mesh and FP32 precision.
+All four series share the saved C64 backbone, PCS, Gaussian width 1 Å and
+0.5 Å mesh spacing, rebuilding neighbors every step.
+[Full measurements and protocol](docs/ELECTROSTATICS.md#multi-npu-scaling).
+
+### Long-range DDP training
+
+![Complete energy-and-force training throughput under strong and weak HCCL DDP scaling.](docs/figures/ascend-electrostatics-ddp.svg)
+
+Strong scaling fixes 16,384 atoms in eight independent 2,048-atom graphs.
+Weak scaling fixes 8,192 atoms/NPU in four graphs/NPU. Each step includes
+energy-and-force loss, mixed parameter backward, HCCL gradient synchronization
+and AdamW. On eight NPUs, q+μ+Q reaches 66.1% strong and 98.9% weak efficiency,
+delivering 79.0k and 117.6k atom-steps/s.
+[DDP training recipe](docs/USAGE.md#multi-npu-training-with-hccl) ·
+[All measurements and protocol](docs/ELECTROSTATICS.md#ddp-training-scaling).
 
 ## License
 
