@@ -92,7 +92,8 @@ def _launch(spectrum,gradient,kp,kn,config,adjoint):
         g=kp.new_empty(0)
     from .runtime import _vector_grid
     grid=_vector_grid(triton.cdiv(frequencies,128),kp.device)
-    _map[(grid,)](source,g,kp,kn,output,graphs,frequencies,channels,fields,mu,quad,compact,adjoint,
+    from .jit_launch import launch
+    launch(_map,(grid,),source,g,kp,kn,output,graphs,frequencies,channels,fields,mu,quad,compact,adjoint,
         *strides,*kp.stride(),*kn.stride(),128,num_warps=4,enable_fp_fusion=False)
     return out.transpose(1,2) if adjoint else out.permute(0,3,1,2)
 

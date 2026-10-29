@@ -445,7 +445,8 @@ class ForceTrainer:
     def _reduce_epoch_metrics(self, sums: dict[str, float]) -> dict[str, float]:
         if self._dist_ready():
             keys = list(sums)
-            tensor = torch.tensor([sums[k] for k in keys], dtype=torch.float64, device=self.device)
+            metric_dtype = torch.float32 if self.device.type == "npu" else torch.float64
+            tensor = torch.tensor([sums[k] for k in keys], dtype=metric_dtype, device=self.device)
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
             sums = {key: float(tensor[i].item()) for i, key in enumerate(keys)}
         return self._finalize_metric_sums(sums, require_data=False)
@@ -454,7 +455,8 @@ class ForceTrainer:
         if not self._dist_ready():
             return float(value if value is not None else math.inf)
         v = float(value if (self.main_process and value is not None) else math.inf)
-        t = torch.tensor([v], dtype=torch.float64, device=self.device)
+        metric_dtype = torch.float32 if self.device.type == "npu" else torch.float64
+        t = torch.tensor([v], dtype=metric_dtype, device=self.device)
         dist.broadcast(t, src=0)
         return float(t.item())
 
@@ -1123,7 +1125,7 @@ class ForceTrainer:
             return
         keys = self._dispersion_graph_observation_keys()
         values = [float(self._dispersion_graph_observation[k]) for k in keys]
-        packed = torch.tensor(values, dtype=torch.float64, device=self.device)
+        packed = torch.tensor(values, dtype=torch.int64, device=self.device)
         dist.all_reduce(packed, op=dist.ReduceOp.SUM)
         reduced = {k: int(round(float(v))) for k, v in zip(keys, packed.detach().cpu().tolist())}
         self._dispersion_graph_observation_synced = reduced
@@ -1322,7 +1324,10 @@ class ForceTrainer:
                 grad_targets = [pos_leaf, strain]
             else:
                 pos_in, cell_in, grad_targets = pos_leaf, cell, [pos_leaf]
-            out = self.model(
+            # Validation runs on rank zero; DDP forward hooks can require all
+            # ranks even when buffer broadcasting is disabled.
+            forward_model = self.model if training else self._raw_model
+            out = forward_model(
                 pos_in,
                 A,
                 batch_idx,

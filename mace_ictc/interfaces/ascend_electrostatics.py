@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 """Owned-source reciprocal electrostatics with differentiable HCCL sums."""
+import os
 import torch
 import torch.distributed as dist
 
@@ -36,6 +37,9 @@ class NativeReciprocal:
         self.calls = 0
         self._ownership = None
         self._counts = None
+        self.fft_policy = os.environ.get('ICTC_ASCEND_MULTIPOLE_FFT', 'auto')
+        if self.fft_policy not in ('auto', 'replicated', 'slabs'):
+            raise ValueError('ICTC_ASCEND_MULTIPOLE_FFT must be auto, replicated or slabs')
         self.description = dict(backend='ascendc-reciprocal', mesh=module.kernel.mesh_shape,
             assignment=module.kernel.assignment, smearing_sigma=module.kernel.smearing_sigma,
             boundary=module.kernel.boundary, source_channels=self.channels,
@@ -74,8 +78,20 @@ class NativeReciprocal:
             q = q - total / counts[:, None]
         position, graph = pos[:owned], batch[:owned]
         if self.rank:
-            energy = multipole_energy(kernel, position, graph, cell, q, dipole, quadrupole,
-                reduce_amplitudes=reduce, graph_counts=counts, compact_quadrupole=True)
+            mx, my, mz = kernel.mesh_shape
+            slabs = size > 1 and my >= size and (self.fft_policy == 'slabs' or
+                self.fft_policy == 'auto' and mx*my*mz >= 262144)
+            if slabs:
+                from .ascend_reciprocal_slabs import multipole_energy as slab_energy
+                self.description['fft_selected'] = 'slabs'
+                self.description['fft'] = 'NPU distributed real FFT, x/y slabs'
+                self.description['transport'] = 'HCCL reduce-scatter, all-to-all and reverse adjoints'
+                energy = slab_energy(kernel, position, graph, cell, q, dipole, quadrupole,
+                    size=size, rank=dist.get_rank(), counts=counts, reduce_energy=reduce)
+            else:
+                self.description['fft_selected'] = 'replicated'
+                energy = multipole_energy(kernel, position, graph, cell, q, dipole, quadrupole,
+                    reduce_amplitudes=reduce, graph_counts=counts, compact_quadrupole=True)
         else:
             frac = _prepare_frac_for_boundary_batched(position, graph, cell,
                 boundary=kernel.boundary, slab_padding_factor=kernel.slab_padding_factor)

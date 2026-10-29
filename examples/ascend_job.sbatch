@@ -14,6 +14,9 @@ set -euo pipefail
 : "${ICTC_SITE_ENV:?Set ICTC_SITE_ENV to an absolute shell script that sources CANN and site libraries}"
 source "$ICTC_SITE_ENV"
 export PATH="$ICTC_ENV/bin:$PATH"
+if [[ -n "${SLURM_JOB_GPUS:-}" ]]; then
+    export ASCEND_RT_VISIBLE_DEVICES="$SLURM_JOB_GPUS"
+fi
 export OMP_NUM_THREADS="${ICTC_OMP_THREADS:-4}"
 export MKL_NUM_THREADS="$OMP_NUM_THREADS" OPENBLAS_NUM_THREADS=1
 export PYTHONDONTWRITEBYTECODE=1

@@ -80,8 +80,8 @@ def drain_graph_queue(device):
 
 @lru_cache(maxsize=None)
 def _vector_cores(device_index):
-    import triton
-    properties = triton.runtime.driver.active.utils.get_device_properties(device_index)
+    from .jit_launch import active_driver
+    properties = active_driver().utils.get_device_properties(device_index)
     return max(1, min(65535, int(properties["num_vectorcore"])))
 
 

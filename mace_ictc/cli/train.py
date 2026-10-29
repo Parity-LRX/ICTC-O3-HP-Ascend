@@ -58,12 +58,16 @@ def _setup_distributed(args):
         }
     if not dist.is_available():
         raise RuntimeError("torch.distributed is not available in this PyTorch build")
-    if args.device.startswith("npu"):
-        raise ValueError("Ascend multi-NPU training is not qualified in this release; use one NPU")
-
     backend = args.ddp_backend
     if backend == "auto":
-        backend = "gloo"
+        backend = "hccl" if args.device.startswith("npu") else "gloo"
+    if args.device.startswith("npu"):
+        if backend != "hccl":
+            raise ValueError("Ascend DDP requires --ddp-backend hccl (or auto)")
+        import torch_npu
+        torch.npu.set_device(_env_int("LOCAL_RANK", 0))
+    elif backend == "hccl":
+        raise ValueError("The hccl backend requires --device npu")
     if not dist.is_initialized():
         dist.init_process_group(backend=backend, init_method="env://")
 
@@ -83,6 +87,8 @@ def _setup_distributed(args):
 def _resolve_device(device_arg: str, ddp_info) -> torch.device:
     if device_arg.startswith("npu"):
         import torch_npu
+        if ddp_info["enabled"]:
+            device_arg = f"npu:{ddp_info['local_rank']}"
         torch.npu.set_device(torch.device(device_arg))
     requested = torch.device(device_arg)
     if requested.type not in ("cpu", "npu"):
@@ -660,7 +666,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dtype", default="float32", choices=["float32", "float64"])
     ap.add_argument("--ddp", default="auto", choices=["auto", "on", "off"],
                     help="DistributedDataParallel training mode. auto enables DDP when WORLD_SIZE>1.")
-    ap.add_argument("--ddp-backend", default="auto", choices=["auto", "gloo"],
+    ap.add_argument("--ddp-backend", default="auto", choices=["auto", "gloo", "hccl"],
                     help="torch.distributed backend for DDP training.")
     ap.add_argument("--ddp-find-unused-parameters", action="store_true",
                     help="Pass find_unused_parameters=True to DistributedDataParallel.")
@@ -1045,10 +1051,13 @@ def main(argv=None):
                  type(model).__name__, args.route, args.channels, args.lmax, args.num_interaction, n_params)
 
     if ddp_info["enabled"]:
+        device_ids = [device.index] if device.type == "npu" else None
         model = DistributedDataParallel(
             model,
+            device_ids=device_ids,
             broadcast_buffers=False,
             find_unused_parameters=bool(args.ddp_find_unused_parameters),
+            gradient_as_bucket_view=False,
         )
 
     # dataloaders
